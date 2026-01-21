@@ -1,6 +1,6 @@
-//! Bybit V5 REST API client implementation.
+//! Bybit V5 REST API 클라이언트 구현.
 //!
-//! This module provides the main client for interacting with the Bybit V5 API.
+//! 이 모듈은 Bybit V5 API와 상호작용하기 위한 메인 클라이언트를 제공합니다.
 
 use crate::exchange::{
     Balance, Candle, CandleInterval, ExchangeError, ExchangeResult, MarketData, Order, OrderBook,
@@ -17,19 +17,19 @@ use chrono::{TimeZone, Utc};
 use reqwest::Client;
 use rust_decimal::Decimal;
 
-/// Base URL for Bybit V5 REST API (mainnet).
+/// Bybit V5 REST API 기본 URL (메인넷).
 const BASE_URL_MAINNET: &str = "https://api.bybit.com";
 
-/// Base URL for Bybit V5 REST API (testnet).
+/// Bybit V5 REST API 기본 URL (테스트넷).
 const BASE_URL_TESTNET: &str = "https://api-testnet.bybit.com";
 
-/// Default category for spot trading.
+/// 현물 거래 기본 카테고리.
 const DEFAULT_CATEGORY: &str = "spot";
 
-/// Bybit V5 API client.
+/// Bybit V5 API 클라이언트.
 ///
-/// This client supports both public (market data) and private (trading) APIs.
-/// For private APIs, credentials must be provided.
+/// 이 클라이언트는 공개(시장 데이터) 및 비공개(거래) API를 모두 지원합니다.
+/// 비공개 API를 사용하려면 인증 정보를 제공해야 합니다.
 #[derive(Debug)]
 pub struct BybitClient {
     client: Client,
@@ -39,40 +39,40 @@ pub struct BybitClient {
 }
 
 impl BybitClient {
-    /// Creates a new unauthenticated Bybit client for mainnet.
+    /// 메인넷용 인증되지 않은 새 Bybit 클라이언트를 생성합니다.
     ///
-    /// This client can only access public (market data) APIs.
+    /// 이 클라이언트는 공개(시장 데이터) API만 접근할 수 있습니다.
     ///
-    /// # Errors
+    /// # 에러
     ///
-    /// Returns an error if the HTTP client cannot be created.
+    /// HTTP 클라이언트를 생성할 수 없는 경우 에러를 반환합니다.
     pub fn new() -> ExchangeResult<Self> {
         Self::new_internal(None, false)
     }
 
-    /// Creates a new unauthenticated Bybit client for testnet.
+    /// 테스트넷용 인증되지 않은 새 Bybit 클라이언트를 생성합니다.
     ///
-    /// This client can only access public (market data) APIs on testnet.
+    /// 이 클라이언트는 테스트넷의 공개(시장 데이터) API만 접근할 수 있습니다.
     ///
-    /// # Errors
+    /// # 에러
     ///
-    /// Returns an error if the HTTP client cannot be created.
+    /// HTTP 클라이언트를 생성할 수 없는 경우 에러를 반환합니다.
     pub fn new_testnet() -> ExchangeResult<Self> {
         Self::new_internal(None, true)
     }
 
-    /// Creates a new authenticated Bybit client for mainnet.
+    /// 메인넷용 인증된 새 Bybit 클라이언트를 생성합니다.
     ///
-    /// This client can access both public and private APIs.
+    /// 이 클라이언트는 공개 및 비공개 API 모두 접근할 수 있습니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `api_key` - Bybit API key
-    /// * `secret_key` - Bybit API secret key
+    /// * `api_key` - Bybit API 키
+    /// * `secret_key` - Bybit API 시크릿 키
     ///
-    /// # Errors
+    /// # 에러
     ///
-    /// Returns an error if the HTTP client cannot be created.
+    /// HTTP 클라이언트를 생성할 수 없는 경우 에러를 반환합니다.
     pub fn with_credentials(
         api_key: impl Into<String>,
         secret_key: impl Into<String>,
@@ -81,16 +81,16 @@ impl BybitClient {
         Self::new_internal(Some(creds), false)
     }
 
-    /// Creates a new authenticated Bybit client for testnet.
+    /// 테스트넷용 인증된 새 Bybit 클라이언트를 생성합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `api_key` - Bybit API key
-    /// * `secret_key` - Bybit API secret key
+    /// * `api_key` - Bybit API 키
+    /// * `secret_key` - Bybit API 시크릿 키
     ///
-    /// # Errors
+    /// # 에러
     ///
-    /// Returns an error if the HTTP client cannot be created.
+    /// HTTP 클라이언트를 생성할 수 없는 경우 에러를 반환합니다.
     pub fn with_credentials_testnet(
         api_key: impl Into<String>,
         secret_key: impl Into<String>,
@@ -99,7 +99,7 @@ impl BybitClient {
         Self::new_internal(Some(creds), true)
     }
 
-    /// Internal constructor.
+    /// 내부 생성자.
     fn new_internal(credentials: Option<BybitCredentials>, testnet: bool) -> ExchangeResult<Self> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -120,25 +120,25 @@ impl BybitClient {
         })
     }
 
-    /// Sets the trading category (spot, linear, inverse, option).
+    /// 거래 카테고리를 설정합니다 (spot, linear, inverse, option).
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `category` - Trading category
+    /// * `category` - 거래 카테고리
     #[must_use]
     pub fn with_category(mut self, category: impl Into<String>) -> Self {
         self.category = category.into();
         self
     }
 
-    /// Returns the credentials if available.
+    /// 사용 가능한 경우 인증 정보를 반환합니다.
     fn credentials(&self) -> ExchangeResult<&BybitCredentials> {
         self.credentials
             .as_ref()
             .ok_or_else(|| ExchangeError::AuthError("Credentials not provided".to_string()))
     }
 
-    /// Makes a GET request to a public endpoint.
+    /// 공개 엔드포인트에 GET 요청을 보냅니다.
     async fn get_public<T: serde::de::DeserializeOwned>(
         &self,
         endpoint: &str,
@@ -156,7 +156,7 @@ impl BybitClient {
         self.handle_response(response).await
     }
 
-    /// Makes a GET request to a private endpoint.
+    /// 비공개 엔드포인트에 GET 요청을 보냅니다.
     async fn get_private<T: serde::de::DeserializeOwned>(
         &self,
         endpoint: &str,
@@ -186,7 +186,7 @@ impl BybitClient {
         self.handle_response(response).await
     }
 
-    /// Makes a POST request to a private endpoint.
+    /// 비공개 엔드포인트에 POST 요청을 보냅니다.
     async fn post_private<T: serde::de::DeserializeOwned>(
         &self,
         endpoint: &str,
@@ -217,7 +217,7 @@ impl BybitClient {
         self.handle_response(response).await
     }
 
-    /// Handles API response and converts errors.
+    /// API 응답을 처리하고 에러를 변환합니다.
     async fn handle_response<T: serde::de::DeserializeOwned>(
         &self,
         response: reqwest::Response,
@@ -229,7 +229,7 @@ impl BybitClient {
             return Err(self.parse_error(&body, status.as_u16()));
         }
 
-        // Parse Bybit response wrapper
+        // Bybit 응답 래퍼 파싱
         let bybit_resp: BybitResponse<T> =
             serde_json::from_str(&body).map_err(ExchangeError::JsonError)?;
 
@@ -240,7 +240,7 @@ impl BybitClient {
         Ok(bybit_resp.result)
     }
 
-    /// Parses error from response body.
+    /// 응답 본문에서 에러를 파싱합니다.
     fn parse_error(&self, body: &str, status: u16) -> ExchangeError {
         if let Ok(resp) = serde_json::from_str::<BybitResponse<serde_json::Value>>(body) {
             return self.convert_bybit_error(resp.ret_code, &resp.ret_msg);
@@ -252,24 +252,24 @@ impl BybitClient {
         }
     }
 
-    /// Converts Bybit error code to ExchangeError.
+    /// Bybit 에러 코드를 ExchangeError로 변환합니다.
     fn convert_bybit_error(&self, ret_code: i32, message: &str) -> ExchangeError {
         match ret_code {
-            // Authentication errors
+            // 인증 에러
             10003 | 10004 | 10005 | 33004 => ExchangeError::AuthError(message.to_string()),
-            // Invalid parameter (10001 is also used for market not found, handled in order)
+            // 잘못된 파라미터 (10001은 마켓을 찾을 수 없는 경우에도 사용되며, 주문에서 처리됨)
             10002 | 10016 => ExchangeError::InvalidParameter(message.to_string()),
-            // Insufficient funds
+            // 잔고 부족
             110007 | 110011 | 110012 => ExchangeError::InsufficientFunds(message.to_string()),
-            // Order not found
+            // 주문을 찾을 수 없음
             110001 | 20001 => ExchangeError::OrderNotFound(message.to_string()),
-            // Market not found / Invalid parameter (ambiguous error code)
+            // 마켓을 찾을 수 없음 / 잘못된 파라미터 (모호한 에러 코드)
             10001 => ExchangeError::InvalidParameter(message.to_string()),
-            // Rate limit
+            // 요청 제한 초과
             10006 | 10018 => ExchangeError::RateLimitExceeded(message.to_string()),
-            // System error
+            // 시스템 에러
             10000 | 10010 => ExchangeError::InternalError(message.to_string()),
-            // Unknown
+            // 알 수 없음
             _ => ExchangeError::UnknownError {
                 code: ret_code.to_string(),
                 message: message.to_string(),
@@ -277,11 +277,11 @@ impl BybitClient {
         }
     }
 
-    /// Converts Bybit symbol format to common market format.
+    /// Bybit 심볼 형식을 공통 마켓 형식으로 변환합니다.
     ///
-    /// Bybit uses "BTCUSDT" format, we need to convert to "USDT-BTC" format.
+    /// Bybit은 "BTCUSDT" 형식을 사용하며, "USDT-BTC" 형식으로 변환해야 합니다.
     fn to_market_code(symbol: &str) -> String {
-        // Common quote currencies in order of preference
+        // 일반적인 quote 통화 (우선순위 순)
         let quotes = ["USDT", "USDC", "BTC", "ETH", "EUR", "DAI"];
 
         for quote in quotes {
@@ -290,13 +290,13 @@ impl BybitClient {
             }
         }
 
-        // Fallback: return as-is
+        // 폴백: 그대로 반환
         symbol.to_string()
     }
 
-    /// Converts common market format to Bybit symbol format.
+    /// 공통 마켓 형식을 Bybit 심볼 형식으로 변환합니다.
     ///
-    /// Common format "USDT-BTC" -> Bybit "BTCUSDT"
+    /// 공통 형식 "USDT-BTC" -> Bybit "BTCUSDT"
     fn to_bybit_symbol(market: &str) -> String {
         if let Some((quote, base)) = market.split_once('-') {
             format!("{}{}", base, quote)
@@ -381,7 +381,7 @@ impl OrderManagement for BybitClient {
         let order_type = match request.order_type {
             OrderType::Limit => "Limit",
             OrderType::Market | OrderType::Price => "Market",
-            OrderType::Best => "Limit", // Bybit doesn't have "best" order type
+            OrderType::Best => "Limit", // Bybit에는 "best" 주문 유형이 없음
         };
 
         let time_in_force = request.time_in_force.map(|tif| match tif {
@@ -391,9 +391,9 @@ impl OrderManagement for BybitClient {
             TimeInForce::PostOnly => "PostOnly",
         });
 
-        // For market buy orders with price (total amount), use quoteCoin as market_unit
+        // 가격이 있는 시장가 매수 주문의 경우 (총 금액), market_unit으로 quoteCoin 사용
         let (qty, market_unit) = if request.order_type == OrderType::Price {
-            // Market buy by total quote amount
+            // 총 quote 금액으로 시장가 매수
             (
                 request.price.unwrap_or(Decimal::ZERO).to_string(),
                 Some("quoteCoin".to_string()),
@@ -416,12 +416,12 @@ impl OrderManagement for BybitClient {
 
         let result: BybitCreateOrderResult = self.post_private("/v5/order/create", &body).await?;
 
-        // Fetch the full order details
+        // 전체 주문 상세 정보 조회
         self.get_order(&result.order_id).await
     }
 
     async fn cancel_order(&self, order_id: &str) -> ExchangeResult<Order> {
-        // First, get the order to find its symbol
+        // 먼저 주문을 조회하여 심볼 확인
         let order = self.get_order(order_id).await?;
         let symbol = Self::to_bybit_symbol(&order.market);
 
@@ -434,7 +434,7 @@ impl OrderManagement for BybitClient {
 
         let _result: BybitCancelOrderResult = self.post_private("/v5/order/cancel", &body).await?;
 
-        // Return the updated order
+        // 업데이트된 주문 반환
         self.get_order(order_id).await
     }
 
@@ -500,7 +500,7 @@ impl OrderManagement for BybitClient {
     }
 }
 
-// Conversion functions
+// 변환 함수들
 
 fn convert_ticker(t: crate::exchanges::bybit::types::BybitTicker, market: &str) -> Ticker {
     let change = if t.price_24h_pcnt > Decimal::ZERO {
@@ -516,7 +516,7 @@ fn convert_ticker(t: crate::exchanges::bybit::types::BybitTicker, market: &str) 
     Ticker {
         market: market.to_string(),
         trade_price: t.last_price,
-        opening_price: t.prev_price_24h, // Bybit doesn't provide exact opening price
+        opening_price: t.prev_price_24h, // Bybit은 정확한 시가를 제공하지 않음
         high_price: t.high_price_24h,
         low_price: t.low_price_24h,
         prev_closing_price: t.prev_price_24h,
@@ -633,18 +633,18 @@ fn convert_balance(b: crate::exchanges::bybit::types::BybitCoinBalance) -> Balan
         currency: b.coin,
         balance: b.available_to_withdraw,
         locked,
-        avg_buy_price: Decimal::ZERO,      // Bybit doesn't provide this
-        unit_currency: "USDT".to_string(), // Default to USDT
+        avg_buy_price: Decimal::ZERO,      // Bybit은 이 정보를 제공하지 않음
+        unit_currency: "USDT".to_string(), // 기본값 USDT
     }
 }
 
-/// Converts CandleInterval to Bybit interval string.
+/// CandleInterval을 Bybit 간격 문자열로 변환합니다.
 fn interval_to_bybit(interval: CandleInterval) -> &'static str {
     match interval {
         CandleInterval::Minute1 => "1",
         CandleInterval::Minute3 => "3",
         CandleInterval::Minute5 => "5",
-        CandleInterval::Minute10 => "15", // Bybit doesn't have 10m, use 15m
+        CandleInterval::Minute10 => "15", // Bybit에는 10분 간격이 없어 15분 사용
         CandleInterval::Minute15 => "15",
         CandleInterval::Minute30 => "30",
         CandleInterval::Minute60 => "60",

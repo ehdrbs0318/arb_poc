@@ -1,32 +1,32 @@
-//! Common types for exchange abstraction.
+//! 거래소 추상화를 위한 공통 타입.
 //!
-//! This module defines the data structures used across all exchange implementations.
+//! 이 모듈은 모든 거래소 구현에서 사용되는 데이터 구조를 정의합니다.
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-/// Represents a trading pair/market (e.g., "KRW-BTC", "BTC-USDT").
+/// 거래 쌍/마켓을 나타냅니다 (예: "KRW-BTC", "BTC-USDT").
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Market {
-    /// The market code (e.g., "KRW-BTC").
+    /// 마켓 코드 (예: "KRW-BTC").
     pub code: String,
-    /// Base currency (e.g., "BTC").
+    /// 기준 통화 (예: "BTC").
     pub base: String,
-    /// Quote currency (e.g., "KRW").
+    /// 견적 통화 (예: "KRW").
     pub quote: String,
 }
 
 impl Market {
-    /// Creates a new Market from a code string.
+    /// 코드 문자열로부터 새 Market을 생성합니다.
     ///
-    /// # Arguments
+    /// # 매개변수
     ///
-    /// * `code` - Market code in "QUOTE-BASE" format (e.g., "KRW-BTC")
+    /// * `code` - "QUOTE-BASE" 형식의 마켓 코드 (예: "KRW-BTC")
     ///
-    /// # Returns
+    /// # 반환값
     ///
-    /// Returns `Some(Market)` if the code is valid, `None` otherwise.
+    /// 코드가 유효하면 `Some(Market)`을, 그렇지 않으면 `None`을 반환합니다.
     #[must_use]
     pub fn from_code(code: &str) -> Option<Self> {
         let parts: Vec<&str> = code.split('-').collect();
@@ -42,88 +42,88 @@ impl Market {
     }
 }
 
-/// Current price information for a market.
+/// 마켓의 현재 가격 정보.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ticker {
-    /// Market code.
+    /// 마켓 코드.
     pub market: String,
-    /// Current trade price.
+    /// 현재 거래 가격.
     pub trade_price: Decimal,
-    /// Opening price.
+    /// 시가.
     pub opening_price: Decimal,
-    /// Highest price in 24 hours.
+    /// 24시간 최고가.
     pub high_price: Decimal,
-    /// Lowest price in 24 hours.
+    /// 24시간 최저가.
     pub low_price: Decimal,
-    /// Previous closing price.
+    /// 전일 종가.
     pub prev_closing_price: Decimal,
-    /// Price change status.
+    /// 가격 변동 상태.
     pub change: PriceChange,
-    /// Change rate (percentage).
+    /// 변동률 (백분율).
     pub change_rate: Decimal,
-    /// Change price (absolute).
+    /// 변동 가격 (절대값).
     pub change_price: Decimal,
-    /// 24-hour accumulated trade volume.
+    /// 24시간 누적 거래량.
     pub acc_trade_volume_24h: Decimal,
-    /// 24-hour accumulated trade price.
+    /// 24시간 누적 거래 금액.
     pub acc_trade_price_24h: Decimal,
-    /// Timestamp.
+    /// 타임스탬프.
     pub timestamp: DateTime<Utc>,
 }
 
-/// Price change direction.
+/// 가격 변동 방향.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum PriceChange {
-    /// Price increased.
+    /// 가격 상승.
     Rise,
-    /// Price decreased.
+    /// 가격 하락.
     Fall,
-    /// Price unchanged.
+    /// 가격 변동 없음.
     #[default]
     Even,
 }
 
-/// A single level in the order book.
+/// 호가창의 단일 호가 레벨.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderBookLevel {
-    /// Price at this level.
+    /// 해당 레벨의 가격.
     pub price: Decimal,
-    /// Size/quantity at this level.
+    /// 해당 레벨의 수량.
     pub size: Decimal,
 }
 
-/// Order book snapshot for a market.
+/// 마켓의 호가창 스냅샷.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderBook {
-    /// Market code.
+    /// 마켓 코드.
     pub market: String,
-    /// Ask (sell) orders, sorted by price ascending.
+    /// 매도(ask) 호가, 가격 오름차순 정렬.
     pub asks: Vec<OrderBookLevel>,
-    /// Bid (buy) orders, sorted by price descending.
+    /// 매수(bid) 호가, 가격 내림차순 정렬.
     pub bids: Vec<OrderBookLevel>,
-    /// Total ask size.
+    /// 총 매도 잔량.
     pub total_ask_size: Decimal,
-    /// Total bid size.
+    /// 총 매수 잔량.
     pub total_bid_size: Decimal,
-    /// Timestamp.
+    /// 타임스탬프.
     pub timestamp: DateTime<Utc>,
 }
 
 impl OrderBook {
-    /// Returns the best ask (lowest sell price).
+    /// 최우선 매도호가(가장 낮은 매도 가격)를 반환합니다.
     #[must_use]
     pub fn best_ask(&self) -> Option<&OrderBookLevel> {
         self.asks.first()
     }
 
-    /// Returns the best bid (highest buy price).
+    /// 최우선 매수호가(가장 높은 매수 가격)를 반환합니다.
     #[must_use]
     pub fn best_bid(&self) -> Option<&OrderBookLevel> {
         self.bids.first()
     }
 
-    /// Calculates the spread between best ask and best bid.
+    /// 최우선 매도호가와 매수호가 사이의 스프레드를 계산합니다.
     #[must_use]
     pub fn spread(&self) -> Option<Decimal> {
         match (self.best_ask(), self.best_bid()) {
@@ -132,7 +132,7 @@ impl OrderBook {
         }
     }
 
-    /// Calculates the spread percentage.
+    /// 스프레드 백분율을 계산합니다.
     #[must_use]
     pub fn spread_percentage(&self) -> Option<Decimal> {
         match (self.best_ask(), self.best_bid()) {
@@ -144,54 +144,54 @@ impl OrderBook {
     }
 }
 
-/// Candle (OHLCV) data.
+/// 캔들 (OHLCV) 데이터.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candle {
-    /// Market code.
+    /// 마켓 코드.
     pub market: String,
-    /// Candle timestamp (start of the period).
+    /// 캔들 타임스탬프 (해당 기간의 시작).
     pub timestamp: DateTime<Utc>,
-    /// Opening price.
+    /// 시가.
     pub open: Decimal,
-    /// Highest price.
+    /// 고가.
     pub high: Decimal,
-    /// Lowest price.
+    /// 저가.
     pub low: Decimal,
-    /// Closing price.
+    /// 종가.
     pub close: Decimal,
-    /// Volume.
+    /// 거래량.
     pub volume: Decimal,
 }
 
-/// Candle interval/timeframe.
+/// 캔들 간격/타임프레임.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandleInterval {
-    /// 1 minute.
+    /// 1분.
     Minute1,
-    /// 3 minutes.
+    /// 3분.
     Minute3,
-    /// 5 minutes.
+    /// 5분.
     Minute5,
-    /// 10 minutes.
+    /// 10분.
     Minute10,
-    /// 15 minutes.
+    /// 15분.
     Minute15,
-    /// 30 minutes.
+    /// 30분.
     Minute30,
-    /// 60 minutes (1 hour).
+    /// 60분 (1시간).
     Minute60,
-    /// 240 minutes (4 hours).
+    /// 240분 (4시간).
     Minute240,
-    /// 1 day.
+    /// 1일.
     Day,
-    /// 1 week.
+    /// 1주.
     Week,
-    /// 1 month.
+    /// 1개월.
     Month,
 }
 
 impl CandleInterval {
-    /// Returns the interval in minutes.
+    /// 간격을 분 단위로 반환합니다.
     #[must_use]
     pub const fn as_minutes(&self) -> u32 {
         match self {
@@ -210,85 +210,85 @@ impl CandleInterval {
     }
 }
 
-/// Order side (buy or sell).
+/// 주문 방향 (매수 또는 매도).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OrderSide {
-    /// Buy order (bid).
+    /// 매수 주문 (bid).
     #[serde(alias = "bid")]
     Buy,
-    /// Sell order (ask).
+    /// 매도 주문 (ask).
     #[serde(alias = "ask")]
     Sell,
 }
 
-/// Order type.
+/// 주문 유형.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OrderType {
-    /// Limit order.
+    /// 지정가 주문.
     Limit,
-    /// Market order.
+    /// 시장가 주문.
     Market,
-    /// Market buy order (by price/total).
+    /// 시장가 매수 주문 (총액 기준).
     Price,
-    /// Best price order.
+    /// 최유리 지정가 주문.
     Best,
 }
 
-/// Time in force for orders.
+/// 주문의 유효 기간 조건.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TimeInForce {
-    /// Good till cancelled.
+    /// 취소될 때까지 유효 (Good Till Cancelled).
     Gtc,
-    /// Immediate or cancel.
+    /// 즉시 체결 또는 취소 (Immediate Or Cancel).
     Ioc,
-    /// Fill or kill.
+    /// 전량 체결 또는 취소 (Fill Or Kill).
     Fok,
-    /// Post only (maker only).
+    /// 메이커 주문만 허용 (Post Only).
     PostOnly,
 }
 
-/// Order status.
+/// 주문 상태.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OrderStatus {
-    /// Order is waiting to be processed.
+    /// 주문 대기 중.
     Wait,
-    /// Order is being processed.
+    /// 주문 처리 중.
     Watch,
-    /// Order is partially filled.
+    /// 부분 체결됨.
     PartiallyFilled,
-    /// Order is completely filled.
+    /// 전량 체결됨.
     Filled,
-    /// Order is cancelled.
+    /// 취소됨.
     Cancelled,
-    /// Order is rejected.
+    /// 거부됨.
     Rejected,
 }
 
-/// Order request parameters.
+/// 주문 요청 매개변수.
 #[derive(Debug, Clone)]
 pub struct OrderRequest {
-    /// Market code.
+    /// 마켓 코드.
     pub market: String,
-    /// Order side (buy/sell).
+    /// 주문 방향 (매수/매도).
     pub side: OrderSide,
-    /// Order type.
+    /// 주문 유형.
     pub order_type: OrderType,
-    /// Order volume (quantity). Required for limit and market sell orders.
+    /// 주문 수량. 지정가 주문 및 시장가 매도 주문에 필수.
     pub volume: Option<Decimal>,
-    /// Order price. Required for limit orders and market buy orders (as total).
+    /// 주문 가격. 지정가 주문 및 시장가 매수 주문(총액)에 필수.
     pub price: Option<Decimal>,
-    /// Time in force.
+    /// 유효 기간 조건.
     pub time_in_force: Option<TimeInForce>,
-    /// Client-defined identifier.
+    /// 클라이언트 정의 식별자.
     pub identifier: Option<String>,
 }
 
 impl OrderRequest {
-    /// Creates a limit buy order request.
+    /// 지정가 매수 주문 요청을 생성합니다.
     #[must_use]
     pub fn limit_buy(market: impl Into<String>, price: Decimal, volume: Decimal) -> Self {
         Self {
@@ -302,7 +302,7 @@ impl OrderRequest {
         }
     }
 
-    /// Creates a limit sell order request.
+    /// 지정가 매도 주문 요청을 생성합니다.
     #[must_use]
     pub fn limit_sell(market: impl Into<String>, price: Decimal, volume: Decimal) -> Self {
         Self {
@@ -316,7 +316,7 @@ impl OrderRequest {
         }
     }
 
-    /// Creates a market buy order request (by total price).
+    /// 시장가 매수 주문 요청을 생성합니다 (총액 기준).
     #[must_use]
     pub fn market_buy(market: impl Into<String>, total: Decimal) -> Self {
         Self {
@@ -330,7 +330,7 @@ impl OrderRequest {
         }
     }
 
-    /// Creates a market sell order request (by volume).
+    /// 시장가 매도 주문 요청을 생성합니다 (수량 기준).
     #[must_use]
     pub fn market_sell(market: impl Into<String>, volume: Decimal) -> Self {
         Self {
@@ -344,14 +344,14 @@ impl OrderRequest {
         }
     }
 
-    /// Sets the time in force.
+    /// 유효 기간 조건을 설정합니다.
     #[must_use]
     pub fn with_time_in_force(mut self, tif: TimeInForce) -> Self {
         self.time_in_force = Some(tif);
         self
     }
 
-    /// Sets the client identifier.
+    /// 클라이언트 식별자를 설정합니다.
     #[must_use]
     pub fn with_identifier(mut self, identifier: impl Into<String>) -> Self {
         self.identifier = Some(identifier.into());
@@ -359,54 +359,54 @@ impl OrderRequest {
     }
 }
 
-/// Order response from the exchange.
+/// 거래소로부터의 주문 응답.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Order {
-    /// Exchange-assigned order ID.
+    /// 거래소에서 할당한 주문 ID.
     pub id: String,
-    /// Market code.
+    /// 마켓 코드.
     pub market: String,
-    /// Order side.
+    /// 주문 방향.
     pub side: OrderSide,
-    /// Order type.
+    /// 주문 유형.
     pub order_type: OrderType,
-    /// Order status.
+    /// 주문 상태.
     pub status: OrderStatus,
-    /// Original order volume.
+    /// 원래 주문 수량.
     pub volume: Decimal,
-    /// Remaining volume.
+    /// 미체결 수량.
     pub remaining_volume: Decimal,
-    /// Executed volume.
+    /// 체결 수량.
     pub executed_volume: Decimal,
-    /// Order price (for limit orders).
+    /// 주문 가격 (지정가 주문의 경우).
     pub price: Option<Decimal>,
-    /// Average executed price.
+    /// 평균 체결 가격.
     pub avg_price: Option<Decimal>,
-    /// Paid fee.
+    /// 지불한 수수료.
     pub paid_fee: Decimal,
-    /// Order creation timestamp.
+    /// 주문 생성 타임스탬프.
     pub created_at: DateTime<Utc>,
-    /// Client identifier (if provided).
+    /// 클라이언트 식별자 (제공된 경우).
     pub identifier: Option<String>,
 }
 
-/// Account balance for a single currency.
+/// 단일 통화의 계정 잔고.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Balance {
-    /// Currency code (e.g., "BTC", "KRW").
+    /// 통화 코드 (예: "BTC", "KRW").
     pub currency: String,
-    /// Available balance.
+    /// 가용 잔고.
     pub balance: Decimal,
-    /// Locked balance (in orders).
+    /// 잠긴 잔고 (주문에 사용 중).
     pub locked: Decimal,
-    /// Average buy price.
+    /// 평균 매수 가격.
     pub avg_buy_price: Decimal,
-    /// Unit currency for avg_buy_price.
+    /// 평균 매수 가격의 단위 통화.
     pub unit_currency: String,
 }
 
 impl Balance {
-    /// Returns the total balance (available + locked).
+    /// 총 잔고 (가용 + 잠김)를 반환합니다.
     #[must_use]
     pub fn total(&self) -> Decimal {
         self.balance + self.locked

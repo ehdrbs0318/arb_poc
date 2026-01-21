@@ -1,7 +1,7 @@
-//! Object-safe exchange adapter trait.
+//! 객체 안전(object-safe) 거래소 어댑터 trait.
 //!
-//! This module provides an object-safe version of the exchange traits,
-//! enabling dynamic dispatch and runtime exchange selection.
+//! 이 모듈은 거래소 trait의 객체 안전 버전을 제공하여,
+//! 동적 디스패치와 런타임 거래소 선택을 가능하게 합니다.
 
 use crate::exchange::error::ExchangeResult;
 use crate::exchange::types::{
@@ -10,12 +10,12 @@ use crate::exchange::types::{
 use async_trait::async_trait;
 use std::fmt::Debug;
 
-/// Object-safe adapter trait for exchange operations.
+/// 거래소 작업을 위한 객체 안전 어댑터 trait.
 ///
-/// This trait uses `async_trait` to enable object safety for async methods,
-/// allowing exchanges to be used as `Box<dyn ExchangeAdapter>` or `Arc<dyn ExchangeAdapter>`.
+/// 이 trait은 `async_trait`을 사용하여 비동기 메서드의 객체 안전성을 확보하며,
+/// 거래소를 `Box<dyn ExchangeAdapter>` 또는 `Arc<dyn ExchangeAdapter>`로 사용할 수 있게 합니다.
 ///
-/// # Example
+/// # 예제
 ///
 /// ```ignore
 /// use std::sync::Arc;
@@ -25,44 +25,44 @@ use std::fmt::Debug;
 /// ```
 #[async_trait]
 pub trait ExchangeAdapter: Send + Sync + Debug {
-    /// Returns the exchange name (e.g., "Upbit", "Bithumb", "Bybit").
+    /// 거래소 이름을 반환합니다 (예: "Upbit", "Bithumb", "Bybit").
     fn name(&self) -> &str;
 
-    /// Returns whether the exchange client is authenticated.
+    /// 거래소 클라이언트가 인증되었는지 여부를 반환합니다.
     fn is_authenticated(&self) -> bool;
 
-    /// Returns the exchange's native quote currency (e.g., "KRW" for Korean exchanges, "USDT" for Bybit).
+    /// 거래소의 기본 호가 통화를 반환합니다 (예: 한국 거래소는 "KRW", Bybit은 "USDT").
     fn native_quote_currency(&self) -> &str;
 
-    // ==================== Market Data Operations ====================
+    // ==================== 시장 데이터 작업 ====================
 
-    /// Fetches the current ticker for one or more markets.
+    /// 하나 이상의 마켓에 대한 현재 티커를 조회합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `markets` - A slice of market codes (e.g., ["KRW-BTC", "KRW-ETH"])
+    /// * `markets` - 마켓 코드 슬라이스 (예: ["KRW-BTC", "KRW-ETH"])
     ///
-    /// # Note
+    /// # 참고
     ///
-    /// Market codes should be in the internal format `{QUOTE}-{BASE}` (e.g., "KRW-BTC").
-    /// The adapter handles conversion to the exchange's native format.
+    /// 마켓 코드는 내부 형식 `{QUOTE}-{BASE}`(예: "KRW-BTC")를 사용해야 합니다.
+    /// 어댑터가 거래소의 고유 형식으로 변환을 처리합니다.
     async fn get_ticker(&self, markets: &[&str]) -> ExchangeResult<Vec<Ticker>>;
 
-    /// Fetches the order book for a market.
+    /// 마켓의 호가창을 조회합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `market` - Market code (e.g., "KRW-BTC")
-    /// * `depth` - Number of levels to fetch (optional, default varies by exchange)
+    /// * `market` - 마켓 코드 (예: "KRW-BTC")
+    /// * `depth` - 조회할 호가 레벨 수 (선택사항, 기본값은 거래소마다 다름)
     async fn get_orderbook(&self, market: &str, depth: Option<u32>) -> ExchangeResult<OrderBook>;
 
-    /// Fetches candle data for a market.
+    /// 마켓의 캔들 데이터를 조회합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `market` - Market code (e.g., "KRW-BTC")
-    /// * `interval` - Candle interval
-    /// * `count` - Number of candles to fetch
+    /// * `market` - 마켓 코드 (예: "KRW-BTC")
+    /// * `interval` - 캔들 간격
+    /// * `count` - 조회할 캔들 수
     async fn get_candles(
         &self,
         market: &str,
@@ -70,66 +70,66 @@ pub trait ExchangeAdapter: Send + Sync + Debug {
         count: u32,
     ) -> ExchangeResult<Vec<Candle>>;
 
-    // ==================== Order Management Operations ====================
+    // ==================== 주문 관리 작업 ====================
 
-    /// Places a new order.
+    /// 새 주문을 생성합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `request` - Order request parameters
+    /// * `request` - 주문 요청 파라미터
     async fn place_order(&self, request: &OrderRequest) -> ExchangeResult<Order>;
 
-    /// Cancels an existing order.
+    /// 기존 주문을 취소합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `order_id` - Exchange-assigned order ID
+    /// * `order_id` - 거래소가 할당한 주문 ID
     async fn cancel_order(&self, order_id: &str) -> ExchangeResult<Order>;
 
-    /// Fetches an order by ID.
+    /// ID로 주문을 조회합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `order_id` - Exchange-assigned order ID
+    /// * `order_id` - 거래소가 할당한 주문 ID
     async fn get_order(&self, order_id: &str) -> ExchangeResult<Order>;
 
-    /// Fetches open orders for a market.
+    /// 마켓의 미체결 주문을 조회합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `market` - Market code (optional, None for all markets)
+    /// * `market` - 마켓 코드 (선택사항, None이면 모든 마켓)
     async fn get_open_orders(&self, market: Option<&str>) -> ExchangeResult<Vec<Order>>;
 
-    /// Fetches account balances.
+    /// 계정 잔고를 조회합니다.
     async fn get_balances(&self) -> ExchangeResult<Vec<Balance>>;
 
-    /// Fetches balance for a specific currency.
+    /// 특정 통화의 잔고를 조회합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `currency` - Currency code (e.g., "BTC", "KRW")
+    /// * `currency` - 통화 코드 (예: "BTC", "KRW")
     async fn get_balance(&self, currency: &str) -> ExchangeResult<Balance>;
 }
 
-/// Wrapper to adapt existing clients implementing MarketData + OrderManagement to ExchangeAdapter.
+/// MarketData + OrderManagement를 구현하는 기존 클라이언트를 ExchangeAdapter로 적응시키는 래퍼.
 ///
-/// This macro generates an adapter struct that implements ExchangeAdapter for a given client type.
+/// 이 macro는 주어진 클라이언트 타입에 대해 ExchangeAdapter를 구현하는 어댑터 구조체를 생성합니다.
 #[macro_export]
 macro_rules! impl_exchange_adapter {
     ($adapter_name:ident, $client_type:ty, $exchange_name:expr, $quote_currency:expr) => {
-        /// Adapter wrapper for the exchange client.
+        /// 거래소 클라이언트를 위한 어댑터 래퍼.
         #[derive(Debug)]
         pub struct $adapter_name {
             client: $client_type,
         }
 
         impl $adapter_name {
-            /// Creates a new adapter from the client.
+            /// 클라이언트로부터 새 어댑터를 생성합니다.
             pub fn new(client: $client_type) -> Self {
                 Self { client }
             }
 
-            /// Returns a reference to the underlying client.
+            /// 기본 클라이언트에 대한 참조를 반환합니다.
             pub fn client(&self) -> &$client_type {
                 &self.client
             }
@@ -231,9 +231,9 @@ macro_rules! impl_exchange_adapter {
 mod tests {
     use super::*;
 
-    // Compile-time test to ensure ExchangeAdapter is object-safe
+    // ExchangeAdapter가 객체 안전한지 확인하는 컴파일 타임 테스트
     fn _assert_object_safe(_: &dyn ExchangeAdapter) {}
 
-    // Compile-time test to ensure ExchangeAdapter can be used with Arc
+    // ExchangeAdapter가 Arc와 함께 사용 가능한지 확인하는 컴파일 타임 테스트
     fn _assert_arc_compatible(_: std::sync::Arc<dyn ExchangeAdapter>) {}
 }

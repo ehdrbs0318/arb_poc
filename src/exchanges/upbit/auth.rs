@@ -1,6 +1,6 @@
-//! Upbit JWT authentication module.
+//! Upbit JWT 인증 모듈.
 //!
-//! This module handles JWT token generation for Upbit API authentication.
+//! 이 모듈은 Upbit API 인증을 위한 JWT 토큰 생성을 처리합니다.
 
 use crate::exchange::ExchangeError;
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -8,7 +8,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha512};
 use uuid::Uuid;
 
-/// JWT payload for Upbit authentication.
+/// Upbit 인증을 위한 JWT 페이로드.
 #[derive(Debug, Serialize)]
 struct JwtPayload {
     access_key: String,
@@ -19,7 +19,7 @@ struct JwtPayload {
     query_hash_alg: Option<String>,
 }
 
-/// Credentials for Upbit API authentication.
+/// Upbit API 인증을 위한 자격 증명.
 #[derive(Debug, Clone)]
 pub struct UpbitCredentials {
     access_key: String,
@@ -27,9 +27,9 @@ pub struct UpbitCredentials {
 }
 
 impl UpbitCredentials {
-    /// Creates new credentials.
+    /// 새로운 자격 증명을 생성합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
     /// * `access_key` - Upbit API access key
     /// * `secret_key` - Upbit API secret key
@@ -40,9 +40,9 @@ impl UpbitCredentials {
         }
     }
 
-    /// Generates a JWT token without query parameters.
+    /// 쿼리 파라미터 없이 JWT 토큰을 생성합니다.
     ///
-    /// Used for endpoints that don't require query parameters.
+    /// 쿼리 파라미터가 필요하지 않은 엔드포인트에 사용됩니다.
     pub fn generate_token(&self) -> Result<String, ExchangeError> {
         let payload = JwtPayload {
             access_key: self.access_key.clone(),
@@ -54,13 +54,13 @@ impl UpbitCredentials {
         self.encode_token(&payload)
     }
 
-    /// Generates a JWT token with query hash.
+    /// 쿼리 해시를 포함한 JWT 토큰을 생성합니다.
     ///
-    /// Used for endpoints that require query parameters.
+    /// 쿼리 파라미터가 필요한 엔드포인트에 사용됩니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `query_string` - URL-encoded query string (e.g., "market=KRW-BTC&side=bid")
+    /// * `query_string` - URL 인코딩된 쿼리 문자열 (예: "market=KRW-BTC&side=bid")
     pub fn generate_token_with_query(&self, query_string: &str) -> Result<String, ExchangeError> {
         let query_hash = self.hash_query(query_string);
 
@@ -74,7 +74,7 @@ impl UpbitCredentials {
         self.encode_token(&payload)
     }
 
-    /// Hashes the query string using SHA512.
+    /// SHA512를 사용하여 쿼리 문자열을 해시합니다.
     fn hash_query(&self, query_string: &str) -> String {
         let mut hasher = Sha512::new();
         hasher.update(query_string.as_bytes());
@@ -82,21 +82,21 @@ impl UpbitCredentials {
         hex::encode(result)
     }
 
-    /// Encodes the JWT payload.
+    /// JWT 페이로드를 인코딩합니다.
     fn encode_token(&self, payload: &JwtPayload) -> Result<String, ExchangeError> {
-        let header = Header::default(); // Uses HS256 by default
+        let header = Header::default(); // 기본값으로 HS256 사용
         let key = EncodingKey::from_secret(self.secret_key.as_bytes());
 
         encode(&header, payload, &key).map_err(|e| ExchangeError::AuthError(e.to_string()))
     }
 
-    /// Returns the authorization header value.
+    /// Authorization 헤더 값을 반환합니다.
     pub fn authorization_header(&self) -> Result<String, ExchangeError> {
         let token = self.generate_token()?;
         Ok(format!("Bearer {token}"))
     }
 
-    /// Returns the authorization header value with query hash.
+    /// 쿼리 해시를 포함한 Authorization 헤더 값을 반환합니다.
     pub fn authorization_header_with_query(
         &self,
         query_string: &str,
@@ -106,15 +106,15 @@ impl UpbitCredentials {
     }
 }
 
-/// Builds a query string from parameters.
+/// 파라미터로부터 쿼리 문자열을 생성합니다.
 ///
-/// # Arguments
+/// # 인자
 ///
-/// * `params` - Iterator of key-value pairs
+/// * `params` - 키-값 쌍의 이터레이터
 ///
-/// # Returns
+/// # 반환값
 ///
-/// URL-encoded query string
+/// URL 인코딩된 쿼리 문자열
 pub fn build_query_string<I, K, V>(params: I) -> String
 where
     I: IntoIterator<Item = (K, V)>,
@@ -145,7 +145,7 @@ mod tests {
         assert!(token.is_ok());
 
         let token = token.unwrap();
-        // JWT tokens have 3 parts separated by dots
+        // JWT 토큰은 점(.)으로 구분된 3개의 파트로 구성됨
         assert_eq!(token.split('.').count(), 3);
     }
 
@@ -162,9 +162,9 @@ mod tests {
         let creds = UpbitCredentials::new("test", "test");
         let hash = creds.hash_query("market=KRW-BTC");
 
-        // SHA512 produces 128 hex characters
+        // SHA512는 128개의 16진수 문자를 생성함
         assert_eq!(hash.len(), 128);
-        // Hash should be consistent
+        // 해시 값은 일관성이 있어야 함
         assert_eq!(hash, creds.hash_query("market=KRW-BTC"));
     }
 
@@ -183,7 +183,7 @@ mod tests {
     fn test_build_query_string_with_special_chars() {
         let params = vec![("key", "value with spaces")];
         let query = build_query_string(params);
-        // URL encoding uses + for spaces in form-urlencoded format
+        // URL 인코딩은 form-urlencoded 형식에서 공백을 +로 변환함
         assert_eq!(query, "key=value+with+spaces");
     }
 

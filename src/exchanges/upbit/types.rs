@@ -1,13 +1,13 @@
-//! Upbit-specific types and API response structures.
+//! Upbit 전용 타입 및 API 응답 구조체.
 //!
-//! These types are used for deserializing Upbit API responses
-//! and are then converted to the common exchange types.
+//! 이 타입들은 Upbit API 응답을 역직렬화하는 데 사용되며,
+//! 이후 공통 거래소 타입으로 변환됩니다.
 
 use chrono::{DateTime, TimeZone, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize};
 
-/// Upbit API error response.
+/// Upbit API 에러 응답.
 #[derive(Debug, Deserialize)]
 pub struct UpbitError {
     pub error: UpbitErrorDetail,
@@ -19,7 +19,7 @@ pub struct UpbitErrorDetail {
     pub message: String,
 }
 
-/// Upbit ticker response.
+/// Upbit 시세(ticker) 응답.
 #[derive(Debug, Deserialize)]
 pub struct UpbitTicker {
     pub market: String,
@@ -39,7 +39,7 @@ pub struct UpbitTicker {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Upbit orderbook response.
+/// Upbit 호가창(orderbook) 응답.
 #[derive(Debug, Deserialize)]
 pub struct UpbitOrderbook {
     pub market: String,
@@ -58,7 +58,7 @@ pub struct UpbitOrderbookUnit {
     pub bid_size: Decimal,
 }
 
-/// Upbit candle response (minutes).
+/// Upbit 캔들(분봉) 응답.
 #[derive(Debug, Deserialize)]
 pub struct UpbitCandle {
     pub market: String,
@@ -72,7 +72,7 @@ pub struct UpbitCandle {
     pub candle_acc_trade_price: Decimal,
 }
 
-/// Upbit account balance response.
+/// Upbit 계좌 잔고 응답.
 #[derive(Debug, Deserialize)]
 pub struct UpbitBalance {
     pub currency: String,
@@ -87,7 +87,7 @@ pub struct UpbitBalance {
     pub unit_currency: String,
 }
 
-/// Upbit order response.
+/// Upbit 주문 응답.
 #[derive(Debug, Deserialize)]
 pub struct UpbitOrder {
     pub uuid: String,
@@ -112,7 +112,7 @@ pub struct UpbitOrder {
     pub identifier: Option<String>,
 }
 
-/// Upbit order request body.
+/// Upbit 주문 요청 본문.
 #[derive(Debug, Serialize)]
 pub struct UpbitOrderRequest {
     pub market: String,
@@ -128,7 +128,7 @@ pub struct UpbitOrderRequest {
     pub identifier: Option<String>,
 }
 
-/// Deserialize timestamp from milliseconds.
+/// 밀리초 타임스탬프를 역직렬화합니다.
 fn deserialize_timestamp_millis<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
 where
     D: Deserializer<'de>,
@@ -139,7 +139,7 @@ where
         .ok_or_else(|| serde::de::Error::custom("invalid timestamp"))
 }
 
-/// Deserialize decimal from string.
+/// 문자열에서 Decimal을 역직렬화합니다.
 fn deserialize_decimal_string<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
 where
     D: Deserializer<'de>,
@@ -148,7 +148,7 @@ where
     s.parse::<Decimal>().map_err(serde::de::Error::custom)
 }
 
-/// Deserialize optional decimal from string.
+/// 문자열에서 Optional Decimal을 역직렬화합니다.
 fn deserialize_optional_decimal_string<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
 where
     D: Deserializer<'de>,

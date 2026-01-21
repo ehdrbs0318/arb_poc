@@ -1,20 +1,20 @@
-//! Bybit private API example.
+//! Bybit 비공개 API 예제.
 //!
-//! This example demonstrates how to use the Bybit client for authenticated operations.
+//! 이 예제는 Bybit 클라이언트를 사용하여 인증이 필요한 작업을 수행하는 방법을 보여줍니다.
 //!
-//! IMPORTANT: Set your API credentials in config.toml before running:
+//! 중요: 실행 전 config.toml에 API 인증 정보를 설정하세요:
 //! ```toml
 //! [bybit]
 //! api_key = "YOUR_API_KEY"
 //! secret_key = "YOUR_SECRET_KEY"
-//! testnet = true  # Use testnet for testing!
+//! testnet = true  # 테스트에는 testnet을 사용하세요!
 //! ```
 //!
-//! Or set environment variables:
+//! 또는 환경 변수를 설정하세요:
 //! - BYBIT_API_KEY
 //! - BYBIT_SECRET_KEY
 //!
-//! Run with: cargo run --example bybit_private
+//! 실행 방법: cargo run --example bybit_private
 
 use arb_poc::exchange::{OrderManagement, OrderRequest};
 use arb_poc::exchanges::BybitClient;
@@ -23,15 +23,15 @@ use std::env;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
+    // 로깅 초기화
     tracing_subscriber::fmt().with_env_filter("info").init();
 
-    // Get API credentials from environment or config
+    // 환경 변수 또는 설정에서 API 인증 정보 가져오기
     let api_key = env::var("BYBIT_API_KEY").expect("BYBIT_API_KEY not set");
     let secret_key = env::var("BYBIT_SECRET_KEY").expect("BYBIT_SECRET_KEY not set");
     let use_testnet = env::var("BYBIT_TESTNET")
         .map(|v| v == "true" || v == "1")
-        .unwrap_or(true); // Default to testnet for safety
+        .unwrap_or(true); // 안전을 위해 기본값은 testnet
 
     println!("=== Bybit Private API Example ===\n");
     println!(
@@ -39,14 +39,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if use_testnet { "TESTNET" } else { "MAINNET" }
     );
 
-    // Create authenticated client
+    // 인증된 클라이언트 생성
     let client = if use_testnet {
         BybitClient::with_credentials_testnet(&api_key, &secret_key)?
     } else {
         BybitClient::with_credentials(&api_key, &secret_key)?
     };
 
-    // 1. Get account balances
+    // 1. 계정 잔고 조회
     println!("--- Account Balances ---");
     let balances = client.get_balances().await?;
     for balance in &balances {
@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    // 2. Get specific balance
+    // 2. 특정 통화 잔고 조회
     println!("--- USDT Balance ---");
     match client.get_balance("USDT").await {
         Ok(balance) => {
@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    // 3. Get open orders
+    // 3. 미체결 주문 조회
     println!("--- Open Orders ---");
     let open_orders = client.get_open_orders(None).await?;
     if open_orders.is_empty() {
@@ -101,8 +101,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    // 4. Place a test limit order (commented out for safety)
-    // WARNING: Uncomment only if you want to place a real order!
+    // 4. 테스트 지정가 주문 생성 (안전을 위해 주석 처리됨)
+    // 경고: 실제 주문을 하려면 주석을 해제하세요!
     /*
     println!("--- Place Limit Order ---");
     let order_request = OrderRequest::limit_buy(
@@ -117,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Order ID: {}", order.id);
             println!("Status: {:?}", order.status);
 
-            // Cancel the order
+            // 주문 취소
             println!("\n--- Cancel Order ---");
             match client.cancel_order(&order.id).await {
                 Ok(cancelled) => {

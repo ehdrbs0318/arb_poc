@@ -1,6 +1,6 @@
-//! Bithumb REST API client implementation.
+//! Bithumb REST API 클라이언트 구현.
 //!
-//! This module provides the main client for interacting with the Bithumb API.
+//! 이 모듈은 Bithumb API와 상호작용하기 위한 메인 클라이언트를 제공합니다.
 
 use crate::exchange::{
     Balance, Candle, CandleInterval, ExchangeError, ExchangeResult, MarketData, Order, OrderBook,
@@ -16,13 +16,13 @@ use chrono::{NaiveDateTime, Utc};
 use reqwest::Client;
 use std::collections::HashMap;
 
-/// Base URL for Bithumb REST API.
+/// Bithumb REST API 기본 URL.
 const BASE_URL: &str = "https://api.bithumb.com";
 
-/// Bithumb API client.
+/// Bithumb API 클라이언트.
 ///
-/// This client supports both public and private APIs.
-/// For private APIs, credentials must be provided.
+/// 이 클라이언트는 Public API와 Private API 모두 지원합니다.
+/// Private API를 사용하려면 인증 정보를 제공해야 합니다.
 #[derive(Debug)]
 pub struct BithumbClient {
     client: Client,
@@ -30,13 +30,13 @@ pub struct BithumbClient {
 }
 
 impl BithumbClient {
-    /// Creates a new unauthenticated Bithumb client.
+    /// 인증되지 않은 새 Bithumb 클라이언트를 생성합니다.
     ///
-    /// This client can only access public APIs.
+    /// 이 클라이언트는 Public API만 접근할 수 있습니다.
     ///
-    /// # Errors
+    /// # 오류
     ///
-    /// Returns an error if the HTTP client cannot be created.
+    /// HTTP 클라이언트를 생성할 수 없는 경우 오류를 반환합니다.
     pub fn new() -> ExchangeResult<Self> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -49,18 +49,18 @@ impl BithumbClient {
         })
     }
 
-    /// Creates a new authenticated Bithumb client.
+    /// 인증된 새 Bithumb 클라이언트를 생성합니다.
     ///
-    /// This client can access both public and private APIs.
+    /// 이 클라이언트는 Public API와 Private API 모두 접근할 수 있습니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `access_key` - Bithumb API access key
-    /// * `secret_key` - Bithumb API secret key
+    /// * `access_key` - Bithumb API 액세스 키
+    /// * `secret_key` - Bithumb API 시크릿 키
     ///
-    /// # Errors
+    /// # 오류
     ///
-    /// Returns an error if the HTTP client cannot be created.
+    /// HTTP 클라이언트를 생성할 수 없는 경우 오류를 반환합니다.
     pub fn with_credentials(
         access_key: impl Into<String>,
         secret_key: impl Into<String>,
@@ -76,14 +76,14 @@ impl BithumbClient {
         })
     }
 
-    /// Returns the credentials if available.
+    /// 인증 정보가 있으면 반환합니다.
     fn credentials(&self) -> ExchangeResult<&BithumbCredentials> {
         self.credentials
             .as_ref()
             .ok_or_else(|| ExchangeError::AuthError("Credentials not provided".to_string()))
     }
 
-    /// Makes a GET request to a public endpoint.
+    /// Public 엔드포인트에 GET 요청을 보냅니다.
     async fn get_public<T: serde::de::DeserializeOwned>(
         &self,
         endpoint: &str,
@@ -100,7 +100,7 @@ impl BithumbClient {
         self.handle_response(response).await
     }
 
-    /// Makes a GET request to a private endpoint.
+    /// Private 엔드포인트에 GET 요청을 보냅니다.
     async fn get_private<T: serde::de::DeserializeOwned>(
         &self,
         endpoint: &str,
@@ -126,7 +126,7 @@ impl BithumbClient {
         self.handle_response(response).await
     }
 
-    /// Makes a POST request to a private endpoint.
+    /// Private 엔드포인트에 POST 요청을 보냅니다.
     async fn post_private<T: serde::de::DeserializeOwned>(
         &self,
         endpoint: &str,
@@ -135,7 +135,7 @@ impl BithumbClient {
         let creds = self.credentials()?;
         let url = format!("{BASE_URL}{endpoint}");
 
-        // Serialize body to query string format for hash
+        // 해시를 위해 본문을 쿼리 스트링 형식으로 직렬화
         let body_map: HashMap<String, serde_json::Value> =
             serde_json::from_str(&serde_json::to_string(body).map_err(ExchangeError::JsonError)?)
                 .map_err(ExchangeError::JsonError)?;
@@ -168,7 +168,7 @@ impl BithumbClient {
         self.handle_response(response).await
     }
 
-    /// Makes a DELETE request to a private endpoint.
+    /// Private 엔드포인트에 DELETE 요청을 보냅니다.
     async fn delete_private<T: serde::de::DeserializeOwned>(
         &self,
         endpoint: &str,
@@ -192,7 +192,7 @@ impl BithumbClient {
         self.handle_response(response).await
     }
 
-    /// Handles API response and converts errors.
+    /// API 응답을 처리하고 오류를 변환합니다.
     async fn handle_response<T: serde::de::DeserializeOwned>(
         &self,
         response: reqwest::Response,
@@ -204,7 +204,7 @@ impl BithumbClient {
         } else {
             let error_text = response.text().await.unwrap_or_default();
 
-            // Try to parse as Bithumb error
+            // Bithumb 오류로 파싱 시도
             if let Ok(bithumb_error) = serde_json::from_str::<BithumbError>(&error_text) {
                 return Err(self.convert_bithumb_error(status.as_u16(), &bithumb_error));
             }
@@ -216,7 +216,7 @@ impl BithumbClient {
         }
     }
 
-    /// Converts Bithumb error to ExchangeError.
+    /// Bithumb 오류를 ExchangeError로 변환합니다.
     fn convert_bithumb_error(&self, status: u16, error: &BithumbError) -> ExchangeError {
         let name = &error.error.name;
         let message = &error.error.message;
@@ -237,10 +237,10 @@ impl BithumbClient {
         }
     }
 
-    /// Converts internal market format to Bithumb format.
+    /// 내부 마켓 형식을 Bithumb 형식으로 변환합니다.
     ///
-    /// Internal format uses "{QUOTE}-{BASE}" (e.g., "KRW-BTC").
-    /// Bithumb uses "{COIN}_{PAYMENT}" format (e.g., "BTC_KRW").
+    /// 내부 형식은 "{QUOTE}-{BASE}" 형식을 사용합니다 (예: "KRW-BTC").
+    /// Bithumb은 "{COIN}_{PAYMENT}" 형식을 사용합니다 (예: "BTC_KRW").
     #[allow(dead_code)]
     fn to_bithumb_market(market: &str) -> String {
         // "KRW-BTC" -> "BTC_KRW"
@@ -252,10 +252,10 @@ impl BithumbClient {
         }
     }
 
-    /// Converts Bithumb market format to internal format.
+    /// Bithumb 마켓 형식을 내부 형식으로 변환합니다.
     ///
-    /// Bithumb uses "{COIN}_{PAYMENT}" format (e.g., "BTC_KRW").
-    /// Internal format uses "{QUOTE}-{BASE}" (e.g., "KRW-BTC").
+    /// Bithumb은 "{COIN}_{PAYMENT}" 형식을 사용합니다 (예: "BTC_KRW").
+    /// 내부 형식은 "{QUOTE}-{BASE}" 형식을 사용합니다 (예: "KRW-BTC").
     #[allow(dead_code)]
     fn from_bithumb_market(market: &str) -> String {
         // "BTC_KRW" -> "KRW-BTC"
@@ -399,7 +399,7 @@ impl OrderManagement for BithumbClient {
     }
 }
 
-// Conversion functions
+// 변환 함수들
 
 fn convert_ticker(t: BithumbTicker) -> Ticker {
     let change = match t.change.as_str() {
@@ -443,7 +443,7 @@ fn convert_orderbook(ob: BithumbOrderbook) -> OrderBook {
         })
         .collect();
 
-    // Sort asks ascending, bids descending
+    // 매도호가는 오름차순, 매수호가는 내림차순 정렬
     asks.sort_by(|a, b| a.price.cmp(&b.price));
     bids.sort_by(|a, b| b.price.cmp(&a.price));
 
@@ -549,11 +549,11 @@ mod tests {
 
     #[test]
     fn test_market_format_conversion() {
-        // Internal to Bithumb
+        // 내부 형식에서 Bithumb 형식으로
         assert_eq!(BithumbClient::to_bithumb_market("KRW-BTC"), "BTC_KRW");
         assert_eq!(BithumbClient::to_bithumb_market("BTC-ETH"), "ETH_BTC");
 
-        // Bithumb to Internal
+        // Bithumb 형식에서 내부 형식으로
         assert_eq!(BithumbClient::from_bithumb_market("BTC_KRW"), "KRW-BTC");
         assert_eq!(BithumbClient::from_bithumb_market("ETH_BTC"), "BTC-ETH");
     }

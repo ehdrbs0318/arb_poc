@@ -1,13 +1,13 @@
-//! Bithumb-specific types and API response structures.
+//! Bithumb 전용 타입 및 API 응답 구조체.
 //!
-//! These types are used for deserializing Bithumb API responses
-//! and are then converted to the common exchange types.
+//! 이 타입들은 Bithumb API 응답을 역직렬화하는 데 사용되며,
+//! 이후 공통 거래소 타입으로 변환됩니다.
 
 use chrono::{DateTime, TimeZone, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize};
 
-/// Bithumb API error response.
+/// Bithumb API 에러 응답.
 #[derive(Debug, Deserialize)]
 pub struct BithumbError {
     pub error: BithumbErrorDetail,
@@ -19,7 +19,7 @@ pub struct BithumbErrorDetail {
     pub message: String,
 }
 
-/// Bithumb ticker response.
+/// Bithumb 시세 응답.
 #[derive(Debug, Deserialize)]
 pub struct BithumbTicker {
     pub market: String,
@@ -46,7 +46,7 @@ pub struct BithumbTicker {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Bithumb orderbook response.
+/// Bithumb 호가창 응답.
 #[derive(Debug, Deserialize)]
 pub struct BithumbOrderbook {
     pub market: String,
@@ -71,7 +71,7 @@ pub struct BithumbOrderbookUnit {
     pub bid_size: Decimal,
 }
 
-/// Bithumb candle response (minutes).
+/// Bithumb 캔들 응답 (분봉).
 #[derive(Debug, Deserialize)]
 pub struct BithumbCandle {
     pub market: String,
@@ -90,7 +90,7 @@ pub struct BithumbCandle {
     pub candle_acc_trade_price: Decimal,
 }
 
-/// Bithumb account balance response.
+/// Bithumb 계정 잔고 응답.
 #[derive(Debug, Deserialize)]
 pub struct BithumbBalance {
     pub currency: String,
@@ -105,7 +105,7 @@ pub struct BithumbBalance {
     pub unit_currency: String,
 }
 
-/// Bithumb order response.
+/// Bithumb 주문 응답.
 #[derive(Debug, Deserialize)]
 pub struct BithumbOrder {
     pub uuid: String,
@@ -130,7 +130,7 @@ pub struct BithumbOrder {
     pub identifier: Option<String>,
 }
 
-/// Bithumb order request body.
+/// Bithumb 주문 요청 본문.
 #[derive(Debug, Serialize)]
 pub struct BithumbOrderRequest {
     pub market: String,
@@ -146,7 +146,7 @@ pub struct BithumbOrderRequest {
     pub identifier: Option<String>,
 }
 
-/// Deserialize timestamp from milliseconds.
+/// 밀리초 타임스탬프를 역직렬화.
 fn deserialize_timestamp_millis<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
 where
     D: Deserializer<'de>,
@@ -157,12 +157,12 @@ where
         .ok_or_else(|| serde::de::Error::custom("invalid timestamp"))
 }
 
-/// Deserialize decimal from number.
+/// 숫자에서 Decimal로 역직렬화.
 fn deserialize_decimal_from_number<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
 where
     D: Deserializer<'de>,
 {
-    // Try to deserialize as f64 first, then convert to Decimal
+    // 먼저 f64로 역직렬화를 시도한 후 Decimal로 변환
     let value = serde_json::Value::deserialize(deserializer)?;
     match &value {
         serde_json::Value::Number(n) => {
@@ -179,7 +179,7 @@ where
     }
 }
 
-/// Deserialize decimal from number with default.
+/// 기본값을 사용하여 숫자에서 Decimal로 역직렬화.
 fn deserialize_decimal_from_number_opt<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
 where
     D: Deserializer<'de>,
@@ -202,7 +202,7 @@ where
     }
 }
 
-/// Deserialize decimal from string.
+/// 문자열에서 Decimal로 역직렬화.
 fn deserialize_decimal_string<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
 where
     D: Deserializer<'de>,
@@ -211,7 +211,7 @@ where
     s.parse::<Decimal>().map_err(serde::de::Error::custom)
 }
 
-/// Deserialize optional decimal from string.
+/// 문자열에서 Option<Decimal>로 역직렬화.
 fn deserialize_optional_decimal_string<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
 where
     D: Deserializer<'de>,

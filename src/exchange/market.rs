@@ -1,35 +1,35 @@
-//! Market code normalization utilities.
+//! 마켓 코드 정규화 유틸리티.
 //!
-//! This module provides utilities for converting between different exchange's
-//! market code formats.
+//! 이 모듈은 서로 다른 거래소의 마켓 코드 형식 간 변환을 위한
+//! 유틸리티를 제공합니다.
 //!
-//! # Market Code Formats
+//! # 마켓 코드 형식
 //!
-//! Different exchanges use different formats for market codes:
+//! 각 거래소마다 다른 마켓 코드 형식을 사용합니다:
 //!
-//! - **Internal format**: `{QUOTE}-{BASE}` (e.g., "KRW-BTC", "USDT-ETH")
-//! - **Upbit**: `{QUOTE}-{BASE}` (e.g., "KRW-BTC") - same as internal
-//! - **Bithumb**: `{QUOTE}-{BASE}` (e.g., "KRW-BTC") - same as internal
-//! - **Bybit**: `{BASE}{QUOTE}` (e.g., "BTCUSDT")
+//! - **내부 형식**: `{QUOTE}-{BASE}` (예: "KRW-BTC", "USDT-ETH")
+//! - **Upbit**: `{QUOTE}-{BASE}` (예: "KRW-BTC") - 내부 형식과 동일
+//! - **Bithumb**: `{QUOTE}-{BASE}` (예: "KRW-BTC") - 내부 형식과 동일
+//! - **Bybit**: `{BASE}{QUOTE}` (예: "BTCUSDT")
 //!
-//! The internal format follows the convention: `{QUOTE}-{BASE}` where:
-//! - QUOTE: The currency you're paying with (KRW, USDT, etc.)
-//! - BASE: The currency you're buying (BTC, ETH, etc.)
+//! 내부 형식은 `{QUOTE}-{BASE}` 규칙을 따릅니다:
+//! - QUOTE: 지불에 사용하는 통화 (KRW, USDT 등)
+//! - BASE: 구매하려는 통화 (BTC, ETH 등)
 
 use crate::exchange::factory::ExchangeName;
 
-/// Converts a market code to the internal format.
+/// 마켓 코드를 내부 형식으로 변환합니다.
 ///
-/// # Arguments
+/// # 인자
 ///
-/// * `exchange` - The source exchange
-/// * `market` - The market code in the exchange's format
+/// * `exchange` - 원본 거래소
+/// * `market` - 거래소 형식의 마켓 코드
 ///
-/// # Returns
+/// # 반환값
 ///
-/// The market code in internal format `{QUOTE}-{BASE}`.
+/// `{QUOTE}-{BASE}` 내부 형식의 마켓 코드.
 ///
-/// # Example
+/// # 예제
 ///
 /// ```ignore
 /// use arb_poc::exchange::market::to_internal_format;
@@ -41,28 +41,28 @@ use crate::exchange::factory::ExchangeName;
 pub fn to_internal_format(exchange: ExchangeName, market: &str) -> String {
     match exchange {
         ExchangeName::Upbit | ExchangeName::Bithumb => {
-            // Already in internal format
+            // 이미 내부 형식임
             market.to_uppercase()
         }
         ExchangeName::Bybit => {
-            // Bybit uses "BTCUSDT" format, convert to "USDT-BTC"
+            // Bybit는 "BTCUSDT" 형식을 사용, "USDT-BTC"로 변환
             bybit_to_internal(market)
         }
     }
 }
 
-/// Converts an internal market code to the exchange's native format.
+/// 내부 마켓 코드를 거래소 고유 형식으로 변환합니다.
 ///
-/// # Arguments
+/// # 인자
 ///
-/// * `exchange` - The target exchange
-/// * `market` - The market code in internal format
+/// * `exchange` - 대상 거래소
+/// * `market` - 내부 형식의 마켓 코드
 ///
-/// # Returns
+/// # 반환값
 ///
-/// The market code in the exchange's native format.
+/// 거래소 고유 형식의 마켓 코드.
 ///
-/// # Example
+/// # 예제
 ///
 /// ```ignore
 /// use arb_poc::exchange::market::to_exchange_format;
@@ -74,27 +74,27 @@ pub fn to_internal_format(exchange: ExchangeName, market: &str) -> String {
 pub fn to_exchange_format(exchange: ExchangeName, market: &str) -> String {
     match exchange {
         ExchangeName::Upbit | ExchangeName::Bithumb => {
-            // Already in internal format
+            // 이미 내부 형식임
             market.to_uppercase()
         }
         ExchangeName::Bybit => {
-            // Convert "USDT-BTC" to "BTCUSDT"
+            // "USDT-BTC"를 "BTCUSDT"로 변환
             internal_to_bybit(market)
         }
     }
 }
 
-/// Converts between exchange formats directly.
+/// 거래소 형식 간 직접 변환합니다.
 ///
-/// # Arguments
+/// # 인자
 ///
-/// * `from_exchange` - The source exchange
-/// * `to_exchange` - The target exchange
-/// * `market` - The market code in the source exchange's format
+/// * `from_exchange` - 원본 거래소
+/// * `to_exchange` - 대상 거래소
+/// * `market` - 원본 거래소 형식의 마켓 코드
 ///
-/// # Returns
+/// # 반환값
 ///
-/// The market code in the target exchange's format.
+/// 대상 거래소 형식의 마켓 코드.
 pub fn convert_market_code(
     from_exchange: ExchangeName,
     to_exchange: ExchangeName,
@@ -104,17 +104,17 @@ pub fn convert_market_code(
     to_exchange_format(to_exchange, &internal)
 }
 
-/// Parses an internal market code into its components.
+/// 내부 마켓 코드를 구성 요소로 파싱합니다.
 ///
-/// # Arguments
+/// # 인자
 ///
-/// * `market` - Market code in internal format (e.g., "KRW-BTC")
+/// * `market` - 내부 형식의 마켓 코드 (예: "KRW-BTC")
 ///
-/// # Returns
+/// # 반환값
 ///
-/// A tuple of (quote_currency, base_currency), or None if parsing fails.
+/// (quote_currency, base_currency) 튜플, 파싱 실패 시 None.
 ///
-/// # Example
+/// # 예제
 ///
 /// ```ignore
 /// let (quote, base) = parse_market_code("KRW-BTC").unwrap();
@@ -130,74 +130,74 @@ pub fn parse_market_code(market: &str) -> Option<(String, String)> {
     }
 }
 
-/// Creates an internal market code from components.
+/// 구성 요소로부터 내부 마켓 코드를 생성합니다.
 ///
-/// # Arguments
+/// # 인자
 ///
-/// * `quote` - Quote currency (e.g., "KRW", "USDT")
-/// * `base` - Base currency (e.g., "BTC", "ETH")
+/// * `quote` - Quote 통화 (예: "KRW", "USDT")
+/// * `base` - Base 통화 (예: "BTC", "ETH")
 ///
-/// # Returns
+/// # 반환값
 ///
-/// The market code in internal format.
+/// 내부 형식의 마켓 코드.
 pub fn create_market_code(quote: &str, base: &str) -> String {
     format!("{}-{}", quote.to_uppercase(), base.to_uppercase())
 }
 
-/// Extracts the base currency from a market code.
+/// 마켓 코드에서 base 통화를 추출합니다.
 ///
-/// # Arguments
+/// # 인자
 ///
-/// * `market` - Market code in internal format
+/// * `market` - 내부 형식의 마켓 코드
 ///
-/// # Returns
+/// # 반환값
 ///
-/// The base currency, or None if parsing fails.
+/// Base 통화, 파싱 실패 시 None.
 pub fn get_base_currency(market: &str) -> Option<String> {
     parse_market_code(market).map(|(_, base)| base)
 }
 
-/// Extracts the quote currency from a market code.
+/// 마켓 코드에서 quote 통화를 추출합니다.
 ///
-/// # Arguments
+/// # 인자
 ///
-/// * `market` - Market code in internal format
+/// * `market` - 내부 형식의 마켓 코드
 ///
-/// # Returns
+/// # 반환값
 ///
-/// The quote currency, or None if parsing fails.
+/// Quote 통화, 파싱 실패 시 None.
 pub fn get_quote_currency(market: &str) -> Option<String> {
     parse_market_code(market).map(|(quote, _)| quote)
 }
 
-/// Normalizes a base currency across exchanges.
+/// 거래소 간 base 통화를 정규화합니다.
 ///
-/// Some exchanges use different symbols for the same asset
-/// (e.g., "XBT" vs "BTC" for Bitcoin).
+/// 일부 거래소는 동일한 자산에 대해 다른 심볼을 사용합니다
+/// (예: Bitcoin의 경우 "XBT" vs "BTC").
 ///
-/// # Arguments
+/// # 인자
 ///
-/// * `currency` - The currency symbol to normalize
+/// * `currency` - 정규화할 통화 심볼
 ///
-/// # Returns
+/// # 반환값
 ///
-/// The normalized currency symbol.
+/// 정규화된 통화 심볼.
 pub fn normalize_currency(currency: &str) -> &str {
     match currency.to_uppercase().as_str() {
         "XBT" => "BTC",
-        // Add more mappings as needed
+        // 필요에 따라 매핑 추가
         _ => currency,
     }
 }
 
-// ==================== Bybit Conversion Functions ====================
+// ==================== Bybit 변환 함수 ====================
 
-/// Common quote currencies for Bybit, in order of preference for detection.
+/// Bybit의 일반적인 quote 통화 목록, 감지 우선순위 순서.
 const BYBIT_QUOTE_CURRENCIES: &[&str] = &["USDT", "USDC", "BTC", "ETH", "EUR", "DAI"];
 
-/// Converts Bybit symbol format to internal format.
+/// Bybit 심볼 형식을 내부 형식으로 변환합니다.
 ///
-/// Bybit uses "BTCUSDT" format, we need "USDT-BTC".
+/// Bybit는 "BTCUSDT" 형식을 사용, "USDT-BTC"가 필요함.
 fn bybit_to_internal(symbol: &str) -> String {
     let symbol = symbol.to_uppercase();
 
@@ -207,13 +207,13 @@ fn bybit_to_internal(symbol: &str) -> String {
         }
     }
 
-    // Fallback: return as-is (might already be in internal format)
+    // 폴백: 그대로 반환 (이미 내부 형식일 수 있음)
     symbol
 }
 
-/// Converts internal format to Bybit symbol format.
+/// 내부 형식을 Bybit 심볼 형식으로 변환합니다.
 ///
-/// Internal "USDT-BTC" -> Bybit "BTCUSDT"
+/// 내부 "USDT-BTC" -> Bybit "BTCUSDT"
 fn internal_to_bybit(market: &str) -> String {
     if let Some((quote, base)) = market.split_once('-') {
         format!("{}{}", base.to_uppercase(), quote.to_uppercase())
@@ -222,7 +222,7 @@ fn internal_to_bybit(market: &str) -> String {
     }
 }
 
-/// Market code builder for convenient market code creation.
+/// 편리한 마켓 코드 생성을 위한 빌더.
 #[derive(Debug, Clone)]
 pub struct MarketCodeBuilder {
     base: String,
@@ -230,11 +230,11 @@ pub struct MarketCodeBuilder {
 }
 
 impl MarketCodeBuilder {
-    /// Creates a new market code builder.
+    /// 새로운 마켓 코드 빌더를 생성합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `base` - Base currency (the asset being traded)
+    /// * `base` - Base 통화 (거래되는 자산)
     pub fn new(base: impl Into<String>) -> Self {
         Self {
             base: base.into().to_uppercase(),
@@ -242,27 +242,27 @@ impl MarketCodeBuilder {
         }
     }
 
-    /// Sets the quote currency.
+    /// Quote 통화를 설정합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `quote` - Quote currency (the currency used to price the base)
+    /// * `quote` - Quote 통화 (base의 가격을 표시하는 통화)
     pub fn quote(mut self, quote: impl Into<String>) -> Self {
         self.quote = quote.into().to_uppercase();
         self
     }
 
-    /// Builds the market code for the specified exchange.
+    /// 지정된 거래소용 마켓 코드를 생성합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `exchange` - Target exchange
+    /// * `exchange` - 대상 거래소
     pub fn build_for(&self, exchange: ExchangeName) -> String {
         let internal = format!("{}-{}", self.quote, self.base);
         to_exchange_format(exchange, &internal)
     }
 
-    /// Builds the market code in internal format.
+    /// 내부 형식의 마켓 코드를 생성합니다.
     pub fn build(&self) -> String {
         format!("{}-{}", self.quote, self.base)
     }
@@ -324,19 +324,19 @@ mod tests {
 
     #[test]
     fn test_convert_market_code() {
-        // Upbit to Bybit
+        // Upbit에서 Bybit로
         assert_eq!(
             convert_market_code(ExchangeName::Upbit, ExchangeName::Bybit, "USDT-BTC"),
             "BTCUSDT"
         );
 
-        // Bybit to Upbit
+        // Bybit에서 Upbit로
         assert_eq!(
             convert_market_code(ExchangeName::Bybit, ExchangeName::Upbit, "BTCUSDT"),
             "USDT-BTC"
         );
 
-        // Same exchange
+        // 동일한 거래소
         assert_eq!(
             convert_market_code(ExchangeName::Upbit, ExchangeName::Upbit, "KRW-BTC"),
             "KRW-BTC"

@@ -1,23 +1,23 @@
-//! Bybit public API example.
+//! Bybit 공개 API 예제.
 //!
-//! This example demonstrates how to use the Bybit client for public market data.
+//! 이 예제는 Bybit 클라이언트를 사용하여 공개 시장 데이터를 조회하는 방법을 보여줍니다.
 //!
-//! Run with: cargo run --example bybit_public
+//! 실행 방법: cargo run --example bybit_public
 
 use arb_poc::exchange::{CandleInterval, MarketData};
 use arb_poc::exchanges::BybitClient;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
+    // 로깅 초기화
     tracing_subscriber::fmt().with_env_filter("info").init();
 
-    // Create an unauthenticated client for public API
+    // 공개 API용 미인증 클라이언트 생성
     let client = BybitClient::new()?;
 
     println!("=== Bybit Public API Example ===\n");
 
-    // 1. Fetch ticker for BTC/USDT
+    // 1. BTC/USDT 티커 조회
     println!("--- Ticker ---");
     let tickers = client.get_ticker(&["USDT-BTC"]).await?;
     for ticker in &tickers {
@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
 
-    // 2. Fetch multiple tickers
+    // 2. 여러 티커 조회
     println!("--- Multiple Tickers ---");
     let markets = ["USDT-BTC", "USDT-ETH", "USDT-SOL"];
     let tickers = client.get_ticker(&markets).await?;
@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    // 3. Fetch order book
+    // 3. 호가창 조회
     println!("--- Order Book (BTC/USDT, depth=10) ---");
     let orderbook = client.get_orderbook("USDT-BTC", Some(10)).await?;
     println!("Market: {}", orderbook.market);
@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    // 4. Fetch candles
+    // 4. 캔들 데이터 조회
     println!("--- Candles (BTC/USDT, 1h, last 5) ---");
     let candles = client
         .get_candles("USDT-BTC", CandleInterval::Minute60, 5)
@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    // 5. Test with linear perpetuals
+    // 5. 선형 무기한 선물 테스트
     println!("--- Linear Perpetual Ticker (BTCUSDT) ---");
     let perp_client = BybitClient::new()?.with_category("linear");
     let tickers = perp_client.get_ticker(&["USDT-BTC"]).await?;

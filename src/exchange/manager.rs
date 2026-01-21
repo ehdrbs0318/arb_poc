@@ -1,20 +1,19 @@
-//! Exchange manager for coordinating multiple exchanges.
+//! 여러 거래소를 조율하기 위한 거래소 관리자.
 //!
-//! This module provides the `ExchangeManager` struct for managing multiple
-//! exchange instances and providing unified access to them.
+//! 이 모듈은 여러 거래소 인스턴스를 관리하고 통합된 접근을 제공하는
+//! `ExchangeManager` 구조체를 제공합니다.
 
 use crate::exchange::adapter::ExchangeAdapter;
 use crate::exchange::error::{ExchangeError, ExchangeResult};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Manager for multiple exchange instances.
+/// 여러 거래소 인스턴스를 위한 관리자.
 ///
-/// The `ExchangeManager` provides a centralized way to manage and access
-/// multiple exchanges at runtime. It supports dynamic registration and
-/// lookup of exchange adapters.
+/// `ExchangeManager`는 런타임에 여러 거래소를 관리하고 접근하는 중앙화된 방법을
+/// 제공합니다. 거래소 어댑터의 동적 등록과 조회를 지원합니다.
 ///
-/// # Example
+/// # 예제
 ///
 /// ```ignore
 /// use arb_poc::exchange::ExchangeManager;
@@ -22,11 +21,11 @@ use std::sync::Arc;
 ///
 /// let mut manager = ExchangeManager::new();
 ///
-/// // Register exchanges
+/// // 거래소 등록
 /// manager.register("upbit", UpbitAdapter::new(UpbitClient::new()?));
 /// manager.register("bithumb", BithumbAdapter::new(BithumbClient::new()?));
 ///
-/// // Access exchanges by name
+/// // 이름으로 거래소 접근
 /// let upbit = manager.get("upbit").unwrap();
 /// let ticker = upbit.get_ticker(&["KRW-BTC"]).await?;
 /// ```
@@ -36,7 +35,7 @@ pub struct ExchangeManager {
 }
 
 impl ExchangeManager {
-    /// Creates a new empty exchange manager.
+    /// 비어있는 새 거래소 관리자를 생성합니다.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -44,11 +43,11 @@ impl ExchangeManager {
         }
     }
 
-    /// Creates a new exchange manager with the given capacity.
+    /// 지정된 용량을 가진 새 거래소 관리자를 생성합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `capacity` - Initial capacity for the exchange registry
+    /// * `capacity` - 거래소 레지스트리의 초기 용량
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -56,18 +55,18 @@ impl ExchangeManager {
         }
     }
 
-    /// Registers an exchange with the given name.
+    /// 주어진 이름으로 거래소를 등록합니다.
     ///
-    /// If an exchange with the same name already exists, it will be replaced.
+    /// 같은 이름의 거래소가 이미 존재하면 대체됩니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `name` - Name to register the exchange under (case-insensitive)
-    /// * `exchange` - The exchange adapter to register
+    /// * `name` - 거래소를 등록할 이름 (대소문자 구분 없음)
+    /// * `exchange` - 등록할 거래소 어댑터
     ///
-    /// # Returns
+    /// # 반환값
     ///
-    /// The previously registered exchange with the same name, if any.
+    /// 같은 이름으로 이전에 등록된 거래소가 있었다면 반환합니다.
     pub fn register(
         &mut self,
         name: impl Into<String>,
@@ -77,12 +76,12 @@ impl ExchangeManager {
         self.exchanges.insert(name, Arc::new(exchange))
     }
 
-    /// Registers an exchange wrapped in Arc.
+    /// Arc로 래핑된 거래소를 등록합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `name` - Name to register the exchange under (case-insensitive)
-    /// * `exchange` - The exchange adapter wrapped in Arc
+    /// * `name` - 거래소를 등록할 이름 (대소문자 구분 없음)
+    /// * `exchange` - Arc로 래핑된 거래소 어댑터
     pub fn register_arc(
         &mut self,
         name: impl Into<String>,
@@ -92,93 +91,93 @@ impl ExchangeManager {
         self.exchanges.insert(name, exchange)
     }
 
-    /// Removes an exchange from the manager.
+    /// 관리자에서 거래소를 제거합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `name` - Name of the exchange to remove (case-insensitive)
+    /// * `name` - 제거할 거래소 이름 (대소문자 구분 없음)
     ///
-    /// # Returns
+    /// # 반환값
     ///
-    /// The removed exchange, if it existed.
+    /// 제거된 거래소가 존재했다면 반환합니다.
     pub fn unregister(&mut self, name: &str) -> Option<Arc<dyn ExchangeAdapter>> {
         self.exchanges.remove(&name.to_lowercase())
     }
 
-    /// Gets a reference to an exchange by name.
+    /// 이름으로 거래소 참조를 가져옵니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `name` - Name of the exchange (case-insensitive)
+    /// * `name` - 거래소 이름 (대소문자 구분 없음)
     ///
-    /// # Returns
+    /// # 반환값
     ///
-    /// A reference to the exchange adapter, if found.
+    /// 찾은 경우 거래소 어댑터 참조를 반환합니다.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Arc<dyn ExchangeAdapter>> {
         self.exchanges.get(&name.to_lowercase()).cloned()
     }
 
-    /// Gets an exchange by name, returning an error if not found.
+    /// 이름으로 거래소를 가져오고, 없으면 에러를 반환합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `name` - Name of the exchange (case-insensitive)
+    /// * `name` - 거래소 이름 (대소문자 구분 없음)
     ///
-    /// # Errors
+    /// # 에러
     ///
-    /// Returns an error if the exchange is not registered.
+    /// 거래소가 등록되지 않은 경우 에러를 반환합니다.
     pub fn get_or_error(&self, name: &str) -> ExchangeResult<Arc<dyn ExchangeAdapter>> {
         self.get(name).ok_or_else(|| {
             ExchangeError::ConfigError(format!("Exchange not registered: {}", name))
         })
     }
 
-    /// Returns true if an exchange with the given name is registered.
+    /// 주어진 이름의 거래소가 등록되어 있으면 true를 반환합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `name` - Name of the exchange (case-insensitive)
+    /// * `name` - 거래소 이름 (대소문자 구분 없음)
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
         self.exchanges.contains_key(&name.to_lowercase())
     }
 
-    /// Returns the names of all registered exchanges.
+    /// 등록된 모든 거래소의 이름을 반환합니다.
     #[must_use]
     pub fn list_exchanges(&self) -> Vec<&str> {
         self.exchanges.keys().map(String::as_str).collect()
     }
 
-    /// Returns the number of registered exchanges.
+    /// 등록된 거래소 개수를 반환합니다.
     #[must_use]
     pub fn len(&self) -> usize {
         self.exchanges.len()
     }
 
-    /// Returns true if no exchanges are registered.
+    /// 등록된 거래소가 없으면 true를 반환합니다.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.exchanges.is_empty()
     }
 
-    /// Returns an iterator over all registered exchanges.
+    /// 등록된 모든 거래소에 대한 이터레이터를 반환합니다.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Arc<dyn ExchangeAdapter>)> {
         self.exchanges
             .iter()
             .map(|(name, exchange)| (name.as_str(), exchange))
     }
 
-    /// Returns only authenticated exchanges.
+    /// 인증된 거래소만 반환합니다.
     pub fn authenticated(&self) -> impl Iterator<Item = (&str, &Arc<dyn ExchangeAdapter>)> {
         self.iter().filter(|(_, ex)| ex.is_authenticated())
     }
 
-    /// Returns exchanges filtered by quote currency.
+    /// 기준 통화로 필터링된 거래소를 반환합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `quote` - The quote currency to filter by (e.g., "KRW", "USDT")
+    /// * `quote` - 필터링할 기준 통화 (예: "KRW", "USDT")
     pub fn by_quote_currency(
         &self,
         quote: &str,
@@ -201,7 +200,7 @@ impl std::fmt::Debug for ExchangeManager {
 mod tests {
     use super::*;
 
-    // Mock adapter for testing
+    // 테스트용 모의 어댑터
     #[derive(Debug)]
     struct MockAdapter {
         name: String,

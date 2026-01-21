@@ -183,7 +183,31 @@ cargo run --example
 - Explain Rust-specific concepts (lifetimes, ownership) when relevant to the solution
 - Provide rationale for design decisions, especially when choosing between alternatives
 - Suggest improvements to existing code patterns when you notice suboptimal approaches
-- Use Korean when the user communicates in Korean, but keep code comments and documentation in English for broader compatibility
+- Use Korean when the user communicates in Korean, but keep code comments and documentation in Korean for broader compatibility
+
+## Skill References (스킬 참조)
+
+### Comment Style (주석 스타일)
+
+> **코드 작성 시 `.claude/skills/comment.md` 스킬을 참조하여 주석을 작성하세요.**
+
+주요 규칙 요약:
+- 주석은 한글로 작성
+- 기술 용어(trait, API, JWT, HMAC 등)는 영어로 유지
+- 문서 주석 섹션 헤더 번역: `# Arguments` -> `# 인자`, `# Returns` -> `# 반환값`, `# Example` -> `# 예제`
+- 코드 내 에러 메시지 문자열은 영어로 유지 (국제화 고려)
+
+### Logging (로깅)
+
+> **로깅 구현 시 `.claude/skills/logging.md` 스킬을 참조하세요.**
+
+주요 규칙 요약:
+- `tracing` 크레이트를 사용한 구조화된 로깅
+- 로그 레벨 사용 지침: error(치명적 오류), warn(복구 가능한 문제), info(중요 비즈니스 이벤트), debug(개발용), trace(상세 추적)
+- 구조화된 필드 규칙: exchange, symbol, order_id 등 일관된 필드명 사용
+- span 활용: `exchange_span()`, `operation_span()` 헬퍼 함수 사용
+- 헬퍼 함수 활용: `log_order_event()`, `log_trade_execution()`, `log_api_request()` 등
+- 민감 정보(API 키, 비밀번호) 로깅 금지
 
 ## When Reviewing Code
 

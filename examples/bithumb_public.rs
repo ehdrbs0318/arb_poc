@@ -1,9 +1,9 @@
-//! Bithumb public API example.
+//! Bithumb 공개 API 예제.
 //!
-//! This example demonstrates how to use the Bithumb client to fetch
-//! public market data without authentication.
+//! 이 예제는 인증 없이 Bithumb 클라이언트를 사용하여
+//! 공개 시장 데이터를 조회하는 방법을 보여줍니다.
 //!
-//! # Run
+//! # 실행
 //!
 //! ```bash
 //! cargo run --example bithumb_public
@@ -15,14 +15,14 @@ use rust_decimal::Decimal;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing for logging
+    // 로깅을 위한 tracing 초기화
     tracing_subscriber::fmt::init();
 
-    // Create an unauthenticated client
+    // 인증되지 않은 클라이언트 생성
     let client = BithumbClient::new()?;
     println!("Created Bithumb client: {}", client.name());
 
-    // Fetch ticker for BTC
+    // BTC 시세 조회
     println!("\n--- Ticker (KRW-BTC) ---");
     match client.get_ticker(&["KRW-BTC"]).await {
         Ok(tickers) => {
@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => println!("Error fetching ticker: {}", e),
     }
 
-    // Fetch orderbook
+    // 호가창 조회
     println!("\n--- Order Book (KRW-BTC) ---");
     match client.get_orderbook("KRW-BTC", Some(5)).await {
         Ok(orderbook) => {
@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => println!("Error fetching orderbook: {}", e),
     }
 
-    // Fetch candles
+    // 캔들 데이터 조회
     println!("\n--- Candles (KRW-BTC, 1 minute) ---");
     match client
         .get_candles("KRW-BTC", CandleInterval::Minute1, 5)
@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => println!("Error fetching candles: {}", e),
     }
 
-    // Fetch multiple tickers
+    // 다중 시세 조회
     println!("\n--- Multiple Tickers ---");
     match client.get_ticker(&["KRW-BTC", "KRW-ETH", "KRW-XRP"]).await {
         Ok(tickers) => {

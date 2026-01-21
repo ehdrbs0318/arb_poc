@@ -1,15 +1,15 @@
-//! Bybit-specific types and API response structures.
+//! Bybit 전용 타입 및 API 응답 구조체.
 //!
-//! These types are used for deserializing Bybit V5 API responses
-//! and are then converted to the common exchange types.
+//! 이 타입들은 Bybit V5 API 응답을 역직렬화하는 데 사용되며,
+//! 이후 공통 거래소 타입으로 변환됩니다.
 
 use chrono::{DateTime, TimeZone, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize};
 
-/// Bybit V5 API response wrapper.
+/// Bybit V5 API 응답 래퍼.
 ///
-/// All Bybit V5 API responses follow this structure:
+/// 모든 Bybit V5 API 응답은 다음 구조를 따릅니다:
 /// ```json
 /// {
 ///   "retCode": 0,
@@ -21,133 +21,133 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// ```
 #[derive(Debug, Deserialize)]
 pub struct BybitResponse<T> {
-    /// Return code (0 = success).
+    /// 반환 코드 (0 = 성공).
     #[serde(rename = "retCode")]
     pub ret_code: i32,
-    /// Return message.
+    /// 반환 메시지.
     #[serde(rename = "retMsg")]
     pub ret_msg: String,
-    /// Result data.
+    /// 결과 데이터.
     pub result: T,
-    /// Extended info.
+    /// 확장 정보.
     #[serde(rename = "retExtInfo", default)]
     pub ret_ext_info: serde_json::Value,
-    /// Server timestamp in milliseconds.
+    /// 서버 타임스탬프 (밀리초).
     pub time: i64,
 }
 
 impl<T> BybitResponse<T> {
-    /// Returns true if the request was successful.
+    /// 요청이 성공했으면 true를 반환합니다.
     #[inline]
     pub fn is_success(&self) -> bool {
         self.ret_code == 0
     }
 }
 
-/// Bybit ticker list result.
+/// Bybit 티커 목록 결과.
 #[derive(Debug, Deserialize)]
 pub struct BybitTickerList {
     pub category: String,
     pub list: Vec<BybitTicker>,
 }
 
-/// Bybit ticker response (spot).
+/// Bybit 티커 응답 (현물).
 #[derive(Debug, Deserialize)]
 pub struct BybitTicker {
-    /// Symbol (e.g., "BTCUSDT").
+    /// 심볼 (예: "BTCUSDT").
     pub symbol: String,
-    /// Last traded price.
+    /// 최근 체결가.
     #[serde(rename = "lastPrice", deserialize_with = "deserialize_decimal_string")]
     pub last_price: Decimal,
-    /// Index price (may be empty for spot).
+    /// 지수 가격 (현물에서는 비어있을 수 있음).
     #[serde(
         rename = "indexPrice",
         default,
         deserialize_with = "deserialize_optional_decimal_string"
     )]
     pub index_price: Option<Decimal>,
-    /// Mark price (may be empty for spot).
+    /// 마크 가격 (현물에서는 비어있을 수 있음).
     #[serde(
         rename = "markPrice",
         default,
         deserialize_with = "deserialize_optional_decimal_string"
     )]
     pub mark_price: Option<Decimal>,
-    /// Previous 24h close price.
+    /// 이전 24시간 종가.
     #[serde(
         rename = "prevPrice24h",
         deserialize_with = "deserialize_decimal_string"
     )]
     pub prev_price_24h: Decimal,
-    /// 24h price change percentage.
+    /// 24시간 가격 변동률.
     #[serde(
         rename = "price24hPcnt",
         deserialize_with = "deserialize_decimal_string"
     )]
     pub price_24h_pcnt: Decimal,
-    /// 24h high price.
+    /// 24시간 최고가.
     #[serde(
         rename = "highPrice24h",
         deserialize_with = "deserialize_decimal_string"
     )]
     pub high_price_24h: Decimal,
-    /// 24h low price.
+    /// 24시간 최저가.
     #[serde(
         rename = "lowPrice24h",
         deserialize_with = "deserialize_decimal_string"
     )]
     pub low_price_24h: Decimal,
-    /// 24h turnover in quote currency.
+    /// 24시간 거래대금 (호가 통화 기준).
     #[serde(
         rename = "turnover24h",
         deserialize_with = "deserialize_decimal_string"
     )]
     pub turnover_24h: Decimal,
-    /// 24h volume in base currency.
+    /// 24시간 거래량 (기준 통화 기준).
     #[serde(rename = "volume24h", deserialize_with = "deserialize_decimal_string")]
     pub volume_24h: Decimal,
-    /// Best bid price.
+    /// 최우선 매수 호가.
     #[serde(rename = "bid1Price", deserialize_with = "deserialize_decimal_string")]
     pub bid1_price: Decimal,
-    /// Best bid size.
+    /// 최우선 매수 수량.
     #[serde(rename = "bid1Size", deserialize_with = "deserialize_decimal_string")]
     pub bid1_size: Decimal,
-    /// Best ask price.
+    /// 최우선 매도 호가.
     #[serde(rename = "ask1Price", deserialize_with = "deserialize_decimal_string")]
     pub ask1_price: Decimal,
-    /// Best ask size.
+    /// 최우선 매도 수량.
     #[serde(rename = "ask1Size", deserialize_with = "deserialize_decimal_string")]
     pub ask1_size: Decimal,
 }
 
-/// Bybit orderbook result.
+/// Bybit 호가창 결과.
 #[derive(Debug, Deserialize)]
 pub struct BybitOrderbookResult {
-    /// Symbol.
+    /// 심볼.
     #[serde(rename = "s")]
     pub symbol: String,
-    /// Ask prices and sizes.
+    /// 매도 호가 및 수량.
     #[serde(rename = "a")]
     pub asks: Vec<BybitOrderbookLevel>,
-    /// Bid prices and sizes.
+    /// 매수 호가 및 수량.
     #[serde(rename = "b")]
     pub bids: Vec<BybitOrderbookLevel>,
-    /// Timestamp in milliseconds.
+    /// 타임스탬프 (밀리초).
     #[serde(rename = "ts")]
     pub timestamp: i64,
-    /// Update ID.
+    /// 업데이트 ID.
     #[serde(rename = "u")]
     pub update_id: i64,
 }
 
-/// Bybit orderbook level [price, size].
+/// Bybit 호가창 레벨 [가격, 수량].
 #[derive(Debug, Deserialize)]
 pub struct BybitOrderbookLevel(
     #[serde(deserialize_with = "deserialize_decimal_string")] pub Decimal,
     #[serde(deserialize_with = "deserialize_decimal_string")] pub Decimal,
 );
 
-/// Bybit kline/candle list result.
+/// Bybit K선/캔들 목록 결과.
 #[derive(Debug, Deserialize)]
 pub struct BybitKlineList {
     pub category: String,
@@ -155,23 +155,23 @@ pub struct BybitKlineList {
     pub list: Vec<BybitKline>,
 }
 
-/// Bybit kline/candle data.
-/// Response is an array: [startTime, open, high, low, close, volume, turnover]
+/// Bybit K선/캔들 데이터.
+/// 응답은 배열 형태: [startTime, open, high, low, close, volume, turnover]
 #[derive(Debug)]
 pub struct BybitKline {
-    /// Start time in milliseconds.
+    /// 시작 시간 (밀리초).
     pub start_time: i64,
-    /// Open price.
+    /// 시가.
     pub open: Decimal,
-    /// High price.
+    /// 고가.
     pub high: Decimal,
-    /// Low price.
+    /// 저가.
     pub low: Decimal,
-    /// Close price.
+    /// 종가.
     pub close: Decimal,
-    /// Volume.
+    /// 거래량.
     pub volume: Decimal,
-    /// Turnover.
+    /// 거래대금.
     pub turnover: Decimal,
 }
 
@@ -219,57 +219,57 @@ impl<'de> Deserialize<'de> for BybitKline {
     }
 }
 
-/// Bybit account wallet balance result.
+/// Bybit 계정 지갑 잔고 결과.
 #[derive(Debug, Deserialize)]
 pub struct BybitWalletBalanceResult {
     pub list: Vec<BybitWalletAccount>,
 }
 
-/// Bybit wallet account.
+/// Bybit 지갑 계정.
 #[derive(Debug, Deserialize)]
 pub struct BybitWalletAccount {
-    /// Account type (UNIFIED, CONTRACT, etc.).
+    /// 계정 유형 (UNIFIED, CONTRACT 등).
     #[serde(rename = "accountType")]
     pub account_type: String,
-    /// Total equity.
+    /// 총 자산.
     #[serde(
         rename = "totalEquity",
         default,
         deserialize_with = "deserialize_optional_decimal_string"
     )]
     pub total_equity: Option<Decimal>,
-    /// Account coins.
+    /// 계정 코인 목록.
     pub coin: Vec<BybitCoinBalance>,
 }
 
-/// Bybit coin balance.
+/// Bybit 코인 잔고.
 #[derive(Debug, Deserialize)]
 pub struct BybitCoinBalance {
-    /// Coin name (e.g., "BTC", "USDT").
+    /// 코인 이름 (예: "BTC", "USDT").
     pub coin: String,
-    /// Wallet balance.
+    /// 지갑 잔고.
     #[serde(
         rename = "walletBalance",
         deserialize_with = "deserialize_decimal_string"
     )]
     pub wallet_balance: Decimal,
-    /// Available balance.
+    /// 출금 가능 잔고.
     #[serde(
         rename = "availableToWithdraw",
         deserialize_with = "deserialize_decimal_string"
     )]
     pub available_to_withdraw: Decimal,
-    /// Locked balance (in orders, etc.).
+    /// 동결 잔고 (주문 등에 사용 중).
     #[serde(default, deserialize_with = "deserialize_optional_decimal_string")]
     pub locked: Option<Decimal>,
-    /// Unrealized PnL.
+    /// 미실현 손익.
     #[serde(
         rename = "unrealisedPnl",
         default,
         deserialize_with = "deserialize_optional_decimal_string"
     )]
     pub unrealised_pnl: Option<Decimal>,
-    /// Cumulative realized PnL.
+    /// 누적 실현 손익.
     #[serde(
         rename = "cumRealisedPnl",
         default,
@@ -278,7 +278,7 @@ pub struct BybitCoinBalance {
     pub cum_realised_pnl: Option<Decimal>,
 }
 
-/// Bybit order list result.
+/// Bybit 주문 목록 결과.
 #[derive(Debug, Deserialize)]
 pub struct BybitOrderList {
     pub category: String,
@@ -287,63 +287,63 @@ pub struct BybitOrderList {
     pub next_page_cursor: Option<String>,
 }
 
-/// Bybit order response.
+/// Bybit 주문 응답.
 #[derive(Debug, Deserialize)]
 pub struct BybitOrder {
-    /// Order ID.
+    /// 주문 ID.
     #[serde(rename = "orderId")]
     pub order_id: String,
-    /// Client order ID.
+    /// 클라이언트 주문 ID.
     #[serde(rename = "orderLinkId", default)]
     pub order_link_id: Option<String>,
-    /// Symbol.
+    /// 심볼.
     pub symbol: String,
-    /// Side: Buy, Sell.
+    /// 주문 방향: Buy, Sell.
     pub side: String,
-    /// Order type: Limit, Market.
+    /// 주문 유형: Limit, Market.
     #[serde(rename = "orderType")]
     pub order_type: String,
-    /// Order price.
+    /// 주문 가격.
     #[serde(default, deserialize_with = "deserialize_optional_decimal_string")]
     pub price: Option<Decimal>,
-    /// Order quantity.
+    /// 주문 수량.
     #[serde(deserialize_with = "deserialize_decimal_string")]
     pub qty: Decimal,
-    /// Time in force: GTC, IOC, FOK, PostOnly.
+    /// 주문 유효 기간: GTC, IOC, FOK, PostOnly.
     #[serde(rename = "timeInForce")]
     pub time_in_force: String,
-    /// Order status.
+    /// 주문 상태.
     #[serde(rename = "orderStatus")]
     pub order_status: String,
-    /// Cumulative executed quantity.
+    /// 누적 체결 수량.
     #[serde(rename = "cumExecQty", deserialize_with = "deserialize_decimal_string")]
     pub cum_exec_qty: Decimal,
-    /// Cumulative executed value.
+    /// 누적 체결 금액.
     #[serde(
         rename = "cumExecValue",
         deserialize_with = "deserialize_decimal_string"
     )]
     pub cum_exec_value: Decimal,
-    /// Cumulative executed fee.
+    /// 누적 체결 수수료.
     #[serde(rename = "cumExecFee", deserialize_with = "deserialize_decimal_string")]
     pub cum_exec_fee: Decimal,
-    /// Average executed price.
+    /// 평균 체결가.
     #[serde(
         rename = "avgPrice",
         default,
         deserialize_with = "deserialize_optional_decimal_string"
     )]
     pub avg_price: Option<Decimal>,
-    /// Remaining quantity.
+    /// 미체결 수량.
     #[serde(rename = "leavesQty", deserialize_with = "deserialize_decimal_string")]
     pub leaves_qty: Decimal,
-    /// Created time in milliseconds.
+    /// 주문 생성 시간 (밀리초).
     #[serde(
         rename = "createdTime",
         deserialize_with = "deserialize_timestamp_string"
     )]
     pub created_time: DateTime<Utc>,
-    /// Updated time in milliseconds.
+    /// 주문 수정 시간 (밀리초).
     #[serde(
         rename = "updatedTime",
         deserialize_with = "deserialize_timestamp_string"
@@ -351,72 +351,72 @@ pub struct BybitOrder {
     pub updated_time: DateTime<Utc>,
 }
 
-/// Bybit create order result.
+/// Bybit 주문 생성 결과.
 #[derive(Debug, Deserialize)]
 pub struct BybitCreateOrderResult {
-    /// Order ID.
+    /// 주문 ID.
     #[serde(rename = "orderId")]
     pub order_id: String,
-    /// Client order ID.
+    /// 클라이언트 주문 ID.
     #[serde(rename = "orderLinkId", default)]
     pub order_link_id: Option<String>,
 }
 
-/// Bybit cancel order result.
+/// Bybit 주문 취소 결과.
 #[derive(Debug, Deserialize)]
 pub struct BybitCancelOrderResult {
-    /// Order ID.
+    /// 주문 ID.
     #[serde(rename = "orderId")]
     pub order_id: String,
-    /// Client order ID.
+    /// 클라이언트 주문 ID.
     #[serde(rename = "orderLinkId", default)]
     pub order_link_id: Option<String>,
 }
 
-/// Bybit order request body for creating orders.
+/// Bybit 주문 생성 요청 본문.
 #[derive(Debug, Serialize)]
 pub struct BybitOrderRequest {
-    /// Category: spot, linear, inverse, option.
+    /// 카테고리: spot, linear, inverse, option.
     pub category: String,
-    /// Symbol (e.g., "BTCUSDT").
+    /// 심볼 (예: "BTCUSDT").
     pub symbol: String,
-    /// Side: Buy, Sell.
+    /// 주문 방향: Buy, Sell.
     pub side: String,
-    /// Order type: Limit, Market.
+    /// 주문 유형: Limit, Market.
     #[serde(rename = "orderType")]
     pub order_type: String,
-    /// Order quantity.
+    /// 주문 수량.
     pub qty: String,
-    /// Order price (required for limit orders).
+    /// 주문 가격 (지정가 주문 시 필수).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub price: Option<String>,
-    /// Time in force: GTC, IOC, FOK, PostOnly.
+    /// 주문 유효 기간: GTC, IOC, FOK, PostOnly.
     #[serde(rename = "timeInForce", skip_serializing_if = "Option::is_none")]
     pub time_in_force: Option<String>,
-    /// Client order ID.
+    /// 클라이언트 주문 ID.
     #[serde(rename = "orderLinkId", skip_serializing_if = "Option::is_none")]
     pub order_link_id: Option<String>,
-    /// Market unit for market orders (baseCoin, quoteCoin).
+    /// 시장가 주문 시 단위 (baseCoin, quoteCoin).
     #[serde(rename = "marketUnit", skip_serializing_if = "Option::is_none")]
     pub market_unit: Option<String>,
 }
 
-/// Bybit cancel order request body.
+/// Bybit 주문 취소 요청 본문.
 #[derive(Debug, Serialize)]
 pub struct BybitCancelOrderRequest {
-    /// Category: spot, linear, inverse, option.
+    /// 카테고리: spot, linear, inverse, option.
     pub category: String,
-    /// Symbol.
+    /// 심볼.
     pub symbol: String,
-    /// Order ID (either orderId or orderLinkId is required).
+    /// 주문 ID (orderId 또는 orderLinkId 중 하나 필수).
     #[serde(rename = "orderId", skip_serializing_if = "Option::is_none")]
     pub order_id: Option<String>,
-    /// Client order ID.
+    /// 클라이언트 주문 ID.
     #[serde(rename = "orderLinkId", skip_serializing_if = "Option::is_none")]
     pub order_link_id: Option<String>,
 }
 
-/// Deserialize decimal from string.
+/// 문자열에서 Decimal로 역직렬화.
 fn deserialize_decimal_string<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
 where
     D: Deserializer<'de>,
@@ -428,7 +428,7 @@ where
     s.parse::<Decimal>().map_err(serde::de::Error::custom)
 }
 
-/// Deserialize optional decimal from string.
+/// 문자열에서 Optional Decimal로 역직렬화.
 fn deserialize_optional_decimal_string<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
 where
     D: Deserializer<'de>,
@@ -443,7 +443,7 @@ where
     }
 }
 
-/// Deserialize timestamp from string milliseconds.
+/// 문자열 밀리초에서 타임스탬프로 역직렬화.
 fn deserialize_timestamp_string<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
 where
     D: Deserializer<'de>,

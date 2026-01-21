@@ -1,14 +1,14 @@
-//! Bybit HMAC-SHA256 authentication module.
+//! Bybit HMAC-SHA256 인증 모듈.
 //!
-//! This module handles signature generation for Bybit V5 API authentication.
+//! 이 모듈은 Bybit V5 API 인증을 위한 서명 생성을 처리합니다.
 //!
-//! # Signature Generation
+//! # 서명 생성
 //!
-//! Bybit uses HMAC-SHA256 for API authentication:
-//! - GET requests: `timestamp + api_key + recv_window + queryString`
-//! - POST requests: `timestamp + api_key + recv_window + jsonBodyString`
+//! Bybit은 API 인증에 HMAC-SHA256을 사용합니다:
+//! - GET 요청: `timestamp + api_key + recv_window + queryString`
+//! - POST 요청: `timestamp + api_key + recv_window + jsonBodyString`
 //!
-//! The signature is then converted to lowercase hexadecimal.
+//! 서명은 소문자 16진수로 변환됩니다.
 
 use crate::exchange::ExchangeError;
 use hmac::{Hmac, Mac};
@@ -17,10 +17,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Default receive window in milliseconds.
+/// 기본 수신 윈도우 (밀리초 단위).
 pub const DEFAULT_RECV_WINDOW: u64 = 5000;
 
-/// Credentials for Bybit API authentication.
+/// Bybit API 인증을 위한 자격 증명.
 #[derive(Debug, Clone)]
 pub struct BybitCredentials {
     api_key: String,
@@ -29,12 +29,12 @@ pub struct BybitCredentials {
 }
 
 impl BybitCredentials {
-    /// Creates new credentials with default receive window.
+    /// 기본 수신 윈도우로 새 자격 증명을 생성합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `api_key` - Bybit API key
-    /// * `secret_key` - Bybit API secret key
+    /// * `api_key` - Bybit API 키
+    /// * `secret_key` - Bybit API 시크릿 키
     pub fn new(api_key: impl Into<String>, secret_key: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
@@ -43,13 +43,13 @@ impl BybitCredentials {
         }
     }
 
-    /// Creates new credentials with custom receive window.
+    /// 사용자 정의 수신 윈도우로 새 자격 증명을 생성합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `api_key` - Bybit API key
-    /// * `secret_key` - Bybit API secret key
-    /// * `recv_window` - Receive window in milliseconds
+    /// * `api_key` - Bybit API 키
+    /// * `secret_key` - Bybit API 시크릿 키
+    /// * `recv_window` - 수신 윈도우 (밀리초 단위)
     #[allow(dead_code)]
     pub fn with_recv_window(
         api_key: impl Into<String>,
@@ -63,21 +63,21 @@ impl BybitCredentials {
         }
     }
 
-    /// Returns the API key.
+    /// API 키를 반환합니다.
     #[inline]
     #[allow(dead_code)]
     pub fn api_key(&self) -> &str {
         &self.api_key
     }
 
-    /// Returns the receive window.
+    /// 수신 윈도우를 반환합니다.
     #[inline]
     #[allow(dead_code)]
     pub fn recv_window(&self) -> u64 {
         self.recv_window
     }
 
-    /// Returns the current UTC timestamp in milliseconds.
+    /// 현재 UTC 타임스탬프를 밀리초 단위로 반환합니다.
     #[inline]
     pub fn timestamp() -> u64 {
         SystemTime::now()
@@ -86,16 +86,16 @@ impl BybitCredentials {
             .as_millis() as u64
     }
 
-    /// Generates signature for GET request.
+    /// GET 요청을 위한 서명을 생성합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `timestamp` - UTC timestamp in milliseconds
-    /// * `query_string` - URL query string (without leading `?`)
+    /// * `timestamp` - UTC 타임스탬프 (밀리초 단위)
+    /// * `query_string` - URL 쿼리 문자열 (앞의 `?` 제외)
     ///
-    /// # Returns
+    /// # 반환값
     ///
-    /// Lowercase hexadecimal HMAC-SHA256 signature
+    /// 소문자 16진수 HMAC-SHA256 서명
     pub fn sign_get(&self, timestamp: u64, query_string: &str) -> Result<String, ExchangeError> {
         let payload = format!(
             "{}{}{}{}",
@@ -104,22 +104,22 @@ impl BybitCredentials {
         self.hmac_sign(&payload)
     }
 
-    /// Generates signature for POST request.
+    /// POST 요청을 위한 서명을 생성합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `timestamp` - UTC timestamp in milliseconds
-    /// * `body` - JSON body string
+    /// * `timestamp` - UTC 타임스탬프 (밀리초 단위)
+    /// * `body` - JSON 본문 문자열
     ///
-    /// # Returns
+    /// # 반환값
     ///
-    /// Lowercase hexadecimal HMAC-SHA256 signature
+    /// 소문자 16진수 HMAC-SHA256 서명
     pub fn sign_post(&self, timestamp: u64, body: &str) -> Result<String, ExchangeError> {
         let payload = format!("{}{}{}{}", timestamp, self.api_key, self.recv_window, body);
         self.hmac_sign(&payload)
     }
 
-    /// Computes HMAC-SHA256 signature.
+    /// HMAC-SHA256 서명을 계산합니다.
     fn hmac_sign(&self, payload: &str) -> Result<String, ExchangeError> {
         let mut mac = HmacSha256::new_from_slice(self.secret_key.as_bytes())
             .map_err(|e| ExchangeError::AuthError(format!("HMAC key error: {}", e)))?;
@@ -129,15 +129,15 @@ impl BybitCredentials {
         Ok(hex::encode(result.into_bytes()))
     }
 
-    /// Returns all required authentication headers for a GET request.
+    /// GET 요청에 필요한 모든 인증 헤더를 반환합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `query_string` - URL query string (without leading `?`)
+    /// * `query_string` - URL 쿼리 문자열 (앞의 `?` 제외)
     ///
-    /// # Returns
+    /// # 반환값
     ///
-    /// Tuple of (timestamp, api_key, recv_window, signature)
+    /// (timestamp, api_key, recv_window, signature) 튜플
     pub fn auth_headers_get(&self, query_string: &str) -> Result<AuthHeaders, ExchangeError> {
         let timestamp = Self::timestamp();
         let signature = self.sign_get(timestamp, query_string)?;
@@ -150,15 +150,15 @@ impl BybitCredentials {
         })
     }
 
-    /// Returns all required authentication headers for a POST request.
+    /// POST 요청에 필요한 모든 인증 헤더를 반환합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `body` - JSON body string
+    /// * `body` - JSON 본문 문자열
     ///
-    /// # Returns
+    /// # 반환값
     ///
-    /// Authentication headers struct
+    /// 인증 헤더 구조체
     pub fn auth_headers_post(&self, body: &str) -> Result<AuthHeaders, ExchangeError> {
         let timestamp = Self::timestamp();
         let signature = self.sign_post(timestamp, body)?;
@@ -172,39 +172,39 @@ impl BybitCredentials {
     }
 }
 
-/// Authentication headers for Bybit API requests.
+/// Bybit API 요청을 위한 인증 헤더.
 #[derive(Debug, Clone)]
 pub struct AuthHeaders {
-    /// UTC timestamp in milliseconds.
+    /// UTC 타임스탬프 (밀리초 단위).
     pub timestamp: u64,
-    /// API key.
+    /// API 키.
     pub api_key: String,
-    /// Receive window in milliseconds.
+    /// 수신 윈도우 (밀리초 단위).
     pub recv_window: u64,
-    /// HMAC-SHA256 signature.
+    /// HMAC-SHA256 서명.
     pub signature: String,
 }
 
 impl AuthHeaders {
-    /// Header name for API key.
+    /// API 키 헤더 이름.
     pub const HEADER_API_KEY: &'static str = "X-BAPI-API-KEY";
-    /// Header name for timestamp.
+    /// 타임스탬프 헤더 이름.
     pub const HEADER_TIMESTAMP: &'static str = "X-BAPI-TIMESTAMP";
-    /// Header name for signature.
+    /// 서명 헤더 이름.
     pub const HEADER_SIGN: &'static str = "X-BAPI-SIGN";
-    /// Header name for receive window.
+    /// 수신 윈도우 헤더 이름.
     pub const HEADER_RECV_WINDOW: &'static str = "X-BAPI-RECV-WINDOW";
 }
 
-/// Builds a query string from parameters.
+/// 매개변수로부터 쿼리 문자열을 생성합니다.
 ///
-/// # Arguments
+/// # 인자
 ///
-/// * `params` - Iterator of key-value pairs
+/// * `params` - 키-값 쌍의 반복자
 ///
-/// # Returns
+/// # 반환값
 ///
-/// URL-encoded query string
+/// URL 인코딩된 쿼리 문자열
 pub fn build_query_string<I, K, V>(params: I) -> String
 where
     I: IntoIterator<Item = (K, V)>,
@@ -239,7 +239,7 @@ mod tests {
     fn test_timestamp() {
         let ts = BybitCredentials::timestamp();
         assert!(ts > 0);
-        // Should be a reasonable timestamp (after 2020)
+        // 합리적인 타임스탬프여야 함 (2020년 이후)
         assert!(ts > 1577836800000);
     }
 
@@ -251,9 +251,9 @@ mod tests {
 
         let signature = creds.sign_get(timestamp, query).unwrap();
 
-        // Signature should be 64 hex characters (256 bits)
+        // 서명은 64개의 16진수 문자여야 함 (256 bits)
         assert_eq!(signature.len(), 64);
-        // Should be lowercase hex
+        // 소문자 16진수여야 함
         assert!(signature.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(signature, signature.to_lowercase());
     }
@@ -279,7 +279,7 @@ mod tests {
         let sig1 = creds.sign_get(timestamp, query).unwrap();
         let sig2 = creds.sign_get(timestamp, query).unwrap();
 
-        // Same input should produce same signature
+        // 동일한 입력은 동일한 서명을 생성해야 함
         assert_eq!(sig1, sig2);
     }
 

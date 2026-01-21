@@ -1,6 +1,6 @@
-//! Upbit REST API client implementation.
+//! Upbit REST API 클라이언트 구현.
 //!
-//! This module provides the main client for interacting with the Upbit API.
+//! 이 모듈은 Upbit API와 상호작용하기 위한 메인 클라이언트를 제공합니다.
 
 use crate::exchange::{
     Balance, Candle, CandleInterval, ExchangeError, ExchangeResult, MarketData, Order, OrderBook,
@@ -16,13 +16,13 @@ use chrono::{NaiveDateTime, Utc};
 use reqwest::Client;
 use std::collections::HashMap;
 
-/// Base URL for Upbit REST API.
+/// Upbit REST API 기본 URL.
 const BASE_URL: &str = "https://api.upbit.com/v1";
 
-/// Upbit API client.
+/// Upbit API 클라이언트.
 ///
-/// This client supports both public (quotation) and private (exchange) APIs.
-/// For private APIs, credentials must be provided.
+/// 이 클라이언트는 공개(시세) API와 비공개(거래) API를 모두 지원합니다.
+/// 비공개 API를 사용하려면 인증 정보가 필요합니다.
 #[derive(Debug)]
 pub struct UpbitClient {
     client: Client,
@@ -30,13 +30,13 @@ pub struct UpbitClient {
 }
 
 impl UpbitClient {
-    /// Creates a new unauthenticated Upbit client.
+    /// 인증 없는 새 Upbit 클라이언트를 생성합니다.
     ///
-    /// This client can only access public (quotation) APIs.
+    /// 이 클라이언트는 공개(시세) API만 접근할 수 있습니다.
     ///
-    /// # Errors
+    /// # 오류
     ///
-    /// Returns an error if the HTTP client cannot be created.
+    /// HTTP 클라이언트를 생성할 수 없는 경우 오류를 반환합니다.
     pub fn new() -> ExchangeResult<Self> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -49,18 +49,18 @@ impl UpbitClient {
         })
     }
 
-    /// Creates a new authenticated Upbit client.
+    /// 인증된 새 Upbit 클라이언트를 생성합니다.
     ///
-    /// This client can access both public and private APIs.
+    /// 이 클라이언트는 공개 API와 비공개 API 모두 접근할 수 있습니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `access_key` - Upbit API access key
-    /// * `secret_key` - Upbit API secret key
+    /// * `access_key` - Upbit API 액세스 키
+    /// * `secret_key` - Upbit API 시크릿 키
     ///
-    /// # Errors
+    /// # 오류
     ///
-    /// Returns an error if the HTTP client cannot be created.
+    /// HTTP 클라이언트를 생성할 수 없는 경우 오류를 반환합니다.
     pub fn with_credentials(
         access_key: impl Into<String>,
         secret_key: impl Into<String>,
@@ -76,14 +76,14 @@ impl UpbitClient {
         })
     }
 
-    /// Returns the credentials if available.
+    /// 인증 정보가 있으면 반환합니다.
     fn credentials(&self) -> ExchangeResult<&UpbitCredentials> {
         self.credentials
             .as_ref()
             .ok_or_else(|| ExchangeError::AuthError("Credentials not provided".to_string()))
     }
 
-    /// Makes a GET request to a public endpoint.
+    /// 공개 엔드포인트에 GET 요청을 보냅니다.
     async fn get_public<T: serde::de::DeserializeOwned>(
         &self,
         endpoint: &str,
@@ -100,7 +100,7 @@ impl UpbitClient {
         self.handle_response(response).await
     }
 
-    /// Makes a GET request to a private endpoint.
+    /// 비공개 엔드포인트에 GET 요청을 보냅니다.
     async fn get_private<T: serde::de::DeserializeOwned>(
         &self,
         endpoint: &str,
@@ -126,7 +126,7 @@ impl UpbitClient {
         self.handle_response(response).await
     }
 
-    /// Makes a POST request to a private endpoint.
+    /// 비공개 엔드포인트에 POST 요청을 보냅니다.
     async fn post_private<T: serde::de::DeserializeOwned>(
         &self,
         endpoint: &str,
@@ -135,7 +135,7 @@ impl UpbitClient {
         let creds = self.credentials()?;
         let url = format!("{BASE_URL}{endpoint}");
 
-        // Serialize body to query string format for hash
+        // 해시를 위해 body를 쿼리 스트링 형식으로 직렬화
         let body_map: HashMap<String, serde_json::Value> =
             serde_json::from_str(&serde_json::to_string(body).map_err(ExchangeError::JsonError)?)
                 .map_err(ExchangeError::JsonError)?;
@@ -168,7 +168,7 @@ impl UpbitClient {
         self.handle_response(response).await
     }
 
-    /// Makes a DELETE request to a private endpoint.
+    /// 비공개 엔드포인트에 DELETE 요청을 보냅니다.
     async fn delete_private<T: serde::de::DeserializeOwned>(
         &self,
         endpoint: &str,
@@ -192,7 +192,7 @@ impl UpbitClient {
         self.handle_response(response).await
     }
 
-    /// Handles API response and converts errors.
+    /// API 응답을 처리하고 오류를 변환합니다.
     async fn handle_response<T: serde::de::DeserializeOwned>(
         &self,
         response: reqwest::Response,
@@ -204,7 +204,7 @@ impl UpbitClient {
         } else {
             let error_text = response.text().await.unwrap_or_default();
 
-            // Try to parse as Upbit error
+            // Upbit 오류 형식으로 파싱 시도
             if let Ok(upbit_error) = serde_json::from_str::<UpbitError>(&error_text) {
                 return Err(self.convert_upbit_error(status.as_u16(), &upbit_error));
             }
@@ -216,7 +216,7 @@ impl UpbitClient {
         }
     }
 
-    /// Converts Upbit error to ExchangeError.
+    /// Upbit 오류를 ExchangeError로 변환합니다.
     fn convert_upbit_error(&self, status: u16, error: &UpbitError) -> ExchangeError {
         let name = &error.error.name;
         let message = &error.error.message;
@@ -367,7 +367,7 @@ impl OrderManagement for UpbitClient {
     }
 }
 
-// Conversion functions
+// 변환 함수들
 
 fn convert_ticker(t: UpbitTicker) -> Ticker {
     let change = match t.change.as_str() {
@@ -411,7 +411,7 @@ fn convert_orderbook(ob: UpbitOrderbook) -> OrderBook {
         })
         .collect();
 
-    // Sort asks ascending, bids descending
+    // 매도호가는 오름차순, 매수호가는 내림차순으로 정렬
     asks.sort_by(|a, b| a.price.cmp(&b.price));
     bids.sort_by(|a, b| b.price.cmp(&a.price));
 

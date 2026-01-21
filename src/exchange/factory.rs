@@ -1,7 +1,7 @@
-//! Exchange factory for creating exchange instances from configuration.
+//! 설정에서 거래소 인스턴스를 생성하기 위한 거래소 팩토리.
 //!
-//! This module provides factory functions for creating exchange adapters
-//! from configuration, enabling dynamic exchange instantiation.
+//! 이 모듈은 설정으로부터 거래소 어댑터를 생성하는 팩토리 함수를 제공하여
+//! 동적 거래소 인스턴스화를 가능하게 합니다.
 
 use crate::config::ExchangeConfig;
 use crate::exchange::adapter::ExchangeAdapter;
@@ -10,35 +10,35 @@ use crate::exchange::manager::ExchangeManager;
 use crate::exchanges::{BithumbClient, BybitClient, UpbitClient};
 use std::sync::Arc;
 
-// ==================== Exchange Adapters ====================
+// ==================== 거래소 어댑터 ====================
 
-/// Upbit exchange adapter.
+/// Upbit 거래소 어댑터.
 #[derive(Debug)]
 pub struct UpbitAdapter {
     client: UpbitClient,
 }
 
 impl UpbitAdapter {
-    /// Creates a new Upbit adapter from a client.
+    /// 클라이언트로부터 새 Upbit 어댑터를 생성합니다.
     pub fn new(client: UpbitClient) -> Self {
         Self { client }
     }
 
-    /// Creates a new unauthenticated Upbit adapter.
+    /// 인증되지 않은 새 Upbit 어댑터를 생성합니다.
     pub fn public() -> ExchangeResult<Self> {
         Ok(Self {
             client: UpbitClient::new()?,
         })
     }
 
-    /// Creates a new authenticated Upbit adapter.
+    /// 인증된 새 Upbit 어댑터를 생성합니다.
     pub fn authenticated(api_key: &str, secret_key: &str) -> ExchangeResult<Self> {
         Ok(Self {
             client: UpbitClient::with_credentials(api_key, secret_key)?,
         })
     }
 
-    /// Creates from exchange config.
+    /// 거래소 설정으로부터 생성합니다.
     pub fn from_config(config: &ExchangeConfig) -> ExchangeResult<Self> {
         if config.has_credentials() {
             Self::authenticated(&config.api_key, &config.secret_key)
@@ -124,33 +124,33 @@ impl ExchangeAdapter for UpbitAdapter {
     }
 }
 
-/// Bithumb exchange adapter.
+/// Bithumb 거래소 어댑터.
 #[derive(Debug)]
 pub struct BithumbAdapter {
     client: BithumbClient,
 }
 
 impl BithumbAdapter {
-    /// Creates a new Bithumb adapter from a client.
+    /// 클라이언트로부터 새 Bithumb 어댑터를 생성합니다.
     pub fn new(client: BithumbClient) -> Self {
         Self { client }
     }
 
-    /// Creates a new unauthenticated Bithumb adapter.
+    /// 인증되지 않은 새 Bithumb 어댑터를 생성합니다.
     pub fn public() -> ExchangeResult<Self> {
         Ok(Self {
             client: BithumbClient::new()?,
         })
     }
 
-    /// Creates a new authenticated Bithumb adapter.
+    /// 인증된 새 Bithumb 어댑터를 생성합니다.
     pub fn authenticated(api_key: &str, secret_key: &str) -> ExchangeResult<Self> {
         Ok(Self {
             client: BithumbClient::with_credentials(api_key, secret_key)?,
         })
     }
 
-    /// Creates from exchange config.
+    /// 거래소 설정으로부터 생성합니다.
     pub fn from_config(config: &ExchangeConfig) -> ExchangeResult<Self> {
         if config.has_credentials() {
             Self::authenticated(&config.api_key, &config.secret_key)
@@ -236,47 +236,47 @@ impl ExchangeAdapter for BithumbAdapter {
     }
 }
 
-/// Bybit exchange adapter.
+/// Bybit 거래소 어댑터.
 #[derive(Debug)]
 pub struct BybitAdapter {
     client: BybitClient,
 }
 
 impl BybitAdapter {
-    /// Creates a new Bybit adapter from a client.
+    /// 클라이언트로부터 새 Bybit 어댑터를 생성합니다.
     pub fn new(client: BybitClient) -> Self {
         Self { client }
     }
 
-    /// Creates a new unauthenticated Bybit adapter (mainnet).
+    /// 인증되지 않은 새 Bybit 어댑터를 생성합니다 (메인넷).
     pub fn public() -> ExchangeResult<Self> {
         Ok(Self {
             client: BybitClient::new()?,
         })
     }
 
-    /// Creates a new unauthenticated Bybit adapter (testnet).
+    /// 인증되지 않은 새 Bybit 어댑터를 생성합니다 (테스트넷).
     pub fn public_testnet() -> ExchangeResult<Self> {
         Ok(Self {
             client: BybitClient::new_testnet()?,
         })
     }
 
-    /// Creates a new authenticated Bybit adapter (mainnet).
+    /// 인증된 새 Bybit 어댑터를 생성합니다 (메인넷).
     pub fn authenticated(api_key: &str, secret_key: &str) -> ExchangeResult<Self> {
         Ok(Self {
             client: BybitClient::with_credentials(api_key, secret_key)?,
         })
     }
 
-    /// Creates a new authenticated Bybit adapter (testnet).
+    /// 인증된 새 Bybit 어댑터를 생성합니다 (테스트넷).
     pub fn authenticated_testnet(api_key: &str, secret_key: &str) -> ExchangeResult<Self> {
         Ok(Self {
             client: BybitClient::with_credentials_testnet(api_key, secret_key)?,
         })
     }
 
-    /// Creates from exchange config.
+    /// 거래소 설정으로부터 생성합니다.
     pub fn from_config(config: &ExchangeConfig) -> ExchangeResult<Self> {
         if config.has_credentials() {
             Self::authenticated(&config.api_key, &config.secret_key)
@@ -285,7 +285,7 @@ impl BybitAdapter {
         }
     }
 
-    /// Creates from exchange config (testnet).
+    /// 거래소 설정으로부터 생성합니다 (테스트넷).
     pub fn from_config_testnet(config: &ExchangeConfig) -> ExchangeResult<Self> {
         if config.has_credentials() {
             Self::authenticated_testnet(&config.api_key, &config.secret_key)
@@ -371,21 +371,21 @@ impl ExchangeAdapter for BybitAdapter {
     }
 }
 
-// ==================== Factory Functions ====================
+// ==================== 팩토리 함수 ====================
 
-/// Supported exchange names.
+/// 지원되는 거래소 이름.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExchangeName {
-    /// Upbit (Korean exchange).
+    /// Upbit (한국 거래소).
     Upbit,
-    /// Bithumb (Korean exchange).
+    /// Bithumb (한국 거래소).
     Bithumb,
-    /// Bybit (Global exchange).
+    /// Bybit (글로벌 거래소).
     Bybit,
 }
 
 impl ExchangeName {
-    /// Returns the string representation of the exchange name.
+    /// 거래소 이름의 문자열 표현을 반환합니다.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Upbit => "upbit",
@@ -394,14 +394,14 @@ impl ExchangeName {
         }
     }
 
-    /// Returns all supported exchange names.
+    /// 지원되는 모든 거래소 이름을 반환합니다.
     pub fn all() -> &'static [Self] {
         &[Self::Upbit, Self::Bithumb, Self::Bybit]
     }
 
-    /// Parses an exchange name from a string (convenience method).
+    /// 문자열에서 거래소 이름을 파싱합니다 (편의 메서드).
     ///
-    /// This is a convenience wrapper around `FromStr::from_str` that returns `Option<Self>`.
+    /// `FromStr::from_str`의 편의 래퍼로 `Option<Self>`를 반환합니다.
     pub fn parse(s: &str) -> Option<Self> {
         s.parse().ok()
     }
@@ -430,18 +430,18 @@ impl std::fmt::Display for ExchangeName {
     }
 }
 
-/// Creates an exchange adapter by name.
+/// 이름으로 거래소 어댑터를 생성합니다.
 ///
-/// # Arguments
+/// # 인자
 ///
-/// * `name` - Exchange name (case-insensitive)
-/// * `config` - Exchange configuration (optional for public-only access)
+/// * `name` - 거래소 이름 (대소문자 구분 없음)
+/// * `config` - 거래소 설정 (공개 전용 접근의 경우 선택적)
 ///
-/// # Errors
+/// # 에러
 ///
-/// Returns an error if the exchange name is not supported or client creation fails.
+/// 거래소 이름이 지원되지 않거나 클라이언트 생성이 실패하면 에러를 반환합니다.
 ///
-/// # Example
+/// # 예제
 ///
 /// ```ignore
 /// let upbit = create_exchange("upbit", None)?;
@@ -480,9 +480,9 @@ pub fn create_exchange(
     Ok(adapter)
 }
 
-/// Creates an exchange adapter using boxed type.
+/// 박스 타입을 사용하여 거래소 어댑터를 생성합니다.
 ///
-/// Same as `create_exchange` but returns `Box<dyn ExchangeAdapter>`.
+/// `create_exchange`와 동일하지만 `Box<dyn ExchangeAdapter>`를 반환합니다.
 pub fn create_exchange_boxed(
     name: &str,
     config: Option<&ExchangeConfig>,
@@ -516,25 +516,25 @@ pub fn create_exchange_boxed(
     Ok(adapter)
 }
 
-/// Extension trait for ExchangeManager to simplify registration from config.
+/// 설정에서 간편하게 등록하기 위한 ExchangeManager 확장 trait.
 pub trait ExchangeManagerExt {
-    /// Registers an exchange from configuration.
+    /// 설정에서 거래소를 등록합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `name` - Exchange name
-    /// * `config` - Exchange configuration
+    /// * `name` - 거래소 이름
+    /// * `config` - 거래소 설정
     fn register_from_config(
         &mut self,
         name: &str,
         config: Option<&ExchangeConfig>,
     ) -> ExchangeResult<()>;
 
-    /// Registers all supported exchanges from the application config.
+    /// 애플리케이션 설정에서 지원되는 모든 거래소를 등록합니다.
     ///
-    /// # Arguments
+    /// # 인자
     ///
-    /// * `config` - Application configuration
+    /// * `config` - 애플리케이션 설정
     fn register_all_from_config(&mut self, config: &crate::config::Config) -> ExchangeResult<()>;
 }
 
@@ -550,13 +550,13 @@ impl ExchangeManagerExt for ExchangeManager {
     }
 
     fn register_all_from_config(&mut self, config: &crate::config::Config) -> ExchangeResult<()> {
-        // Register Upbit
+        // Upbit 등록
         self.register_from_config("upbit", Some(&config.upbit))?;
 
-        // Register Bithumb
+        // Bithumb 등록
         self.register_from_config("bithumb", Some(&config.bithumb))?;
 
-        // Register Bybit
+        // Bybit 등록
         self.register_from_config("bybit", Some(&config.bybit))?;
 
         Ok(())

@@ -1,15 +1,15 @@
-//! # Upbit Public API Example
+//! # Upbit 공개 API 예제
 //!
-//! This example demonstrates how to use the Upbit public (quotation) API
-//! to fetch market data without authentication.
+//! 이 예제는 Upbit 공개(시세 조회) API를 사용하여
+//! 인증 없이 시장 데이터를 조회하는 방법을 보여줍니다.
 //!
-//! ## Running this example
+//! ## 예제 실행 방법
 //!
 //! ```bash
 //! cargo run --example upbit_public
 //! ```
 //!
-//! No API credentials are required for this example.
+//! 이 예제는 API 인증 정보가 필요하지 않습니다.
 
 use arb_poc::exchange::{CandleInterval, MarketData};
 use arb_poc::exchanges::UpbitClient;
@@ -18,11 +18,11 @@ use arb_poc::exchanges::UpbitClient;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Upbit Public API Example ===\n");
 
-    // Create an unauthenticated client
+    // 인증 없이 클라이언트 생성
     let client = UpbitClient::new()?;
     println!("Exchange: {}\n", client.name());
 
-    // 1. Fetch ticker for multiple markets
+    // 1. 여러 마켓의 티커 조회
     println!("--- Tickers ---");
     let markets = ["KRW-BTC", "KRW-ETH", "KRW-XRP"];
     let tickers = client.get_ticker(&markets).await?;
@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    // 2. Fetch order book
+    // 2. 호가창 조회
     println!("--- Order Book (KRW-BTC) ---");
     let orderbook = client.get_orderbook("KRW-BTC", Some(5)).await?;
 
@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Total Bid Size: {}", orderbook.total_bid_size);
     println!();
 
-    // 3. Fetch candles
+    // 3. 캔들 데이터 조회
     println!("--- Recent Candles (KRW-BTC, 15min) ---");
     let candles = client
         .get_candles("KRW-BTC", CandleInterval::Minute15, 5)

@@ -1,11 +1,11 @@
-//! # Upbit Private API Example
+//! # Upbit 비공개 API 예제
 //!
-//! This example demonstrates how to use the Upbit private (exchange) API
-//! to manage orders and check account balances.
+//! 이 예제는 Upbit 비공개(거래) API를 사용하여
+//! 주문을 관리하고 계정 잔고를 확인하는 방법을 보여줍니다.
 //!
-//! ## Prerequisites
+//! ## 사전 요구사항
 //!
-//! 1. Create a `config.toml` file in the project root:
+//! 1. 프로젝트 루트에 `config.toml` 파일을 생성하세요:
 //!
 //! ```toml
 //! [upbit]
@@ -13,25 +13,25 @@
 //! secret_key = "your-secret-key"
 //! ```
 //!
-//! Or set environment variables:
+//! 또는 환경 변수를 설정하세요:
 //! - `UPBIT_API_KEY`
 //! - `UPBIT_SECRET_KEY`
 //!
-//! ## Running this example
+//! ## 예제 실행 방법
 //!
 //! ```bash
 //! cargo run --example upbit_private
 //! ```
 //!
-//! **WARNING**: This example may place real orders on your account.
-//! Use with caution and review the code before running.
+//! **경고**: 이 예제는 실제 계정에 주문을 넣을 수 있습니다.
+//! 실행 전에 코드를 검토하고 주의해서 사용하세요.
 
 use arb_poc::config::Config;
 use arb_poc::exchange::{MarketData, OrderManagement};
 use arb_poc::exchanges::UpbitClient;
 use rust_decimal::Decimal;
 
-// OrderRequest is used in the commented-out order placement example
+// OrderRequest는 아래 주석 처리된 주문 예제에서 사용됩니다
 #[allow(unused_imports)]
 use arb_poc::exchange::OrderRequest;
 
@@ -39,7 +39,7 @@ use arb_poc::exchange::OrderRequest;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Upbit Private API Example ===\n");
 
-    // Load configuration
+    // 설정 로드
     let config = Config::load()?;
 
     if !config.upbit.has_credentials() {
@@ -52,13 +52,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Create an authenticated client
+    // 인증된 클라이언트 생성
     let client = UpbitClient::with_credentials(&config.upbit.api_key, &config.upbit.secret_key)?;
 
     println!("Exchange: {}", client.name());
     println!("Authentication: Enabled\n");
 
-    // 1. Fetch account balances
+    // 1. 계정 잔고 조회
     println!("--- Account Balances ---");
     let balances = client.get_balances().await?;
 
@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    // 2. Fetch open orders
+    // 2. 미체결 주문 조회
     println!("--- Open Orders ---");
     let open_orders = client.get_open_orders(None).await?;
 
@@ -95,17 +95,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    // 3. Example: Place a limit order (COMMENTED OUT FOR SAFETY)
-    // Uncomment the following code to test order placement.
-    // Make sure to use appropriate price and volume for your account.
+    // 3. 예제: 지정가 주문 넣기 (안전을 위해 주석 처리됨)
+    // 주문 기능을 테스트하려면 아래 코드의 주석을 해제하세요.
+    // 계정에 적절한 가격과 수량을 사용하세요.
     /*
     println!("--- Place Order Example ---");
 
-    // Get current price first
+    // 먼저 현재 가격 조회
     let tickers = client.get_ticker(&["KRW-BTC"]).await?;
     let current_price = tickers.first().map(|t| t.trade_price).unwrap_or_default();
 
-    // Place a limit buy order at 90% of current price (unlikely to fill)
+    // 현재 가격의 90%에 지정가 매수 주문 (체결 가능성 낮음)
     let order_price = current_price * Decimal::new(9, 1); // 90%
     let order_volume = Decimal::new(1, 4); // 0.0001 BTC
 
@@ -126,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Order ID: {}", order.id);
             println!("  Status: {:?}", order.status);
 
-            // Cancel the order
+            // 주문 취소
             println!("\nCancelling order...");
             match client.cancel_order(&order.id).await {
                 Ok(cancelled) => {

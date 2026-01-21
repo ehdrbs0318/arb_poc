@@ -1,17 +1,17 @@
-//! Bithumb private API example.
+//! Bithumb 비공개 API 예제.
 //!
-//! This example demonstrates how to use the Bithumb client to access
-//! private API endpoints with authentication.
+//! 이 예제는 인증을 사용하여 Bithumb 비공개 API 엔드포인트에
+//! 접근하는 방법을 보여줍니다.
 //!
-//! # Configuration
+//! # 설정
 //!
-//! Set the following environment variables before running:
-//! - BITHUMB_API_KEY: Your Bithumb API access key
-//! - BITHUMB_SECRET_KEY: Your Bithumb API secret key
+//! 실행 전 다음 환경 변수를 설정하세요:
+//! - BITHUMB_API_KEY: Bithumb API 액세스 키
+//! - BITHUMB_SECRET_KEY: Bithumb API 시크릿 키
 //!
-//! Or create a config.toml file with your credentials.
+//! 또는 자격 증명이 포함된 config.toml 파일을 생성하세요.
 //!
-//! # Run
+//! # 실행
 //!
 //! ```bash
 //! BITHUMB_API_KEY=your_key BITHUMB_SECRET_KEY=your_secret cargo run --example bithumb_private
@@ -23,10 +23,10 @@ use arb_poc::exchanges::BithumbClient;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing for logging
+    // 로깅을 위한 tracing 초기화
     tracing_subscriber::fmt::init();
 
-    // Load configuration
+    // 설정 로드
     let config = Config::load_or_default();
 
     if !config.bithumb.has_credentials() {
@@ -36,12 +36,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Create an authenticated client
+    // 인증된 클라이언트 생성
     let client =
         BithumbClient::with_credentials(&config.bithumb.api_key, &config.bithumb.secret_key)?;
     println!("Created authenticated Bithumb client");
 
-    // Fetch account balances
+    // 계정 잔고 조회
     println!("\n--- Account Balances ---");
     match client.get_balances().await {
         Ok(balances) => {
@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => println!("Error fetching balances: {}", e),
     }
 
-    // Fetch specific currency balance
+    // 특정 통화 잔고 조회
     println!("\n--- KRW Balance ---");
     match client.get_balance("KRW").await {
         Ok(balance) => {
@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => println!("Error fetching KRW balance: {}", e),
     }
 
-    // Fetch open orders
+    // 미체결 주문 조회
     println!("\n--- Open Orders (KRW-BTC) ---");
     match client.get_open_orders(Some("KRW-BTC")).await {
         Ok(orders) => {
@@ -92,16 +92,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => println!("Error fetching open orders: {}", e),
     }
 
-    // Example: Place and cancel an order (commented out for safety)
+    // 예제: 주문 생성 및 취소 (안전을 위해 주석 처리됨)
     /*
     use arb_poc::exchange::OrderRequest;
     use rust_decimal::Decimal;
 
-    // Place a limit buy order
+    // 지정가 매수 주문 생성
     println!("\n--- Place Order ---");
     let order_request = OrderRequest::limit_buy(
         "KRW-BTC",
-        Decimal::from(10000000),  // Very low price to avoid execution
+        Decimal::from(10000000),  // 체결 방지를 위한 매우 낮은 가격
         Decimal::new(1, 4),       // 0.0001 BTC
     );
 
@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Order placed: {}", order.id);
             println!("Status: {:?}", order.status);
 
-            // Cancel the order
+            // 주문 취소
             println!("\n--- Cancel Order ---");
             match client.cancel_order(&order.id).await {
                 Ok(cancelled) => {
