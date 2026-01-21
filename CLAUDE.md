@@ -18,11 +18,12 @@ Rust 기반 Arbitrage(차익거래) PoC(Proof of Concept) 프로젝트
 │              (추상화된 Exchange API 사용)                 │
 ├─────────────────────────────────────────────────────────┤
 │                 Exchange Abstraction                     │
-│         (trait Exchange, trait OrderBook, etc.)          │
-├──────────┬──────────┬──────────┬──────────┬────────────┤
-│ Binance  │  Upbit   │  Bithumb │  Bybit   │    ...     │
-│   SDK    │   SDK    │   SDK    │   SDK    │            │
-└──────────┴──────────┴──────────┴──────────┴────────────┘
+│    (trait MarketData, trait OrderManagement, etc.)       │
+├────────────────┬────────────────┬───────────────────────┤
+│     Upbit      │    Bithumb     │       Bybit           │
+│      SDK       │      SDK       │        SDK            │
+│   (한국/KRW)    │   (한국/KRW)    │    (글로벌/USDT)      │
+└────────────────┴────────────────┴───────────────────────┘
 ```
 
 ### 레이어 설명
@@ -43,34 +44,43 @@ Rust 기반 Arbitrage(차익거래) PoC(Proof of Concept) 프로젝트
    - 거래소 API 호출, 인증, 웹소켓 연결 등 구현
    - 새 거래소 추가 시 이 계층에 모듈만 추가하면 됨
 
-### 모듈 구조 (목표)
+### 모듈 구조
 
 ```
 src/
-├── main.rs
-├── lib.rs
-├── strategy/              # 전략 계층
-│   ├── mod.rs
-│   ├── arbitrage.rs       # 차익거래 전략
-│   └── ...
-├── exchange/              # 거래소 추상화 계층
-│   ├── mod.rs
-│   ├── traits.rs          # Exchange, OrderBook 등 trait 정의
-│   ├── types.rs           # 공통 타입 (Order, Ticker, etc.)
-│   └── error.rs           # 거래소 관련 에러 타입
-├── exchanges/             # 각 거래소 SDK 구현
-│   ├── mod.rs
-│   ├── binance/
-│   │   ├── mod.rs
-│   │   ├── client.rs
-│   │   ├── websocket.rs
-│   │   └── ...
-│   ├── upbit/
-│   │   └── ...
-│   └── ...
+├── main.rs                # 메인 진입점
+├── lib.rs                 # 라이브러리 루트
 ├── config/                # 설정 관리
 │   └── mod.rs
-└── utils/                 # 유틸리티
+├── logging/               # 로깅 모듈
+│   └── mod.rs
+├── exchange/              # 거래소 추상화 계층
+│   ├── mod.rs
+│   ├── traits.rs          # MarketData, OrderManagement trait 정의
+│   ├── types.rs           # 공통 타입 (Order, Ticker, OrderBook, etc.)
+│   ├── error.rs           # 거래소 관련 에러 타입
+│   ├── adapter.rs         # 객체 안전 어댑터 trait
+│   ├── factory.rs         # 거래소 팩토리 함수
+│   ├── manager.rs         # ExchangeManager (다중 거래소 관리)
+│   └── market.rs          # 마켓 코드 변환 유틸리티
+├── exchanges/             # 각 거래소 SDK 구현
+│   ├── mod.rs
+│   ├── upbit/             # Upbit 거래소
+│   │   ├── mod.rs
+│   │   ├── client.rs
+│   │   ├── types.rs
+│   │   └── auth.rs
+│   ├── bithumb/           # Bithumb 거래소
+│   │   ├── mod.rs
+│   │   ├── client.rs
+│   │   ├── types.rs
+│   │   └── auth.rs
+│   └── bybit/             # Bybit 거래소
+│       ├── mod.rs
+│       ├── client.rs
+│       ├── types.rs
+│       └── auth.rs
+└── strategy/              # 전략 계층 (TODO)
     └── ...
 ```
 
@@ -123,22 +133,44 @@ secret_key = "실제_시크릿_키"
 
 ## 프로젝트 구조
 
-### 현재 구조
+### 프로젝트 구조
 
 ```
 arb_poc/
-├── src/
-│   └── main.rs          # 메인 진입점
-├── Cargo.toml           # 프로젝트 설정 및 의존성
-├── Cargo.lock           # 의존성 잠금 파일
-├── config.example.toml  # 설정 템플릿 (Git 포함)
-├── config.toml          # 실제 설정 (Git 제외)
+├── src/                      # 소스 코드
+│   ├── main.rs               # 메인 진입점
+│   ├── lib.rs                # 라이브러리 루트
+│   ├── config/               # 설정 관리
+│   ├── logging/              # 로깅 모듈
+│   ├── exchange/             # 거래소 추상화 계층
+│   └── exchanges/            # 거래소별 SDK 구현
+│       ├── upbit/
+│       ├── bithumb/
+│       └── bybit/
+├── examples/                 # 사용 예제
+│   ├── upbit_public.rs
+│   ├── upbit_private.rs
+│   ├── bithumb_public.rs
+│   ├── bithumb_private.rs
+│   ├── bybit_public.rs
+│   ├── bybit_private.rs
+│   └── exchange_manager.rs
+├── Cargo.toml                # 프로젝트 설정 및 의존성
+├── Cargo.lock                # 의존성 잠금 파일
+├── config.example.toml       # 설정 템플릿 (Git 포함)
+├── config.toml               # 실제 설정 (Git 제외)
 └── .claude/
-    └── agents/          # 커스텀 에이전트 정의
-        ├── coder.md     # Rust 코드 작성 전문가
-        ├── trader.md    # 금융공학/퀀트 전문가
-        ├── reviewer.md  # 코드 리뷰 전문가
-        └── supervisor.md # 작업 조율 담당
+    ├── agents/               # 커스텀 에이전트 정의
+    │   ├── coder.md          # Rust 코드 작성 전문가
+    │   ├── trader.md         # 금융공학/퀀트 전문가
+    │   ├── reviewer.md       # 코드 리뷰 전문가
+    │   └── supervisor.md     # 작업 조율 담당
+    └── skills/               # 스킬 정의
+        ├── comment.md        # 주석 스타일 가이드
+        ├── logging.md        # 로깅 스타일 가이드
+        ├── upbit-api/        # Upbit API 레퍼런스
+        ├── bithumb-api/      # Bithumb API 레퍼런스
+        └── bybit-v5-api/     # Bybit V5 API 레퍼런스
 ```
 
 ## 빌드 및 실행 명령어
@@ -186,7 +218,9 @@ cargo doc --open
 
 - 공개 API에는 `///` 주석 필수
 - 모듈 레벨 문서는 `//!` 사용
-- 코드 주석과 문서는 영어로 작성
+- **코드 주석은 한글로 작성** (`.claude/skills/comment.md` 참조)
+- 기술 용어(trait, API, JWT 등)는 영어로 유지
+- 에러 메시지 문자열은 영어로 유지 (국제화 고려)
 
 ### Git 커밋
 
@@ -280,3 +314,38 @@ supervisor 처리 과정:
 - 런타임 성능 오버헤드
 - 유지보수 상태 및 보안 이력
 - 라이선스 호환성
+
+## 스킬 참조
+
+코드 작성 시 다음 스킬 문서를 참조하세요:
+
+| 스킬 | 경로 | 설명 |
+|------|------|------|
+| 주석 스타일 | `.claude/skills/comment.md` | 한글 주석 작성 규칙 |
+| 로깅 | `.claude/skills/logging.md` | tracing 기반 로깅 패턴 |
+| Upbit API | `.claude/skills/upbit-api/` | Upbit 거래소 API 레퍼런스 |
+| Bithumb API | `.claude/skills/bithumb-api/` | Bithumb 거래소 API 레퍼런스 |
+| Bybit API | `.claude/skills/bybit-v5-api/` | Bybit V5 API 레퍼런스 |
+
+## 로깅
+
+이 프로젝트는 `tracing` 크레이트를 사용합니다. 로깅 초기화 및 사용법은 `.claude/skills/logging.md`를 참조하세요.
+
+### 로그 레벨
+
+| 레벨 | 용도 |
+|------|------|
+| `error` | 치명적 오류, 복구 불가능 |
+| `warn` | 복구 가능한 문제 |
+| `info` | 중요 비즈니스 이벤트 (주문, 체결 등) |
+| `debug` | 개발/디버깅용 상세 정보 |
+| `trace` | 매우 상세한 추적 정보 |
+
+### 로깅 초기화 예시
+
+```rust
+use arb_poc::logging::{init_logging, LogConfig};
+
+let config = LogConfig::from_env();
+init_logging(&config).expect("로깅 초기화 실패");
+```
