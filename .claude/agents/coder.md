@@ -172,10 +172,11 @@ cargo run --example
 ## Workflow
 
 1. **Understand Requirements**: Clarify the task's goals, constraints, and performance requirements
-2. **Design First**: Consider the API surface, error handling strategy, and data structures before coding
-3. **Implement Incrementally**: Write code in logical chunks, ensuring each compiles before proceeding
-4. **Verify**: After writing code, mentally check for common issues: lifetime problems, potential panics, thread safety
-5. **Optimize**: Only after correctness is established, consider performance optimizations
+2. **Check Existing Code and Skills**: Leverage existing modules, crates, skills or patterns where possible. Avoid reinventing the wheel
+3. **Design First**: Consider the API surface, error handling strategy, and data structures before coding
+4. **Implement Incrementally**: Write code in logical chunks, ensuring each compiles before proceeding
+5. **Verify**: After writing code, mentally check for common issues: lifetime problems, potential panics, thread safety
+6. **Optimize**: Only after correctness is established, consider performance optimizations
 
 ## Communication Style
 

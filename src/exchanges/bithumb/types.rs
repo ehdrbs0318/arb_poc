@@ -1,0 +1,307 @@
+//! Bithumb-specific types and API response structures.
+//!
+//! These types are used for deserializing Bithumb API responses
+//! and are then converted to the common exchange types.
+
+use chrono::{DateTime, TimeZone, Utc};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Bithumb API error response.
+#[derive(Debug, Deserialize)]
+pub struct BithumbError {
+    pub error: BithumbErrorDetail,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BithumbErrorDetail {
+    pub name: String,
+    pub message: String,
+}
+
+/// Bithumb ticker response.
+#[derive(Debug, Deserialize)]
+pub struct BithumbTicker {
+    pub market: String,
+    #[serde(deserialize_with = "deserialize_decimal_from_number")]
+    pub trade_price: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_number")]
+    pub opening_price: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_number")]
+    pub high_price: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_number")]
+    pub low_price: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_number")]
+    pub prev_closing_price: Decimal,
+    pub change: String,
+    #[serde(default, deserialize_with = "deserialize_decimal_from_number_opt")]
+    pub change_rate: Decimal,
+    #[serde(default, deserialize_with = "deserialize_decimal_from_number_opt")]
+    pub change_price: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_number")]
+    pub acc_trade_volume_24h: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_number")]
+    pub acc_trade_price_24h: Decimal,
+    #[serde(deserialize_with = "deserialize_timestamp_millis")]
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Bithumb orderbook response.
+#[derive(Debug, Deserialize)]
+pub struct BithumbOrderbook {
+    pub market: String,
+    #[serde(deserialize_with = "deserialize_timestamp_millis")]
+    pub timestamp: DateTime<Utc>,
+    #[serde(deserialize_with = "deserialize_decimal_from_number")]
+    pub total_ask_size: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_number")]
+    pub total_bid_size: Decimal,
+    pub orderbook_units: Vec<BithumbOrderbookUnit>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BithumbOrderbookUnit {
+    #[serde(deserialize_with = "deserialize_decimal_from_number")]
+    pub ask_price: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_number")]
+    pub bid_price: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_number")]
+    pub ask_size: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_number")]
+    pub bid_size: Decimal,
+}
+
+/// Bithumb candle response (minutes).
+#[derive(Debug, Deserialize)]
+pub struct BithumbCandle {
+    pub market: String,
+    pub candle_date_time_utc: String,
+    #[serde(deserialize_with = "deserialize_decimal_from_number")]
+    pub opening_price: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_number")]
+    pub high_price: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_number")]
+    pub low_price: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_number")]
+    pub trade_price: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_number")]
+    pub candle_acc_trade_volume: Decimal,
+    #[serde(default, deserialize_with = "deserialize_decimal_from_number_opt")]
+    pub candle_acc_trade_price: Decimal,
+}
+
+/// Bithumb account balance response.
+#[derive(Debug, Deserialize)]
+pub struct BithumbBalance {
+    pub currency: String,
+    #[serde(deserialize_with = "deserialize_decimal_string")]
+    pub balance: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_string")]
+    pub locked: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_string")]
+    pub avg_buy_price: Decimal,
+    #[serde(default)]
+    pub avg_buy_price_modified: bool,
+    pub unit_currency: String,
+}
+
+/// Bithumb order response.
+#[derive(Debug, Deserialize)]
+pub struct BithumbOrder {
+    pub uuid: String,
+    pub market: String,
+    pub side: String,
+    pub ord_type: String,
+    pub state: String,
+    #[serde(deserialize_with = "deserialize_decimal_string")]
+    pub volume: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_string")]
+    pub remaining_volume: Decimal,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_string")]
+    pub executed_volume: Option<Decimal>,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_string")]
+    pub price: Option<Decimal>,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_string")]
+    pub avg_price: Option<Decimal>,
+    #[serde(deserialize_with = "deserialize_decimal_string")]
+    pub paid_fee: Decimal,
+    pub created_at: String,
+    #[serde(default)]
+    pub identifier: Option<String>,
+}
+
+/// Bithumb order request body.
+#[derive(Debug, Serialize)]
+pub struct BithumbOrderRequest {
+    pub market: String,
+    pub side: String,
+    pub ord_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_in_force: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<String>,
+}
+
+/// Deserialize timestamp from milliseconds.
+fn deserialize_timestamp_millis<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let millis = i64::deserialize(deserializer)?;
+    Utc.timestamp_millis_opt(millis)
+        .single()
+        .ok_or_else(|| serde::de::Error::custom("invalid timestamp"))
+}
+
+/// Deserialize decimal from number.
+fn deserialize_decimal_from_number<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    // Try to deserialize as f64 first, then convert to Decimal
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match &value {
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(Decimal::from(i))
+            } else if let Some(f) = n.as_f64() {
+                Decimal::try_from(f).map_err(serde::de::Error::custom)
+            } else {
+                Err(serde::de::Error::custom("invalid number"))
+            }
+        }
+        serde_json::Value::String(s) => s.parse::<Decimal>().map_err(serde::de::Error::custom),
+        _ => Err(serde::de::Error::custom("expected number or string")),
+    }
+}
+
+/// Deserialize decimal from number with default.
+fn deserialize_decimal_from_number_opt<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match &value {
+        serde_json::Value::Null => Ok(Decimal::ZERO),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(Decimal::from(i))
+            } else if let Some(f) = n.as_f64() {
+                Decimal::try_from(f).map_err(serde::de::Error::custom)
+            } else {
+                Err(serde::de::Error::custom("invalid number"))
+            }
+        }
+        serde_json::Value::String(s) if s.is_empty() => Ok(Decimal::ZERO),
+        serde_json::Value::String(s) => s.parse::<Decimal>().map_err(serde::de::Error::custom),
+        _ => Err(serde::de::Error::custom("expected number or string")),
+    }
+}
+
+/// Deserialize decimal from string.
+fn deserialize_decimal_string<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    s.parse::<Decimal>().map_err(serde::de::Error::custom)
+}
+
+/// Deserialize optional decimal from string.
+fn deserialize_optional_decimal_string<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    match opt {
+        Some(s) if !s.is_empty() => s
+            .parse::<Decimal>()
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deserialize_bithumb_ticker() {
+        let json = r#"{
+            "market": "KRW-BTC",
+            "trade_price": 148500000,
+            "opening_price": 148000000,
+            "high_price": 149000000,
+            "low_price": 147500000,
+            "prev_closing_price": 148000000,
+            "change": "RISE",
+            "change_rate": 0.003,
+            "change_price": 500000,
+            "acc_trade_volume_24h": 1234.5678,
+            "acc_trade_price_24h": 183456789012,
+            "timestamp": 1676965262177
+        }"#;
+
+        let ticker: BithumbTicker = serde_json::from_str(json).unwrap();
+        assert_eq!(ticker.market, "KRW-BTC");
+        assert_eq!(ticker.trade_price, Decimal::from(148500000));
+        assert_eq!(ticker.change, "RISE");
+    }
+
+    #[test]
+    fn test_deserialize_bithumb_orderbook() {
+        let json = r#"{
+            "market": "KRW-BTC",
+            "timestamp": 1676965262177,
+            "total_ask_size": 10.5,
+            "total_bid_size": 9.5,
+            "orderbook_units": [
+                {"ask_price": 148520000, "bid_price": 148490000, "ask_size": 0.01, "bid_size": 0.04}
+            ]
+        }"#;
+
+        let ob: BithumbOrderbook = serde_json::from_str(json).unwrap();
+        assert_eq!(ob.market, "KRW-BTC");
+        assert_eq!(ob.orderbook_units.len(), 1);
+        assert_eq!(ob.orderbook_units[0].ask_price, Decimal::from(148520000));
+    }
+
+    #[test]
+    fn test_deserialize_bithumb_balance() {
+        let json = r#"{
+            "currency": "BTC",
+            "balance": "0.5",
+            "locked": "0.1",
+            "avg_buy_price": "50000000",
+            "avg_buy_price_modified": false,
+            "unit_currency": "KRW"
+        }"#;
+
+        let balance: BithumbBalance = serde_json::from_str(json).unwrap();
+        assert_eq!(balance.currency, "BTC");
+        assert_eq!(balance.balance, Decimal::new(5, 1));
+    }
+
+    #[test]
+    fn test_deserialize_bithumb_candle() {
+        let json = r#"{
+            "market": "KRW-BTC",
+            "candle_date_time_utc": "2024-01-15T10:30:00",
+            "opening_price": 50000000,
+            "high_price": 51000000,
+            "low_price": 49000000,
+            "trade_price": 50500000,
+            "candle_acc_trade_volume": 123.456,
+            "candle_acc_trade_price": 6172839500
+        }"#;
+
+        let candle: BithumbCandle = serde_json::from_str(json).unwrap();
+        assert_eq!(candle.market, "KRW-BTC");
+        assert_eq!(candle.opening_price, Decimal::from(50000000));
+    }
+}

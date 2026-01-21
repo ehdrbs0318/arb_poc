@@ -1,0 +1,23 @@
+# arb_poc Configuration Template
+#
+# Copy this file to config.toml and fill in your API credentials.
+# IMPORTANT: Never commit config.toml to version control!
+
+[upbit]
+api_key = "YOUR_UPBIT_API_KEY"
+secret_key = "YOUR_UPBIT_SECRET_KEY"
+
+[bithumb]
+api_key = "YOUR_BITHUMB_API_KEY"
+secret_key = "YOUR_BITHUMB_SECRET_KEY"
+
+[bybit]
+api_key = "YOUR_BYBIT_API_KEY"
+secret_key = "YOUR_BYBIT_SECRET_KEY"
+# Optional: Use testnet instead of mainnet (default: false)
+testnet = false
+
+# Future exchanges can be added here:
+# [binance]
+# api_key = "YOUR_BINANCE_API_KEY"
+# secret_key = "YOUR_BINANCE_SECRET_KEY"
