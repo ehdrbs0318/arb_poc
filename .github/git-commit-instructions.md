@@ -1,0 +1,1 @@
+When write commit message, write in Korean(한국어)
