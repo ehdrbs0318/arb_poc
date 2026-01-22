@@ -1,9 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/arb-config",
+    "crates/arb-logging",
+    "crates/arb-telegram",
+    "crates/arb-exchange",
+    "crates/arb-exchanges",
+]
+
 [package]
 name = "arb_poc"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Workspace crates
+arb-config = { path = "crates/arb-config" }
+arb-logging = { path = "crates/arb-logging" }
+arb-telegram = { path = "crates/arb-telegram" }
+arb-exchange = { path = "crates/arb-exchange" }
+arb-exchanges = { path = "crates/arb-exchanges" }
+
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
+
+# Decimal precision for financial calculations
+rust_decimal = { version = "1.36", features = ["serde"] }
+
+[dev-dependencies]
+# Testing
+tokio-test = "0.4"
+mockito = "1.6"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["arb_poc team"]
+license = "MIT"
+repository = "https://github.com/example/arb_poc"
+
+[workspace.dependencies]
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
 
@@ -53,11 +93,6 @@ chrono = { version = "0.4", features = ["serde"] }
 # Hex encoding
 hex = "0.4"
 
-[dev-dependencies]
-# Testing
-tokio-test = "0.4"
-mockito = "1.6"
-
 [[example]]
 name = "upbit_public"
 path = "examples/upbit_public.rs"
@@ -85,3 +120,7 @@ path = "examples/bybit_private.rs"
 [[example]]
 name = "exchange_manager"
 path = "examples/exchange_manager.rs"
+
+[[example]]
+name = "telegram"
+path = "examples/telegram.rs"

@@ -16,10 +16,14 @@
 //!
 //! 실행 방법: cargo run --example bybit_private
 
-use arb_poc::exchange::{OrderManagement, OrderRequest};
+use arb_poc::exchange::OrderManagement;
 use arb_poc::exchanges::BybitClient;
 use rust_decimal::Decimal;
 use std::env;
+
+// OrderRequest는 주석 처리된 주문 예제에서 사용됩니다.
+#[allow(unused_imports)]
+use arb_poc::exchange::OrderRequest;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -87,11 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         for order in &open_orders {
             println!(
-                "Order {}: {} {} {} @ {:?}, Status: {:?}, Filled: {}/{}",
+                "Order {}: {} {:?} {:?} @ {:?}, Status: {:?}, Filled: {}/{}",
                 order.id,
                 order.market,
-                format!("{:?}", order.side),
-                format!("{:?}", order.order_type),
+                order.side,
+                order.order_type,
                 order.price,
                 order.status,
                 order.executed_volume,

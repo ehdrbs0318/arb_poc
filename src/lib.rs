@@ -7,14 +7,34 @@
 //!
 //! ## 아키텍처
 //!
-//! 이 크레이트는 다음 모듈들로 구성되어 있습니다:
+//! 이 크레이트는 workspace crates를 re-export합니다:
 //!
-//! - [`exchange`]: 거래소 추상화를 위한 공통 trait 및 타입
-//! - [`exchanges`]: 특정 거래소 구현체 (예: Upbit)
-//! - [`config`]: 설정 관리
-//! - [`logging`]: 구조화된 로깅 시스템
+//! - [`config`]: 설정 관리 (from `arb-config`)
+//! - [`logging`]: 구조화된 로깅 시스템 (from `arb-logging`)
+//! - [`telegram`]: Telegram 알림 시스템 (from `arb-telegram`)
+//! - [`exchange`]: 거래소 추상화를 위한 공통 trait 및 타입 (from `arb-exchange`)
+//! - [`exchanges`]: 특정 거래소 구현체 (from `arb-exchanges`)
+//!
+//! ## 예제
+//!
+//! ```no_run
+//! use arb_poc::config::Config;
+//! use arb_poc::exchange::MarketData;
+//! use arb_poc::exchanges::UpbitClient;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let config = Config::load_or_default();
+//!     let client = UpbitClient::new()?;
+//!     let tickers = client.get_ticker(&["KRW-BTC"]).await?;
+//!     println!("BTC: {}", tickers[0].trade_price);
+//!     Ok(())
+//! }
+//! ```
 
-pub mod config;
-pub mod exchange;
-pub mod exchanges;
-pub mod logging;
+// Re-export workspace crates
+pub use arb_config as config;
+pub use arb_exchange as exchange;
+pub use arb_exchanges as exchanges;
+pub use arb_logging as logging;
+pub use arb_telegram as telegram;

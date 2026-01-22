@@ -9,11 +9,9 @@
 //! 실행 방법: `cargo run --example exchange_manager`
 
 use arb_poc::config::Config;
-use arb_poc::exchange::{
-    create_exchange, ExchangeManager, ExchangeManagerExt, ExchangeName,
-    MarketCodeBuilder,
-};
+use arb_poc::exchange::{ExchangeManager, ExchangeName, MarketCodeBuilder};
 use arb_poc::exchange::market::convert_market_code;
+use arb_poc::exchanges::{create_exchange, ExchangeManagerExt};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -46,7 +44,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = config_manager.register_all_from_config(&config) {
         println!("Warning: Could not register all exchanges: {}", e);
     }
-    println!("Registered from config: {:?}", config_manager.list_exchanges());
+    println!(
+        "Registered from config: {:?}",
+        config_manager.list_exchanges()
+    );
 
     // ==================== 거래소 동적 사용 ====================
     println!("\n--- Fetching Tickers from All Exchanges ---");
@@ -89,10 +90,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- Filtering by Quote Currency ---");
 
     let krw_exchanges: Vec<_> = manager.by_quote_currency("KRW").collect();
-    println!("KRW exchanges: {:?}", krw_exchanges.iter().map(|(n, _)| *n).collect::<Vec<_>>());
+    println!(
+        "KRW exchanges: {:?}",
+        krw_exchanges.iter().map(|(n, _)| *n).collect::<Vec<_>>()
+    );
 
     let usdt_exchanges: Vec<_> = manager.by_quote_currency("USDT").collect();
-    println!("USDT exchanges: {:?}", usdt_exchanges.iter().map(|(n, _)| *n).collect::<Vec<_>>());
+    println!(
+        "USDT exchanges: {:?}",
+        usdt_exchanges.iter().map(|(n, _)| *n).collect::<Vec<_>>()
+    );
 
     // ==================== 마켓 코드 변환 ====================
     println!("\n--- Market Code Conversion ---");
