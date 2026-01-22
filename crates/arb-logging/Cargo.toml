@@ -1,0 +1,13 @@
+[package]
+name = "arb-logging"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Structured logging for arb_poc"
+
+[dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+rust_decimal = { workspace = true }
