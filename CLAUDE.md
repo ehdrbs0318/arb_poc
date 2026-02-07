@@ -349,3 +349,12 @@ use arb_poc::logging::{init_logging, LogConfig};
 let config = LogConfig::from_env();
 init_logging(&config).expect("로깅 초기화 실패");
 ```
+
+## 작업 완료 시 문서 동기화
+
+작업이 완료되면 다음 파일들이 현재 코드베이스와 일치하는지 확인하고, 누락되거나 오래된 내용이 있으면 업데이트합니다:
+
+- `CLAUDE.md` — 프로젝트 구조, 모듈 설명, 개발 규칙
+- `spec/*` — 스펙 문서
+- `docs/*` — 프로젝트 문서
+- `.claude/skills/*` — 스킬 레퍼런스

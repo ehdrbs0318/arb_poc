@@ -6,17 +6,5 @@
     "stripe@claude-plugins-official": true
   },
   "language": "korean",
-  "respectGitIgnore": true,
-  "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "prompt",
-            "prompt": "Check CLAUDE.md, spec/*, docs/*, and .claude/skills/*. if something is missing or outdated, update those files accordingly."
-          }
-        ]
-      }
-    ]
-  }
+  "respectGitIgnore": true
 }
