@@ -109,12 +109,31 @@ impl<'a, U: MarketData, B: MarketData> CoinSelector<'a, U, B> {
         let upbit_map = build_ticker_map_upbit(&upbit_tickers);
         let bybit_map = build_ticker_map_bybit(&bybit_tickers);
 
+        // KRW → USDT 환산 환율 (Upbit KRW-USDT 티커)
+        let usdt_krw_rate: Decimal = upbit_map
+            .get("USDT")
+            .map(|t| t.trade_price)
+            .unwrap_or(Decimal::ZERO);
+        let usdt_krw_rate_f64 = usdt_krw_rate.to_f64().unwrap_or(0.0);
+
+        if usdt_krw_rate.is_zero() {
+            warn!("KRW-USDT 환율 조회 불가: Upbit 볼륨을 USDT로 환산할 수 없습니다");
+        } else {
+            debug!(usdt_krw_rate = %usdt_krw_rate, "KRW-USDT 환율");
+        }
+
         // 5. 24h 거래대금 1차 필터: 양쪽 중 낮은 값 기준으로 하위 50% 제거
+        //    Upbit 거래대금은 KRW 단위이므로 USDT로 환산하여 비교합니다.
         let mut volume_pairs: Vec<(&str, Decimal)> = filtered_coins
             .iter()
             .filter_map(|coin| {
-                let upbit_vol = upbit_map.get(*coin).map(|t| t.acc_trade_price_24h)?;
+                let upbit_vol_krw = upbit_map.get(*coin).map(|t| t.acc_trade_price_24h)?;
                 let bybit_vol = bybit_map.get(*coin).map(|t| t.acc_trade_price_24h)?;
+                let upbit_vol = if !usdt_krw_rate.is_zero() {
+                    upbit_vol_krw / usdt_krw_rate
+                } else {
+                    upbit_vol_krw
+                };
                 let min_vol = upbit_vol.min(bybit_vol);
                 Some((*coin, min_vol))
             })
@@ -188,8 +207,14 @@ impl<'a, U: MarketData, B: MarketData> CoinSelector<'a, U, B> {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
             // 볼륨 USDT 환산: volume(코인수량) × close_price
-            let upbit_vol_usdt = upbit_candle.volume.to_f64().unwrap_or(0.0)
+            // Upbit close는 KRW 단위이므로 KRW-USDT 환율로 나누어 USDT로 환산
+            let upbit_vol_krw = upbit_candle.volume.to_f64().unwrap_or(0.0)
                 * upbit_candle.close.to_f64().unwrap_or(0.0);
+            let upbit_vol_usdt = if usdt_krw_rate_f64 > 0.0 {
+                upbit_vol_krw / usdt_krw_rate_f64
+            } else {
+                upbit_vol_krw
+            };
             let bybit_vol_usdt = bybit_candle.volume.to_f64().unwrap_or(0.0)
                 * bybit_candle.close.to_f64().unwrap_or(0.0);
             let volume_1h_usdt = upbit_vol_usdt.min(bybit_vol_usdt);
@@ -256,11 +281,11 @@ fn extract_coins_upbit(tickers: &[Ticker]) -> HashSet<&str> {
 }
 
 /// Bybit 티커에서 코인 심볼 집합을 추출합니다.
-/// "BTCUSDT" → "BTC" (USDT 마켓만 대상)
+/// "USDT-BTC" → "BTC" (to_market_code()가 "USDT-BTC" → "USDT-BTC"로 변환)
 fn extract_coins_bybit(tickers: &[Ticker]) -> HashSet<&str> {
     tickers
         .iter()
-        .filter_map(|t| t.market.strip_suffix("USDT"))
+        .filter_map(|t| t.market.strip_prefix("USDT-"))
         .collect()
 }
 
@@ -276,7 +301,7 @@ fn build_ticker_map_upbit(tickers: &[Ticker]) -> std::collections::HashMap<&str,
 fn build_ticker_map_bybit(tickers: &[Ticker]) -> std::collections::HashMap<&str, &Ticker> {
     tickers
         .iter()
-        .filter_map(|t| t.market.strip_suffix("USDT").map(|coin| (coin, t)))
+        .filter_map(|t| t.market.strip_prefix("USDT-").map(|coin| (coin, t)))
         .collect()
 }
 
@@ -381,7 +406,8 @@ mod tests {
             if quote == "KRW" {
                 format!("KRW-{base}")
             } else {
-                format!("{base}{quote}")
+                // Bybit to_market_code: "USDT-BTC" → "USDT-BTC" (quote-base)
+                format!("{quote}-{base}")
             }
         }
     }
@@ -473,17 +499,17 @@ mod tests {
 
         let bybit_tickers = vec![
             make_ticker(
-                "BTCUSDT",
+                "USDT-BTC",
                 d("67000"),
                 d("5000000000"),
                 d("68000"),
                 d("66000"),
             ),
-            make_ticker("ETHUSDT", d("3300"), d("2000000000"), d("3400"), d("3200")),
-            make_ticker("XRPUSDT", d("1.1"), d("800000000"), d("1.2"), d("1.0")),
-            make_ticker("SOLUSDT", d("150"), d("600000000"), d("160"), d("140")),
-            make_ticker("USDTUSDT", d("1"), d("100000000"), d("1"), d("1")),
-            make_ticker("USDCUSDT", d("1"), d("100000000"), d("1"), d("1")),
+            make_ticker("USDT-ETH", d("3300"), d("2000000000"), d("3400"), d("3200")),
+            make_ticker("USDT-XRP", d("1.1"), d("800000000"), d("1.2"), d("1.0")),
+            make_ticker("USDT-SOL", d("150"), d("600000000"), d("160"), d("140")),
+            make_ticker("USDT-USDT", d("1"), d("100000000"), d("1"), d("1")),
+            make_ticker("USDT-USDC", d("1"), d("100000000"), d("1"), d("1")),
         ];
 
         let upbit_candles: HashMap<String, Vec<Candle>> = HashMap::from([
@@ -507,20 +533,20 @@ mod tests {
 
         let bybit_candles: HashMap<String, Vec<Candle>> = HashMap::from([
             (
-                "BTCUSDT".into(),
-                vec![make_candle("BTCUSDT", d("67000"), d("100"))],
+                "USDT-BTC".into(),
+                vec![make_candle("USDT-BTC", d("67000"), d("100"))],
             ),
             (
-                "ETHUSDT".into(),
-                vec![make_candle("ETHUSDT", d("3300"), d("5000"))],
+                "USDT-ETH".into(),
+                vec![make_candle("USDT-ETH", d("3300"), d("5000"))],
             ),
             (
-                "XRPUSDT".into(),
-                vec![make_candle("XRPUSDT", d("1.1"), d("50000000"))],
+                "USDT-XRP".into(),
+                vec![make_candle("USDT-XRP", d("1.1"), d("50000000"))],
             ),
             (
-                "SOLUSDT".into(),
-                vec![make_candle("SOLUSDT", d("150"), d("100000"))],
+                "USDT-SOL".into(),
+                vec![make_candle("USDT-SOL", d("150"), d("100000"))],
             ),
         ]);
 
@@ -580,9 +606,11 @@ mod tests {
         let selector = CoinSelector::new(&upbit, &bybit);
 
         // 매우 높은 볼륨 임계값 → 대부분 제외
-        // BTC: 100 × 67000 = 6,700,000 USDT (Bybit 기준, 양쪽 중 min)
-        // ETH: 5000 × 3300 = 16,500,000 USDT
-        // 임계값을 10,000,000 USDT로 설정 → BTC(6.7M) 제외, ETH(16.5M) 통과
+        // BTC Upbit: 100 × 90,000,000 / 1350 = 6,666,667 USDT
+        // BTC Bybit: 100 × 67,000 = 6,700,000 USDT → min = 6,666,667
+        // ETH Upbit: 5000 × 4,500,000 / 1350 = 16,666,667 USDT
+        // ETH Bybit: 5000 × 3,300 = 16,500,000 USDT → min = 16,500,000
+        // 임계값 10,000,000 USDT → BTC(6.7M) 제외, ETH(16.5M) 통과
         let result = selector
             .select(10, d("10000000"), &[])
             .await
@@ -646,7 +674,7 @@ mod tests {
             d("90"),
         )];
         let bybit_tickers = vec![make_ticker(
-            "BBBUSDT",
+            "USDT-BBB",
             d("100"),
             d("1000000"),
             d("110"),
@@ -689,13 +717,13 @@ mod tests {
         ];
         let bybit_tickers = vec![
             make_ticker(
-                "BTCUSDT",
+                "USDT-BTC",
                 d("67000"),
                 d("5000000000"),
                 d("68000"),
                 d("66000"),
             ),
-            make_ticker("ETHUSDT", d("3300"), d("2000000000"), d("3400"), d("3200")),
+            make_ticker("USDT-ETH", d("3300"), d("2000000000"), d("3400"), d("3200")),
         ];
 
         let upbit_candles: HashMap<String, Vec<Candle>> = HashMap::from([
@@ -710,12 +738,12 @@ mod tests {
         ]);
         let bybit_candles: HashMap<String, Vec<Candle>> = HashMap::from([
             (
-                "BTCUSDT".into(),
-                vec![make_candle("BTCUSDT", d("67000"), d("100"))],
+                "USDT-BTC".into(),
+                vec![make_candle("USDT-BTC", d("67000"), d("100"))],
             ),
             (
-                "ETHUSDT".into(),
-                vec![make_candle("ETHUSDT", d("3300"), d("5000"))],
+                "USDT-ETH".into(),
+                vec![make_candle("USDT-ETH", d("3300"), d("5000"))],
             ),
         ]);
 
