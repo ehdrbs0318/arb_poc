@@ -8,6 +8,7 @@ use tracing::{info, warn};
 
 use arb_exchange::MarketData;
 
+use crate::common::fee::roundtrip_fee_pct;
 use crate::error::StrategyError;
 use crate::zscore::config::ZScoreConfig;
 use crate::zscore::simulator::{BacktestResult, fetch_candle_data, simulate_with_cache};
@@ -203,6 +204,18 @@ pub async fn run_sweep<U: MarketData, B: MarketData>(
     // 데이터 1회 수집
     let cache = fetch_candle_data(upbit, bybit, &sweep_config.base_config).await?;
 
+    // 수수료 정보 표시 (진입에는 z * stddev > fee_pct 필요)
+    let fee_pct = roundtrip_fee_pct(
+        sweep_config.base_config.upbit_taker_fee,
+        sweep_config.base_config.bybit_taker_fee,
+    );
+    let fee_f64: f64 = fee_pct.to_string().parse().unwrap_or(0.0);
+    info!(
+        roundtrip_fee_pct = fee_f64,
+        "진입 조건: z * stddev > {fee_f64}% (fee). entry_z가 낮아도 수수료 필터가 \
+         실질적 최소 z를 결정합니다."
+    );
+
     let mut rows = Vec::new();
     let mut sorted_entry_z = sweep_config.entry_z_values.clone();
     sorted_entry_z.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -242,6 +255,22 @@ pub async fn run_sweep<U: MarketData, B: MarketData>(
         return Err(StrategyError::Config(
             "All parameter combinations failed".to_string(),
         ));
+    }
+
+    // 중복 결과 감지: 수수료 floor에 의해 entry_z 차이가 무의미한 경우
+    let dup_count = rows
+        .windows(2)
+        .filter(|w| w[0].total_trades == w[1].total_trades && w[0].net_pnl == w[1].net_pnl)
+        .count();
+    if dup_count > 0 {
+        warn!(
+            duplicate_pairs = dup_count,
+            roundtrip_fee_pct = fee_f64,
+            "{}개 인접 조합이 동일 결과 — expected_profit 필터(z*stddev > {:.2}%)가 \
+             entry_z_threshold보다 강하게 작용. 더 높은 entry_z 범위를 추천합니다.",
+            dup_count,
+            fee_f64
+        );
     }
 
     // period_start/end는 캐시의 timestamps에서 추출

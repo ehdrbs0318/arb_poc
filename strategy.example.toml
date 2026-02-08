@@ -43,9 +43,19 @@ output_dir = "./output/"
 # 최대 동시 포지션 수 (생략 시 코인 수만큼 허용)
 # max_concurrent_positions = 2
 
+# 볼륨/슬리피지 모델 (기본: 비활성)
+# 활성화하면 캔들 거래량 대비 주문 비율로 슬리피지를 추정합니다.
+volume_filter_enabled = false
+# 최대 참여율 (캔들 거래량의 10%, 초과 시 진입 거부)
+max_participation_rate = 0.1
+# 기본 슬리피지 (bps, 1 bps = 0.01%)
+slippage_base_bps = 1.0
+# Square-Root Impact 계수: slippage_bps = base + coeff × √(participation_rate) × 10000
+slippage_impact_coeff = 0.001
+
 # 파라미터 sweep 설정 (zscore_parameter_sweep 예제 전용)
 # cargo run --example zscore_parameter_sweep
 [sweep]
-entry_z_values = [1.0, 1.25, 1.5, 1.75, 2.0, 2.5]
+entry_z_values = [2.0, 2.5, 3.0, 3.5, 4.0]
 # exit_z_values = [0.3, 0.5, 0.7]   # 생략 시 기본 exit_z 사용
 # max_combinations = 50              # 조합 수 가드레일 (기본 50)

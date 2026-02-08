@@ -19,6 +19,7 @@ use crate::zscore::config::ZScoreConfig;
 use crate::zscore::pnl::{self, ClosedPosition};
 use crate::zscore::position::{self, PositionManager, VirtualPosition};
 use crate::zscore::signal::{self, Signal};
+use crate::zscore::slippage;
 use crate::zscore::spread::SpreadCalculator;
 
 /// 정상성 검증 메트릭 (예약).
@@ -163,6 +164,14 @@ fn find_close_at(candles: &[Candle], target: DateTime<Utc>) -> Option<Decimal> {
         .iter()
         .find(|c| c.timestamp == target)
         .map(|c| c.close)
+}
+
+/// 시간 정렬된 캔들 데이터에서 특정 timestamp의 volume을 조회합니다.
+fn find_volume_at(candles: &[Candle], target: DateTime<Utc>) -> Option<Decimal> {
+    candles
+        .iter()
+        .find(|c| c.timestamp == target)
+        .map(|c| c.volume)
 }
 
 /// 모든 시계열에서 합집합 타임스탬프를 오름차순으로 생성합니다.
@@ -488,9 +497,87 @@ pub fn simulate_with_cache(
                         .unwrap_or(0.0);
                     let usdt_krw_val = spread_calc.usdt_krw_window().last().unwrap_or(0.0);
 
-                    let upbit_price = Decimal::try_from(upbit_usdt).unwrap_or(Decimal::ZERO);
-                    let bybit_price_dec = Decimal::try_from(bybit_f64).unwrap_or(Decimal::ZERO);
+                    let mut upbit_price = Decimal::try_from(upbit_usdt).unwrap_or(Decimal::ZERO);
+                    let mut bybit_price_dec = Decimal::try_from(bybit_f64).unwrap_or(Decimal::ZERO);
                     let usdt_krw_dec = Decimal::try_from(usdt_krw_val).unwrap_or(Decimal::ZERO);
+
+                    // 볼륨/슬리피지 적용
+                    if config.volume_filter_enabled {
+                        let upbit_vol = cache
+                            .upbit_coin_candles
+                            .get(&c)
+                            .and_then(|candles| find_volume_at(candles, ts));
+                        let bybit_vol = cache
+                            .bybit_candles
+                            .get(&c)
+                            .and_then(|candles| find_volume_at(candles, ts));
+
+                        // Upbit 슬리피지 (매수 → 가격 상승)
+                        if let Some(uv) = upbit_vol {
+                            match slippage::calculate_slippage(
+                                size_usdt,
+                                uv,
+                                upbit_price,
+                                true, // Upbit: 코인 수량
+                                true, // 매수
+                                config.max_participation_rate,
+                                config.slippage_base_bps,
+                                config.slippage_impact_coeff,
+                            ) {
+                                Some(r) => {
+                                    debug!(
+                                        coin = c.as_str(),
+                                        exchange = "upbit",
+                                        participation_rate = r.participation_rate,
+                                        slippage_bps = r.slippage_bps,
+                                        "진입 슬리피지 적용"
+                                    );
+                                    upbit_price = r.adjusted_price;
+                                }
+                                None => {
+                                    debug!(
+                                        coin = c.as_str(),
+                                        exchange = "upbit",
+                                        "진입 거부: Upbit 볼륨 부족"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Bybit 슬리피지 (short 진입 → 매도 → 가격 하락)
+                        if let Some(bv) = bybit_vol {
+                            match slippage::calculate_slippage(
+                                size_usdt,
+                                bv,
+                                bybit_price_dec,
+                                true,  // Bybit: 코인 수량 (volume=base coin, turnover=USDT)
+                                false, // short = 매도
+                                config.max_participation_rate,
+                                config.slippage_base_bps,
+                                config.slippage_impact_coeff,
+                            ) {
+                                Some(r) => {
+                                    debug!(
+                                        coin = c.as_str(),
+                                        exchange = "bybit",
+                                        participation_rate = r.participation_rate,
+                                        slippage_bps = r.slippage_bps,
+                                        "진입 슬리피지 적용"
+                                    );
+                                    bybit_price_dec = r.adjusted_price;
+                                }
+                                None => {
+                                    debug!(
+                                        coin = c.as_str(),
+                                        exchange = "bybit",
+                                        "진입 거부: Bybit 볼륨 부족"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    }
 
                     let liq_price = position::calculate_liquidation_price(
                         bybit_price_dec,
@@ -517,6 +604,7 @@ pub fn simulate_with_cache(
                         spread_pct = spread_pct,
                         expected_profit = expected_profit_pct,
                         size_usdt = %size_usdt,
+                        volume_filter = config.volume_filter_enabled,
                         "진입 시그널 실행"
                     );
 
@@ -537,6 +625,71 @@ pub fn simulate_with_cache(
                         .unwrap_or(0.0);
                     let usdt_krw_val = spread_calc.usdt_krw_window().last().unwrap_or(0.0);
 
+                    let mut exit_upbit = Decimal::try_from(upbit_usdt).unwrap_or(Decimal::ZERO);
+                    let mut exit_bybit = Decimal::try_from(bybit_f64).unwrap_or(Decimal::ZERO);
+
+                    // 청산 슬리피지 적용 (청산은 거부하지 않고 항상 실행)
+                    if config.volume_filter_enabled {
+                        let size_usdt = position_mgr
+                            .open_positions
+                            .get(c.as_str())
+                            .map(|p| p.size_usdt)
+                            .unwrap_or(config.total_capital_usdt * config.position_ratio);
+
+                        let upbit_vol = cache
+                            .upbit_coin_candles
+                            .get(&c)
+                            .and_then(|candles| find_volume_at(candles, ts));
+                        let bybit_vol = cache
+                            .bybit_candles
+                            .get(&c)
+                            .and_then(|candles| find_volume_at(candles, ts));
+
+                        // Upbit 청산: 매도 → 가격 하락
+                        if let Some(uv) = upbit_vol
+                            && let Some(r) = slippage::calculate_slippage(
+                                size_usdt,
+                                uv,
+                                exit_upbit,
+                                true,  // Upbit: 코인 수량
+                                false, // 매도
+                                1.0,   // 청산은 참여율 무시 (항상 실행)
+                                config.slippage_base_bps,
+                                config.slippage_impact_coeff,
+                            )
+                        {
+                            debug!(
+                                coin = c.as_str(),
+                                exchange = "upbit",
+                                slippage_bps = r.slippage_bps,
+                                "청산 슬리피지 적용"
+                            );
+                            exit_upbit = r.adjusted_price;
+                        }
+
+                        // Bybit 청산: short close = 매수 → 가격 상승
+                        if let Some(bv) = bybit_vol
+                            && let Some(r) = slippage::calculate_slippage(
+                                size_usdt,
+                                bv,
+                                exit_bybit,
+                                true, // Bybit: 코인 수량 (volume=base coin, turnover=USDT)
+                                true, // 매수 (short close)
+                                1.0,   // 청산은 참여율 무시
+                                config.slippage_base_bps,
+                                config.slippage_impact_coeff,
+                            )
+                        {
+                            debug!(
+                                coin = c.as_str(),
+                                exchange = "bybit",
+                                slippage_bps = r.slippage_bps,
+                                "청산 슬리피지 적용"
+                            );
+                            exit_bybit = r.adjusted_price;
+                        }
+                    }
+
                     info!(
                         coin = c.as_str(),
                         z_score = z_score,
@@ -548,8 +701,8 @@ pub fn simulate_with_cache(
                         .close_position(
                             &c,
                             ts,
-                            Decimal::try_from(upbit_usdt).unwrap_or(Decimal::ZERO),
-                            Decimal::try_from(bybit_f64).unwrap_or(Decimal::ZERO),
+                            exit_upbit,
+                            exit_bybit,
                             Decimal::try_from(usdt_krw_val).unwrap_or(Decimal::ZERO),
                             spread_pct,
                             z_score,

@@ -48,6 +48,16 @@ pub struct ZScoreConfig {
     pub output_dir: PathBuf,
     /// 최대 동시 포지션 수 (None이면 coins.len()까지 허용).
     pub max_concurrent_positions: Option<usize>,
+    /// 볼륨/슬리피지 모델 활성화 (기본값: false).
+    pub volume_filter_enabled: bool,
+    /// 최대 참여율 (캔들 거래량 대비 주문 비율, 기본값: 0.1 = 10%).
+    /// 초과 시 진입을 거부합니다.
+    pub max_participation_rate: f64,
+    /// 기본 슬리피지 (bps, 기본값: 1.0 = 0.01%).
+    pub slippage_base_bps: f64,
+    /// 슬리피지 충격 계수 (기본값: 0.001).
+    /// slippage_bps = base_bps + impact_coeff × √(participation_rate) × 10000
+    pub slippage_impact_coeff: f64,
 }
 
 impl Default for ZScoreConfig {
@@ -68,6 +78,10 @@ impl Default for ZScoreConfig {
             min_stddev_threshold: 0.01,
             output_dir: PathBuf::from("./output/"),
             max_concurrent_positions: None,
+            volume_filter_enabled: false,
+            max_participation_rate: 0.1,
+            slippage_base_bps: 1.0,
+            slippage_impact_coeff: 0.001,
         }
     }
 }
@@ -206,6 +220,10 @@ struct RawZScoreConfig {
     min_stddev_threshold: f64,
     output_dir: String,
     max_concurrent_positions: Option<usize>,
+    volume_filter_enabled: bool,
+    max_participation_rate: f64,
+    slippage_base_bps: f64,
+    slippage_impact_coeff: f64,
 }
 
 impl Default for RawZScoreConfig {
@@ -226,6 +244,10 @@ impl Default for RawZScoreConfig {
             min_stddev_threshold: defaults.min_stddev_threshold,
             output_dir: "./output/".to_string(),
             max_concurrent_positions: defaults.max_concurrent_positions,
+            volume_filter_enabled: defaults.volume_filter_enabled,
+            max_participation_rate: defaults.max_participation_rate,
+            slippage_base_bps: defaults.slippage_base_bps,
+            slippage_impact_coeff: defaults.slippage_impact_coeff,
         }
     }
 }
@@ -249,6 +271,10 @@ impl From<RawZScoreConfig> for ZScoreConfig {
             min_stddev_threshold: raw.min_stddev_threshold,
             output_dir: PathBuf::from(raw.output_dir),
             max_concurrent_positions: raw.max_concurrent_positions,
+            volume_filter_enabled: raw.volume_filter_enabled,
+            max_participation_rate: raw.max_participation_rate,
+            slippage_base_bps: raw.slippage_base_bps,
+            slippage_impact_coeff: raw.slippage_impact_coeff,
         }
     }
 }

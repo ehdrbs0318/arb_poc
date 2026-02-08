@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 기본 sweep 값
         SweepConfig {
             base_config: config,
-            entry_z_values: vec![1.0, 1.25, 1.5, 1.75, 2.0, 2.5],
+            entry_z_values: vec![2.0, 2.5, 3.0, 3.5, 4.0],
             exit_z_values: vec![], // base_config.exit_z 사용
             max_combinations: 50,
         }

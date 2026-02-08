@@ -179,6 +179,24 @@ pub fn print_sweep_summary(result: &SweepResult) {
         );
     }
 
+    // 중복 결과 감지 (연속된 행의 net_pnl과 거래 수가 동일하면 수수료 floor에 의한 중복)
+    let mut dup_count = 0usize;
+    for i in 1..result.rows.len() {
+        if result.rows[i].total_trades == result.rows[i - 1].total_trades
+            && result.rows[i].net_pnl == result.rows[i - 1].net_pnl
+        {
+            dup_count += 1;
+        }
+    }
+    if dup_count > 0 {
+        info!("");
+        info!(
+            "! {dup_count}개 조합이 동일 결과: 수수료 대비 변동성이 낮아 \
+             expected_profit 필터가 entry_z보다 강하게 작용합니다."
+        );
+        info!("  더 높은 entry_z 범위로 sweep하거나, 수수료가 낮은 구간을 탐색하세요.");
+    }
+
     // entry_z < 1.25 경고
     if result.rows.iter().any(|r| r.entry_z < 1.25) {
         info!("");
