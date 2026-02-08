@@ -169,7 +169,7 @@ impl<'a, U: MarketData, B: MarketData> CoinSelector<'a, U, B> {
             {
                 Ok(candles) if !candles.is_empty() => candles[0].clone(),
                 Ok(_) => {
-                    warn!(
+                    debug!(
                         coin = *coin,
                         exchange = "upbit",
                         "1h 캔들 데이터 없음, 건너뜀"
@@ -177,7 +177,7 @@ impl<'a, U: MarketData, B: MarketData> CoinSelector<'a, U, B> {
                     continue;
                 }
                 Err(e) => {
-                    warn!(coin = *coin, exchange = "upbit", error = %e, "1h 캔들 조회 실패, 건너뜀");
+                    debug!(coin = *coin, exchange = "upbit", error = %e, "1h 캔들 조회 실패, 건너뜀");
                     continue;
                 }
             };
@@ -190,7 +190,7 @@ impl<'a, U: MarketData, B: MarketData> CoinSelector<'a, U, B> {
             {
                 Ok(candles) if !candles.is_empty() => candles[0].clone(),
                 Ok(_) => {
-                    warn!(
+                    debug!(
                         coin = *coin,
                         exchange = "bybit",
                         "1h 캔들 데이터 없음, 건너뜀"
@@ -198,13 +198,10 @@ impl<'a, U: MarketData, B: MarketData> CoinSelector<'a, U, B> {
                     continue;
                 }
                 Err(e) => {
-                    warn!(coin = *coin, exchange = "bybit", error = %e, "1h 캔들 조회 실패, 건너뜀");
+                    debug!(coin = *coin, exchange = "bybit", error = %e, "1h 캔들 조회 실패, 건너뜀");
                     continue;
                 }
             };
-
-            // Rate limit 보호: 100ms 딜레이
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
             // 볼륨 USDT 환산: volume(코인수량) × close_price
             // Upbit close는 KRW 단위이므로 KRW-USDT 환율로 나누어 USDT로 환산

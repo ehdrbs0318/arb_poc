@@ -2,6 +2,7 @@
 //!
 //! 이 모듈은 Bybit V5 API와 상호작용하기 위한 메인 클라이언트를 제공합니다.
 
+use crate::rate_limit::RateLimiter;
 use crate::bybit::auth::{AuthHeaders, BybitCredentials, build_query_string};
 use crate::bybit::stream::BybitStreamInner;
 use crate::bybit::types::{
@@ -29,6 +30,12 @@ const BASE_URL_TESTNET: &str = "https://api-testnet.bybit.com";
 /// 현물 거래 기본 카테고리.
 const DEFAULT_CATEGORY: &str = "spot";
 
+/// Bybit API 레이트 리밋 (초당 요청 수).
+/// 공식 제한: 20 req/sec (UID 기반). 90%로 보수적 적용.
+const BYBIT_RATE_LIMIT: u32 = 18;
+/// Bybit API 최대 버스트 용량.
+const BYBIT_BURST: u32 = 3;
+
 /// Bybit V5 API 클라이언트.
 ///
 /// 이 클라이언트는 공개(시장 데이터) 및 비공개(거래) API를 모두 지원합니다.
@@ -40,6 +47,8 @@ pub struct BybitClient {
     category: String,
     /// WebSocket 스트림 내부 상태.
     pub(crate) stream: Arc<BybitStreamInner>,
+    /// API 레이트 리밋터.
+    limiter: Arc<RateLimiter>,
 }
 
 impl std::fmt::Debug for BybitClient {
@@ -132,6 +141,7 @@ impl BybitClient {
             base_url,
             category: DEFAULT_CATEGORY.to_string(),
             stream: Arc::new(BybitStreamInner::new(StreamConfig::default())),
+            limiter: Arc::new(RateLimiter::new("bybit", BYBIT_RATE_LIMIT, BYBIT_BURST)),
         })
     }
 
@@ -164,6 +174,7 @@ impl BybitClient {
         endpoint: &str,
         params: &[(&str, &str)],
     ) -> ExchangeResult<T> {
+        self.limiter.acquire().await;
         let url = format!("{}{}", self.base_url, endpoint);
         debug!(endpoint, "Bybit public GET 요청");
         let response = self
@@ -183,6 +194,7 @@ impl BybitClient {
         endpoint: &str,
         params: &[(&str, &str)],
     ) -> ExchangeResult<T> {
+        self.limiter.acquire().await;
         let creds = self.credentials()?;
         let url = format!("{}{}", self.base_url, endpoint);
         debug!(endpoint, "Bybit private GET 요청");
@@ -214,6 +226,7 @@ impl BybitClient {
         endpoint: &str,
         body: &impl serde::Serialize,
     ) -> ExchangeResult<T> {
+        self.limiter.acquire().await;
         let creds = self.credentials()?;
         let url = format!("{}{}", self.base_url, endpoint);
         debug!(endpoint, "Bybit private POST 요청");

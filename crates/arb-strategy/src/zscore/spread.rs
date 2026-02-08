@@ -7,14 +7,17 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::common::candle_window::CandleWindow;
 use crate::common::convert::decimal_to_f64;
 use crate::error::StrategyError;
 
-/// 연속 누락 감지 임계값 (분).
-const CONSECUTIVE_MISSING_WARN_THRESHOLD: usize = 5;
+/// 연속 누락 경고 임계값 (분).
+///
+/// 저유동성 코인은 수 분간 거래가 없을 수 있으므로, 짧은 갭은 debug로 기록하고
+/// 이 임계값 이상의 연속 갭만 warn으로 기록합니다.
+const CONSECUTIVE_MISSING_WARN_THRESHOLD: usize = 30;
 
 /// 개별 소스의 forward-fill 상태를 추적합니다.
 #[derive(Debug, Clone)]
@@ -23,6 +26,8 @@ struct ForwardFillState {
     last_value: Option<Decimal>,
     /// 연속 누락 횟수.
     consecutive_missing: usize,
+    /// 현재 갭에서 이미 경고를 출력했는지 여부.
+    warned_current_gap: bool,
 }
 
 impl ForwardFillState {
@@ -30,6 +35,7 @@ impl ForwardFillState {
         Self {
             last_value: None,
             consecutive_missing: 0,
+            warned_current_gap: false,
         }
     }
 
@@ -45,17 +51,33 @@ impl ForwardFillState {
     ) -> Option<Decimal> {
         match value {
             Some(v) => {
+                // 갭이 끝남 → 갭 길이가 의미 있었으면 요약 로그
+                if self.consecutive_missing >= CONSECUTIVE_MISSING_WARN_THRESHOLD {
+                    warn!(
+                        "캔들 갭 종료: {} — 총 {}분 연속 누락 후 데이터 복구 at {}",
+                        source, self.consecutive_missing, timestamp
+                    );
+                } else if self.consecutive_missing >= 5 {
+                    debug!(
+                        "캔들 갭 종료: {} — {}분 연속 누락 후 복구 at {}",
+                        source, self.consecutive_missing, timestamp
+                    );
+                }
                 self.last_value = Some(v);
                 self.consecutive_missing = 0;
+                self.warned_current_gap = false;
                 Some(v)
             }
             None => {
                 self.consecutive_missing += 1;
-                if self.consecutive_missing >= CONSECUTIVE_MISSING_WARN_THRESHOLD {
+                if self.consecutive_missing >= CONSECUTIVE_MISSING_WARN_THRESHOLD
+                    && !self.warned_current_gap
+                {
                     warn!(
-                        "연속 {}분 캔들 누락: {} at {}",
+                        "연속 {}분 캔들 누락 진행 중: {} at {}",
                         self.consecutive_missing, source, timestamp
                     );
+                    self.warned_current_gap = true;
                 }
                 self.last_value
             }

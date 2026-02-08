@@ -13,22 +13,39 @@ use crate::bithumb::types::{
     BithumbBalance, BithumbCandle, BithumbError, BithumbOrder, BithumbOrderRequest,
     BithumbOrderbook, BithumbTicker,
 };
+use crate::rate_limit::RateLimiter;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use reqwest::Client;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 /// Bithumb REST API 기본 URL.
 const BASE_URL: &str = "https://api.bithumb.com";
 
+/// Bithumb API 레이트 리밋 (초당 요청 수).
+/// 보수적으로 초당 8회 적용.
+const BITHUMB_RATE_LIMIT: u32 = 8;
+/// Bithumb API 최대 버스트 용량.
+const BITHUMB_BURST: u32 = 2;
+
 /// Bithumb API 클라이언트.
 ///
 /// 이 클라이언트는 Public API와 Private API 모두 지원합니다.
 /// Private API를 사용하려면 인증 정보를 제공해야 합니다.
-#[derive(Debug)]
 pub struct BithumbClient {
     client: Client,
     pub(crate) credentials: Option<BithumbCredentials>,
+    /// API 레이트 리밋터.
+    limiter: Arc<RateLimiter>,
+}
+
+impl std::fmt::Debug for BithumbClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BithumbClient")
+            .field("credentials", &self.credentials.is_some())
+            .finish()
+    }
 }
 
 impl BithumbClient {
@@ -48,6 +65,7 @@ impl BithumbClient {
         Ok(Self {
             client,
             credentials: None,
+            limiter: Arc::new(RateLimiter::new("bithumb", BITHUMB_RATE_LIMIT, BITHUMB_BURST)),
         })
     }
 
@@ -75,6 +93,7 @@ impl BithumbClient {
         Ok(Self {
             client,
             credentials: Some(BithumbCredentials::new(access_key, secret_key)),
+            limiter: Arc::new(RateLimiter::new("bithumb", BITHUMB_RATE_LIMIT, BITHUMB_BURST)),
         })
     }
 
@@ -91,6 +110,7 @@ impl BithumbClient {
         endpoint: &str,
         params: Option<&[(&str, &str)]>,
     ) -> ExchangeResult<T> {
+        self.limiter.acquire().await;
         let url = format!("{BASE_URL}{endpoint}");
         debug!(endpoint, "Bithumb public GET 요청");
         let mut request = self.client.get(&url);
@@ -109,6 +129,7 @@ impl BithumbClient {
         endpoint: &str,
         params: Option<&[(&str, &str)]>,
     ) -> ExchangeResult<T> {
+        self.limiter.acquire().await;
         let creds = self.credentials()?;
         let url = format!("{BASE_URL}{endpoint}");
         debug!(endpoint, "Bithumb private GET 요청");
@@ -136,6 +157,7 @@ impl BithumbClient {
         endpoint: &str,
         body: &impl serde::Serialize,
     ) -> ExchangeResult<T> {
+        self.limiter.acquire().await;
         let creds = self.credentials()?;
         let url = format!("{BASE_URL}{endpoint}");
         debug!(endpoint, "Bithumb private POST 요청");
@@ -179,6 +201,7 @@ impl BithumbClient {
         endpoint: &str,
         params: &[(&str, &str)],
     ) -> ExchangeResult<T> {
+        self.limiter.acquire().await;
         let creds = self.credentials()?;
         let url = format!("{BASE_URL}{endpoint}");
         debug!(endpoint, "Bithumb private DELETE 요청");

@@ -8,6 +8,7 @@ use arb_exchange::{
     StreamConfig, Ticker, TimeInForce,
 };
 
+use crate::rate_limit::RateLimiter;
 use crate::upbit::auth::{UpbitCredentials, build_query_string};
 use crate::upbit::stream::UpbitStreamInner;
 use crate::upbit::types::{
@@ -27,11 +28,27 @@ const BASE_URL: &str = "https://api.upbit.com/v1";
 ///
 /// 이 클라이언트는 공개(시세) API와 비공개(거래) API를 모두 지원합니다.
 /// 비공개 API를 사용하려면 인증 정보가 필요합니다.
+/// Upbit Quotation API 레이트 리밋 (초당 요청 수).
+/// 공식 제한: 10 req/sec (IP 기반). 80%로 보수적 적용.
+const UPBIT_QUOTATION_RATE_LIMIT: u32 = 8;
+/// Quotation API 최대 버스트 용량.
+const UPBIT_QUOTATION_BURST: u32 = 2;
+
+/// Upbit Exchange API 레이트 리밋 (초당 요청 수).
+/// 공식 제한: 30 req/sec (계정 기반). 80%로 보수적 적용.
+const UPBIT_EXCHANGE_RATE_LIMIT: u32 = 25;
+/// Exchange API 최대 버스트 용량.
+const UPBIT_EXCHANGE_BURST: u32 = 3;
+
 pub struct UpbitClient {
     client: Client,
     pub(crate) credentials: Option<UpbitCredentials>,
     /// WebSocket 스트림 내부 상태.
     pub(crate) stream: Arc<UpbitStreamInner>,
+    /// Quotation API (시세 조회) 레이트 리밋터.
+    quotation_limiter: Arc<RateLimiter>,
+    /// Exchange API (주문/계좌) 레이트 리밋터.
+    exchange_limiter: Arc<RateLimiter>,
 }
 
 impl std::fmt::Debug for UpbitClient {
@@ -60,6 +77,16 @@ impl UpbitClient {
             client,
             credentials: None,
             stream: Arc::new(UpbitStreamInner::new(StreamConfig::default())),
+            quotation_limiter: Arc::new(RateLimiter::new(
+                "upbit-quotation",
+                UPBIT_QUOTATION_RATE_LIMIT,
+                UPBIT_QUOTATION_BURST,
+            )),
+            exchange_limiter: Arc::new(RateLimiter::new(
+                "upbit-exchange",
+                UPBIT_EXCHANGE_RATE_LIMIT,
+                UPBIT_EXCHANGE_BURST,
+            )),
         })
     }
 
@@ -88,6 +115,16 @@ impl UpbitClient {
             client,
             credentials: Some(UpbitCredentials::new(access_key, secret_key)),
             stream: Arc::new(UpbitStreamInner::new(StreamConfig::default())),
+            quotation_limiter: Arc::new(RateLimiter::new(
+                "upbit-quotation",
+                UPBIT_QUOTATION_RATE_LIMIT,
+                UPBIT_QUOTATION_BURST,
+            )),
+            exchange_limiter: Arc::new(RateLimiter::new(
+                "upbit-exchange",
+                UPBIT_EXCHANGE_RATE_LIMIT,
+                UPBIT_EXCHANGE_BURST,
+            )),
         })
     }
 
@@ -109,6 +146,7 @@ impl UpbitClient {
         endpoint: &str,
         params: Option<&[(&str, &str)]>,
     ) -> ExchangeResult<T> {
+        self.quotation_limiter.acquire().await;
         let url = format!("{BASE_URL}{endpoint}");
         debug!(endpoint, "Upbit public GET 요청");
         let mut request = self.client.get(&url);
@@ -127,6 +165,7 @@ impl UpbitClient {
         endpoint: &str,
         params: Option<&[(&str, &str)]>,
     ) -> ExchangeResult<T> {
+        self.exchange_limiter.acquire().await;
         let creds = self.credentials()?;
         let url = format!("{BASE_URL}{endpoint}");
         debug!(endpoint, "Upbit private GET 요청");
@@ -154,6 +193,7 @@ impl UpbitClient {
         endpoint: &str,
         body: &impl serde::Serialize,
     ) -> ExchangeResult<T> {
+        self.exchange_limiter.acquire().await;
         let creds = self.credentials()?;
         let url = format!("{BASE_URL}{endpoint}");
         debug!(endpoint, "Upbit private POST 요청");
@@ -197,6 +237,7 @@ impl UpbitClient {
         endpoint: &str,
         params: &[(&str, &str)],
     ) -> ExchangeResult<T> {
+        self.exchange_limiter.acquire().await;
         let creds = self.credentials()?;
         let url = format!("{BASE_URL}{endpoint}");
         debug!(endpoint, "Upbit private DELETE 요청");

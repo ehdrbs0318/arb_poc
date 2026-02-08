@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 use arb_exchange::MarketData;
 use arb_exchange::types::{Candle, CandleInterval};
 
+use crate::common::convert::truncate_to_minute;
 use crate::common::statistics;
 use crate::error::StrategyError;
 use crate::zscore::config::ZScoreConfig;
@@ -158,23 +159,30 @@ pub async fn fetch_all_candles<M: MarketData>(
 }
 
 /// 시간 정렬된 캔들 데이터에서 특정 timestamp의 close 가격을 조회합니다.
+/// 분 단위로 정규화하여 비교합니다 (Upbit/Bybit 밀리초/나노초 차이 보정).
 /// 없으면 None 반환 (forward-fill은 SpreadCalculator가 처리).
 fn find_close_at(candles: &[Candle], target: DateTime<Utc>) -> Option<Decimal> {
+    let target_min = truncate_to_minute(target);
     candles
         .iter()
-        .find(|c| c.timestamp == target)
+        .find(|c| truncate_to_minute(c.timestamp) == target_min)
         .map(|c| c.close)
 }
 
 /// 시간 정렬된 캔들 데이터에서 특정 timestamp의 volume을 조회합니다.
+/// 분 단위로 정규화하여 비교합니다 (Upbit/Bybit 밀리초/나노초 차이 보정).
 fn find_volume_at(candles: &[Candle], target: DateTime<Utc>) -> Option<Decimal> {
+    let target_min = truncate_to_minute(target);
     candles
         .iter()
-        .find(|c| c.timestamp == target)
+        .find(|c| truncate_to_minute(c.timestamp) == target_min)
         .map(|c| c.volume)
 }
 
 /// 모든 시계열에서 합집합 타임스탬프를 오름차순으로 생성합니다.
+///
+/// 저유동성 코인은 1440캔들이 24시간 이상을 커버할 수 있으므로,
+/// 3개 소스의 공통 시간 범위(가장 늦은 시작 시간 이후)만 포함합니다.
 fn build_aligned_timestamps(
     upbit_coin: &HashMap<String, Vec<Candle>>,
     usdt_krw: &[Candle],
@@ -184,16 +192,36 @@ fn build_aligned_timestamps(
 
     for candles in upbit_coin.values() {
         for c in candles {
-            all_timestamps.insert(c.timestamp);
+            all_timestamps.insert(truncate_to_minute(c.timestamp));
         }
     }
     for c in usdt_krw {
-        all_timestamps.insert(c.timestamp);
+        all_timestamps.insert(truncate_to_minute(c.timestamp));
     }
     for candles in bybit.values() {
         for c in candles {
-            all_timestamps.insert(c.timestamp);
+            all_timestamps.insert(truncate_to_minute(c.timestamp));
         }
+    }
+
+    // 공통 시간 범위 계산: 각 소스의 가장 이른 타임스탬프 중 가장 늦은 것
+    let mut source_starts = Vec::new();
+    for candles in upbit_coin.values() {
+        if let Some(c) = candles.first() {
+            source_starts.push(truncate_to_minute(c.timestamp));
+        }
+    }
+    if let Some(c) = usdt_krw.first() {
+        source_starts.push(truncate_to_minute(c.timestamp));
+    }
+    for candles in bybit.values() {
+        if let Some(c) = candles.first() {
+            source_starts.push(truncate_to_minute(c.timestamp));
+        }
+    }
+
+    if let Some(common_start) = source_starts.iter().max() {
+        all_timestamps.retain(|ts| ts >= common_start);
     }
 
     all_timestamps.into_iter().collect()
@@ -918,8 +946,9 @@ mod tests {
 
     #[test]
     fn test_find_close_at() {
-        let ts1 = Utc::now();
-        let ts2 = ts1 + chrono::Duration::minutes(1);
+        use chrono::TimeZone;
+        let ts1 = Utc.with_ymd_and_hms(2026, 2, 8, 10, 0, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2026, 2, 8, 10, 1, 0).unwrap();
         let candles = vec![
             Candle {
                 market: "KRW-BTC".to_string(),
@@ -943,9 +972,16 @@ mod tests {
 
         assert_eq!(find_close_at(&candles, ts1), Some(Decimal::new(100_500, 0)));
         assert_eq!(find_close_at(&candles, ts2), Some(Decimal::new(100_800, 0)));
+        // 존재하지 않는 분
         assert_eq!(
             find_close_at(&candles, ts2 + chrono::Duration::minutes(1)),
             None
+        );
+        // 같은 분의 다른 초에서도 매칭 (truncate 정규화 효과)
+        let ts1_with_seconds = Utc.with_ymd_and_hms(2026, 2, 8, 10, 0, 45).unwrap();
+        assert_eq!(
+            find_close_at(&candles, ts1_with_seconds),
+            Some(Decimal::new(100_500, 0))
         );
     }
 
@@ -988,16 +1024,58 @@ mod tests {
 
     #[test]
     fn test_build_aligned_timestamps() {
-        let ts1 = Utc::now();
-        let ts2 = ts1 + chrono::Duration::minutes(1);
-        let ts3 = ts1 + chrono::Duration::minutes(2);
+        use chrono::TimeZone;
+        // 3개 소스 모두 동일 시간 범위를 커버 — 공통 범위 필터 통과
+        let ts1 = Utc.with_ymd_and_hms(2026, 2, 8, 10, 0, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2026, 2, 8, 10, 1, 0).unwrap();
+        let ts3 = Utc.with_ymd_and_hms(2026, 2, 8, 10, 2, 0).unwrap();
+
+        let make_candle = |market: &str, ts: DateTime<Utc>| Candle {
+            market: market.to_string(),
+            timestamp: ts,
+            open: Decimal::ONE,
+            high: Decimal::ONE,
+            low: Decimal::ONE,
+            close: Decimal::ONE,
+            volume: Decimal::ONE,
+        };
+
+        let mut upbit_coin: HashMap<String, Vec<Candle>> = HashMap::new();
+        upbit_coin.insert(
+            "BTC".to_string(),
+            vec![make_candle("KRW-BTC", ts1), make_candle("KRW-BTC", ts2)],
+        );
+
+        let usdt_krw = vec![make_candle("KRW-USDT", ts1), make_candle("KRW-USDT", ts3)];
+
+        let mut bybit: HashMap<String, Vec<Candle>> = HashMap::new();
+        bybit.insert(
+            "BTC".to_string(),
+            vec![make_candle("BTCUSDT", ts1), make_candle("BTCUSDT", ts3)],
+        );
+
+        // 공통 시작점: max(ts1, ts1, ts1) = ts1 → 3개 타임스탬프 모두 통과
+        let result = build_aligned_timestamps(&upbit_coin, &usdt_krw, &bybit);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], ts1);
+        assert_eq!(result[1], ts2);
+        assert_eq!(result[2], ts3);
+    }
+
+    #[test]
+    fn test_build_aligned_timestamps_deduplicates_same_minute() {
+        use chrono::TimeZone;
+        // 같은 분이지만 초가 다른 타임스탬프 (Upbit vs Bybit 정밀도 차이 시나리오)
+        let ts_upbit = Utc.with_ymd_and_hms(2026, 2, 8, 10, 5, 30).unwrap();
+        let ts_bybit = Utc.with_ymd_and_hms(2026, 2, 8, 10, 5, 0).unwrap();
+        let ts_usdt = Utc.with_ymd_and_hms(2026, 2, 8, 10, 5, 15).unwrap();
 
         let mut upbit_coin: HashMap<String, Vec<Candle>> = HashMap::new();
         upbit_coin.insert(
             "BTC".to_string(),
             vec![Candle {
                 market: "KRW-BTC".to_string(),
-                timestamp: ts1,
+                timestamp: ts_upbit,
                 open: Decimal::ONE,
                 high: Decimal::ONE,
                 low: Decimal::ONE,
@@ -1008,7 +1086,7 @@ mod tests {
 
         let usdt_krw = vec![Candle {
             market: "KRW-USDT".to_string(),
-            timestamp: ts2,
+            timestamp: ts_usdt,
             open: Decimal::ONE,
             high: Decimal::ONE,
             low: Decimal::ONE,
@@ -1021,7 +1099,7 @@ mod tests {
             "BTC".to_string(),
             vec![Candle {
                 market: "BTCUSDT".to_string(),
-                timestamp: ts3,
+                timestamp: ts_bybit,
                 open: Decimal::ONE,
                 high: Decimal::ONE,
                 low: Decimal::ONE,
@@ -1030,11 +1108,11 @@ mod tests {
             }],
         );
 
+        // 3개 모두 같은 분 (10:05) → truncate 후 1개로 합쳐져야 함
         let result = build_aligned_timestamps(&upbit_coin, &usdt_krw, &bybit);
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0], ts1);
-        assert_eq!(result[1], ts2);
-        assert_eq!(result[2], ts3);
+        assert_eq!(result.len(), 1);
+        let expected = Utc.with_ymd_and_hms(2026, 2, 8, 10, 5, 0).unwrap();
+        assert_eq!(result[0], expected);
     }
 
     #[test]

@@ -6,11 +6,12 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
+use crate::common::convert::truncate_to_minute;
 use crate::common::statistics;
 use crate::error::StrategyError;
 use crate::output::csv;
@@ -22,13 +23,6 @@ use crate::zscore::signal::{self, Signal};
 use crate::zscore::simulator::{TimeseriesRecord, fetch_all_candles};
 use crate::zscore::spread::SpreadCalculator;
 use arb_exchange::{MarketData, MarketEvent, MarketStream};
-
-/// 분 경계를 기준으로 timestamp를 truncate합니다.
-fn truncate_to_minute(ts: DateTime<Utc>) -> DateTime<Utc> {
-    ts.with_second(0)
-        .and_then(|t| t.with_nanosecond(0))
-        .unwrap_or(ts)
-}
 
 /// 분 완결 시 반환되는 데이터 (코인별 Upbit close, USDT/KRW, 코인별 Bybit close).
 type MinuteCloses = (
@@ -657,40 +651,71 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
             "워밍업 데이터 로드"
         );
 
-        // 공통 타임스탬프 기준으로 SpreadCalculator 업데이트
+        // 분 단위로 타임스탬프 정규화 (Upbit 초정밀도 / Bybit 밀리초 정밀도 정렬)
+        let upbit_map: std::collections::HashMap<DateTime<Utc>, Decimal> = upbit_candles
+            .iter()
+            .map(|c| (truncate_to_minute(c.timestamp), c.close))
+            .collect();
+        let bybit_map: std::collections::HashMap<DateTime<Utc>, Decimal> = bybit_candles
+            .iter()
+            .map(|c| (truncate_to_minute(c.timestamp), c.close))
+            .collect();
+        let usdt_krw_map: std::collections::HashMap<DateTime<Utc>, Decimal> = usdt_krw_candles
+            .iter()
+            .map(|c| (truncate_to_minute(c.timestamp), c.close))
+            .collect();
+
+        // 3개 소스의 공통 시간 범위 계산
+        // 저유동성 코인은 1440캔들이 24시간 이상을 커버할 수 있으므로,
+        // 가장 늦은 시작 시간 이후만 처리하여 소스 간 범위 불일치를 방지합니다.
+        let common_start = [
+            upbit_map.keys().min().copied(),
+            bybit_map.keys().min().copied(),
+            usdt_krw_map.keys().min().copied(),
+        ]
+        .iter()
+        .filter_map(|t| *t)
+        .max();
+
+        // 합집합 타임스탬프 (공통 범위 내, 정규화된 분 단위)
         use std::collections::BTreeSet;
         let mut timestamps = BTreeSet::new();
-        for c in &upbit_candles {
-            timestamps.insert(c.timestamp);
+        for ts in upbit_map.keys() {
+            timestamps.insert(*ts);
         }
-        for c in &bybit_candles {
-            timestamps.insert(c.timestamp);
+        for ts in bybit_map.keys() {
+            timestamps.insert(*ts);
         }
-        for c in &usdt_krw_candles {
-            timestamps.insert(c.timestamp);
+        for ts in usdt_krw_map.keys() {
+            timestamps.insert(*ts);
+        }
+
+        // 공통 범위 이전의 타임스탬프 제거
+        let pre_filter_count = timestamps.len();
+        if let Some(start) = common_start {
+            timestamps.retain(|ts| *ts >= start);
         }
 
         debug!(
             coin = coin,
-            common_timestamps = timestamps.len(),
-            "워밍업 공통 타임스탬프 수"
+            total_timestamps = pre_filter_count,
+            common_range_timestamps = timestamps.len(),
+            trimmed = pre_filter_count - timestamps.len(),
+            upbit_candles = upbit_map.len(),
+            bybit_candles = bybit_map.len(),
+            usdt_krw_candles = usdt_krw_map.len(),
+            common_start = ?common_start,
+            "워밍업 타임스탬프 정규화 완료"
         );
 
-        for ts in timestamps {
-            let upbit_close = upbit_candles
-                .iter()
-                .find(|c| c.timestamp == ts)
-                .map(|c| c.close);
-            let usdt_krw_close = usdt_krw_candles
-                .iter()
-                .find(|c| c.timestamp == ts)
-                .map(|c| c.close);
-            let bybit_close = bybit_candles
-                .iter()
-                .find(|c| c.timestamp == ts)
-                .map(|c| c.close);
-
-            spread_calc.update(coin, ts, upbit_close, usdt_krw_close, bybit_close)?;
+        for ts in &timestamps {
+            spread_calc.update(
+                coin,
+                *ts,
+                upbit_map.get(ts).copied(),
+                usdt_krw_map.get(ts).copied(),
+                bybit_map.get(ts).copied(),
+            )?;
         }
 
         debug!(
@@ -1040,16 +1065,6 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
 mod tests {
     use super::*;
     use crate::zscore::coin_selector::CoinCandidate;
-
-    #[test]
-    fn test_truncate_to_minute() {
-        use chrono::TimeZone;
-        let ts = Utc.with_ymd_and_hms(2026, 2, 6, 10, 30, 45).unwrap();
-        let truncated = truncate_to_minute(ts);
-        assert_eq!(truncated.second(), 0);
-        assert_eq!(truncated.minute(), 30);
-        assert_eq!(truncated.nanosecond(), 0);
-    }
 
     #[test]
     fn test_candle_builder_new_minute() {

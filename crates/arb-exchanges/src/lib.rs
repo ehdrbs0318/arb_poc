@@ -38,6 +38,7 @@
 pub mod bithumb;
 pub mod bybit;
 pub mod factory;
+pub mod rate_limit;
 pub mod upbit;
 
 pub use arb_exchange::ExchangeName;
