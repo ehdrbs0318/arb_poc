@@ -146,11 +146,10 @@ impl ExchangeManager {
     ///
     /// 거래소가 등록되지 않은 경우 에러를 반환합니다.
     pub fn get_or_error(&self, name: &str) -> ExchangeResult<Arc<dyn ExchangeAdapter>> {
-        self.get(name)
-            .ok_or_else(|| {
-                warn!(name = name, "미등록 거래소 접근 시도");
-                ExchangeError::ConfigError(format!("Exchange not registered: {}", name))
-            })
+        self.get(name).ok_or_else(|| {
+            warn!(name = name, "미등록 거래소 접근 시도");
+            ExchangeError::ConfigError(format!("Exchange not registered: {}", name))
+        })
     }
 
     /// 주어진 이름의 거래소가 등록되어 있으면 true를 반환합니다.

@@ -67,10 +67,7 @@ impl MarketStream for UpbitClient {
         "Upbit"
     }
 
-    async fn subscribe(
-        &self,
-        markets: &[&str],
-    ) -> ExchangeResult<mpsc::Receiver<MarketEvent>> {
+    async fn subscribe(&self, markets: &[&str]) -> ExchangeResult<mpsc::Receiver<MarketEvent>> {
         let inner = self.stream_inner();
 
         // 기존 구독이 있으면 먼저 해제
@@ -256,9 +253,7 @@ async fn upbit_ws_loop(
 async fn connect_and_subscribe(
     markets: &[String],
 ) -> Result<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Box<dyn std::error::Error + Send + Sync>,
 > {
     let (ws_stream, response) = connect_async(UPBIT_WS_URL).await?;

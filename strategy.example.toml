@@ -42,3 +42,10 @@ output_dir = "./output/"
 
 # 최대 동시 포지션 수 (생략 시 코인 수만큼 허용)
 # max_concurrent_positions = 2
+
+# 파라미터 sweep 설정 (zscore_parameter_sweep 예제 전용)
+# cargo run --example zscore_parameter_sweep
+[sweep]
+entry_z_values = [1.0, 1.25, 1.5, 1.75, 2.0, 2.5]
+# exit_z_values = [0.3, 0.5, 0.7]   # 생략 시 기본 exit_z 사용
+# max_combinations = 50              # 조합 수 가드레일 (기본 50)

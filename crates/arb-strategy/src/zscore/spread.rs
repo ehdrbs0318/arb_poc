@@ -351,7 +351,7 @@ mod tests {
                 ts,
                 Some(dec(138_000_000, 0)),
                 Some(dec(1380, 0)),
-                Some(dec(100_000 + i as i64 * 10, 0)),
+                Some(dec(100_000 + i * 10, 0)),
             )
             .unwrap();
         }

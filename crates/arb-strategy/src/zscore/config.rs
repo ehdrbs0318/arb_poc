@@ -165,13 +165,24 @@ impl ZScoreConfig {
             .map_err(|e| StrategyError::Config(format!("TOML parse error: {e}")))?;
         Ok(wrapper.zscore.into())
     }
+
+    /// TOML 문자열에서 `[sweep]` 섹션도 함께 파싱합니다.
+    pub fn from_toml_str_with_sweep(
+        s: &str,
+    ) -> Result<(Self, Option<RawSweepConfig>), StrategyError> {
+        let wrapper: TomlWrapper = toml::from_str(s)
+            .map_err(|e| StrategyError::Config(format!("TOML parse error: {e}")))?;
+        Ok((wrapper.zscore.into(), wrapper.sweep))
+    }
 }
 
-/// TOML 최상위 래퍼 (`[zscore]` 섹션).
+/// TOML 최상위 래퍼 (`[zscore]` 및 `[sweep]` 섹션).
 #[derive(Deserialize)]
 struct TomlWrapper {
     #[serde(default)]
     zscore: RawZScoreConfig,
+    #[serde(default)]
+    sweep: Option<RawSweepConfig>,
 }
 
 /// TOML 역직렬화 전용 중간 구조체.
@@ -242,6 +253,32 @@ impl From<RawZScoreConfig> for ZScoreConfig {
     }
 }
 
+/// TOML 역직렬화 전용 sweep 설정.
+#[derive(Debug, Deserialize)]
+pub struct RawSweepConfig {
+    /// 테스트할 entry_z 값 목록.
+    pub entry_z_values: Vec<f64>,
+    /// 테스트할 exit_z 값 목록 (없으면 base_config.exit_z 사용).
+    pub exit_z_values: Option<Vec<f64>>,
+    /// 최대 조합 수 (기본 50).
+    pub max_combinations: Option<usize>,
+}
+
+impl RawSweepConfig {
+    /// `SweepConfig`로 변환합니다.
+    pub fn into_sweep_config(self, base_config: ZScoreConfig) -> crate::zscore::sweep::SweepConfig {
+        let exit_z_values = self
+            .exit_z_values
+            .unwrap_or_else(|| vec![base_config.exit_z_threshold]);
+        crate::zscore::sweep::SweepConfig {
+            base_config,
+            entry_z_values: self.entry_z_values,
+            exit_z_values,
+            max_combinations: self.max_combinations.unwrap_or(50),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,23 +291,29 @@ mod tests {
 
     #[test]
     fn test_validate_empty_coins() {
-        let mut config = ZScoreConfig::default();
-        config.coins = vec![];
+        let config = ZScoreConfig {
+            coins: vec![],
+            ..ZScoreConfig::default()
+        };
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_validate_entry_le_exit() {
-        let mut config = ZScoreConfig::default();
-        config.entry_z_threshold = 0.5;
-        config.exit_z_threshold = 2.0;
+        let config = ZScoreConfig {
+            entry_z_threshold: 0.5,
+            exit_z_threshold: 2.0,
+            ..ZScoreConfig::default()
+        };
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_validate_position_ratio_too_high() {
-        let mut config = ZScoreConfig::default();
-        config.position_ratio = Decimal::new(6, 1); // 0.6
+        let config = ZScoreConfig {
+            position_ratio: Decimal::new(6, 1), // 0.6
+            ..ZScoreConfig::default()
+        };
         assert!(config.validate().is_err());
     }
 
@@ -339,5 +382,63 @@ entry_z_threshold = 3.0
     fn test_from_toml_str_invalid() {
         let toml = "invalid toml {{{}}}";
         assert!(ZScoreConfig::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn test_from_toml_str_with_sweep() {
+        let toml = r#"
+[zscore]
+coins = ["BTC"]
+entry_z_threshold = 2.0
+
+[sweep]
+entry_z_values = [1.5, 2.0, 2.5, 3.0]
+exit_z_values = [0.3, 0.5, 0.7]
+max_combinations = 100
+"#;
+        let (config, raw_sweep) = ZScoreConfig::from_toml_str_with_sweep(toml).unwrap();
+        assert_eq!(config.coins, vec!["BTC"]);
+        assert_eq!(config.entry_z_threshold, 2.0);
+
+        let raw_sweep = raw_sweep.expect("sweep 섹션이 파싱되어야 함");
+        assert_eq!(raw_sweep.entry_z_values, vec![1.5, 2.0, 2.5, 3.0]);
+        assert_eq!(raw_sweep.exit_z_values, Some(vec![0.3, 0.5, 0.7]));
+        assert_eq!(raw_sweep.max_combinations, Some(100));
+
+        let sweep_config = raw_sweep.into_sweep_config(config);
+        assert_eq!(sweep_config.entry_z_values.len(), 4);
+        assert_eq!(sweep_config.exit_z_values.len(), 3);
+        assert_eq!(sweep_config.max_combinations, 100);
+    }
+
+    #[test]
+    fn test_from_toml_str_with_sweep_defaults() {
+        let toml = r#"
+[zscore]
+coins = ["ETH"]
+exit_z_threshold = 0.4
+
+[sweep]
+entry_z_values = [2.0, 2.5]
+"#;
+        let (config, raw_sweep) = ZScoreConfig::from_toml_str_with_sweep(toml).unwrap();
+        let raw_sweep = raw_sweep.expect("sweep 섹션이 파싱되어야 함");
+        assert!(raw_sweep.exit_z_values.is_none());
+        assert!(raw_sweep.max_combinations.is_none());
+
+        let sweep_config = raw_sweep.into_sweep_config(config);
+        // exit_z_values가 없으면 base_config.exit_z_threshold 사용
+        assert_eq!(sweep_config.exit_z_values, vec![0.4]);
+        assert_eq!(sweep_config.max_combinations, 50);
+    }
+
+    #[test]
+    fn test_from_toml_str_without_sweep() {
+        let toml = r#"
+[zscore]
+coins = ["BTC"]
+"#;
+        let (_config, raw_sweep) = ZScoreConfig::from_toml_str_with_sweep(toml).unwrap();
+        assert!(raw_sweep.is_none());
     }
 }

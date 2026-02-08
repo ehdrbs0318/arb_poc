@@ -90,10 +90,7 @@ impl MarketStream for BybitClient {
         "Bybit"
     }
 
-    async fn subscribe(
-        &self,
-        markets: &[&str],
-    ) -> ExchangeResult<mpsc::Receiver<MarketEvent>> {
+    async fn subscribe(&self, markets: &[&str]) -> ExchangeResult<mpsc::Receiver<MarketEvent>> {
         let inner = self.stream_inner();
 
         // 기존 구독이 있으면 먼저 해제
@@ -115,10 +112,7 @@ impl MarketStream for BybitClient {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
         // tickers.{symbol} 형식으로 구독 토픽 생성
-        let topics: Vec<String> = markets
-            .iter()
-            .map(|m| format!("tickers.{m}"))
-            .collect();
+        let topics: Vec<String> = markets.iter().map(|m| format!("tickers.{m}")).collect();
         let config = inner.config.clone();
 
         info!(
@@ -277,9 +271,7 @@ async fn bybit_ws_loop(
 async fn connect_and_subscribe(
     topics: &[String],
 ) -> Result<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Box<dyn std::error::Error + Send + Sync>,
 > {
     let (ws_stream, response) = connect_async(BYBIT_WS_LINEAR_URL).await?;
