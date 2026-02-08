@@ -58,6 +58,20 @@ pub struct ZScoreConfig {
     /// 슬리피지 충격 계수 (기본값: 0.001).
     /// slippage_bps = base_bps + impact_coeff × √(participation_rate) × 10000
     pub slippage_impact_coeff: f64,
+    /// 자동 코인 선택 활성화 (기본값: false).
+    /// true이면 거래량 기반으로 대상 코인을 자동 선택합니다.
+    pub auto_select: bool,
+    /// 자동 선택 시 최대 코인 수 (기본값: 5).
+    pub max_coins: usize,
+    /// 코인 재선택 주기 (분, 기본값: 10).
+    pub reselect_interval_min: u64,
+    /// 자동 선택 시 최소 1시간 거래량 (USDT 기준, 기본값: 1,000,000).
+    pub min_volume_1h_usdt: Decimal,
+    /// 자동 선택에서 제외할 코인 블랙리스트.
+    pub blacklist: Vec<String>,
+    /// 포지션 TTL (시간 단위, 기본값: 24).
+    /// 해당 시간 이후 자동 청산합니다.
+    pub position_ttl_hours: u64,
 }
 
 impl Default for ZScoreConfig {
@@ -82,6 +96,12 @@ impl Default for ZScoreConfig {
             max_participation_rate: 0.1,
             slippage_base_bps: 1.0,
             slippage_impact_coeff: 0.001,
+            auto_select: false,
+            max_coins: 5,
+            reselect_interval_min: 10,
+            min_volume_1h_usdt: Decimal::new(1_000_000, 0),
+            blacklist: vec![],
+            position_ttl_hours: 24,
         }
     }
 }
@@ -89,8 +109,15 @@ impl Default for ZScoreConfig {
 impl ZScoreConfig {
     /// 설정값 유효성 검증.
     pub fn validate(&self) -> Result<(), StrategyError> {
-        if self.coins.is_empty() {
+        // auto_select=false이면 coins가 비어있으면 에러
+        if !self.auto_select && self.coins.is_empty() {
             return Err(StrategyError::Config("coins must not be empty".to_string()));
+        }
+        // auto_select=true이면 max_coins > 0 필수
+        if self.auto_select && self.max_coins == 0 {
+            return Err(StrategyError::Config(
+                "max_coins must be greater than 0 when auto_select is enabled".to_string(),
+            ));
         }
         if self.window_size == 0 {
             return Err(StrategyError::Config(
@@ -224,6 +251,12 @@ struct RawZScoreConfig {
     max_participation_rate: f64,
     slippage_base_bps: f64,
     slippage_impact_coeff: f64,
+    auto_select: Option<bool>,
+    max_coins: Option<usize>,
+    reselect_interval_min: Option<u64>,
+    min_volume_1h_usdt: Option<f64>,
+    blacklist: Option<Vec<String>>,
+    position_ttl_hours: Option<u64>,
 }
 
 impl Default for RawZScoreConfig {
@@ -248,6 +281,12 @@ impl Default for RawZScoreConfig {
             max_participation_rate: defaults.max_participation_rate,
             slippage_base_bps: defaults.slippage_base_bps,
             slippage_impact_coeff: defaults.slippage_impact_coeff,
+            auto_select: None,
+            max_coins: None,
+            reselect_interval_min: None,
+            min_volume_1h_usdt: None,
+            blacklist: None,
+            position_ttl_hours: None,
         }
     }
 }
@@ -275,6 +314,15 @@ impl From<RawZScoreConfig> for ZScoreConfig {
             max_participation_rate: raw.max_participation_rate,
             slippage_base_bps: raw.slippage_base_bps,
             slippage_impact_coeff: raw.slippage_impact_coeff,
+            auto_select: raw.auto_select.unwrap_or(false),
+            max_coins: raw.max_coins.unwrap_or(5),
+            reselect_interval_min: raw.reselect_interval_min.unwrap_or(10),
+            min_volume_1h_usdt: raw
+                .min_volume_1h_usdt
+                .and_then(|v| Decimal::try_from(v).ok())
+                .unwrap_or(Decimal::new(1_000_000, 0)),
+            blacklist: raw.blacklist.unwrap_or_default(),
+            position_ttl_hours: raw.position_ttl_hours.unwrap_or(24),
         }
     }
 }
@@ -466,5 +514,89 @@ coins = ["BTC"]
 "#;
         let (_config, raw_sweep) = ZScoreConfig::from_toml_str_with_sweep(toml).unwrap();
         assert!(raw_sweep.is_none());
+    }
+
+    #[test]
+    fn test_auto_select_defaults() {
+        let config = ZScoreConfig::default();
+        assert!(!config.auto_select);
+        assert_eq!(config.max_coins, 5);
+        assert_eq!(config.reselect_interval_min, 10);
+        assert_eq!(config.min_volume_1h_usdt, Decimal::new(1_000_000, 0));
+        assert!(config.blacklist.is_empty());
+        assert_eq!(config.position_ttl_hours, 24);
+    }
+
+    #[test]
+    fn test_auto_select_from_toml() {
+        let toml = r#"
+[zscore]
+coins = ["BTC"]
+auto_select = true
+max_coins = 3
+reselect_interval_min = 5
+min_volume_1h_usdt = 500000.0
+blacklist = ["USDC", "USDT"]
+position_ttl_hours = 12
+"#;
+        let config = ZScoreConfig::from_toml_str(toml).unwrap();
+        assert!(config.auto_select);
+        assert_eq!(config.max_coins, 3);
+        assert_eq!(config.reselect_interval_min, 5);
+        assert_eq!(config.min_volume_1h_usdt, Decimal::new(500_000, 0));
+        assert_eq!(config.blacklist, vec!["USDC", "USDT"]);
+        assert_eq!(config.position_ttl_hours, 12);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_auto_select_partial_toml_uses_defaults() {
+        let toml = r#"
+[zscore]
+coins = ["BTC"]
+auto_select = true
+"#;
+        let config = ZScoreConfig::from_toml_str(toml).unwrap();
+        assert!(config.auto_select);
+        // 나머지는 기본값
+        assert_eq!(config.max_coins, 5);
+        assert_eq!(config.reselect_interval_min, 10);
+        assert_eq!(config.min_volume_1h_usdt, Decimal::new(1_000_000, 0));
+        assert!(config.blacklist.is_empty());
+        assert_eq!(config.position_ttl_hours, 24);
+    }
+
+    #[test]
+    fn test_auto_select_true_empty_coins_is_valid() {
+        // auto_select=true이면 coins가 비어있어도 유효
+        let config = ZScoreConfig {
+            coins: vec![],
+            auto_select: true,
+            ..ZScoreConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_auto_select_false_empty_coins_is_invalid() {
+        // auto_select=false이면 coins가 비어있으면 에러
+        let config = ZScoreConfig {
+            coins: vec![],
+            auto_select: false,
+            ..ZScoreConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_auto_select_max_coins_zero_is_invalid() {
+        // auto_select=true이고 max_coins=0이면 에러
+        let config = ZScoreConfig {
+            auto_select: true,
+            max_coins: 0,
+            ..ZScoreConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("max_coins"));
     }
 }

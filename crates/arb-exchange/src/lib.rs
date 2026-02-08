@@ -50,7 +50,7 @@ pub use adapter::ExchangeAdapter;
 pub use manager::ExchangeManager;
 
 // stream trait 재내보내기
-pub use stream::{MarketEvent, MarketStream, StreamConfig};
+pub use stream::{MarketEvent, MarketStream, StreamCommand, StreamConfig};
 
 // market 유틸리티 재내보내기
 pub use market::{

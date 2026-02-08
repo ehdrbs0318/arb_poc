@@ -90,6 +90,31 @@ pub trait ExchangeAdapter: Send + Sync + Debug {
         before: DateTime<Utc>,
     ) -> ExchangeResult<Vec<Candle>>;
 
+    /// 전종목 Ticker를 조회합니다.
+    ///
+    /// 거래소가 지원하는 모든 마켓의 현재 티커 정보를 반환합니다.
+    async fn get_all_tickers(&self) -> ExchangeResult<Vec<Ticker>>;
+
+    // ==================== 스트림 관리 작업 ====================
+
+    /// 기존 연결을 유지하면서 마켓을 추가 구독합니다.
+    ///
+    /// 기본 구현은 `Unsupported` 에러를 반환합니다.
+    async fn subscribe_markets(&self, _markets: &[&str]) -> ExchangeResult<()> {
+        Err(crate::error::ExchangeError::Unsupported(
+            "subscribe_markets not implemented".into(),
+        ))
+    }
+
+    /// 기존 연결을 유지하면서 마켓 구독을 해제합니다.
+    ///
+    /// 기본 구현은 `Unsupported` 에러를 반환합니다.
+    async fn unsubscribe_markets(&self, _markets: &[&str]) -> ExchangeResult<()> {
+        Err(crate::error::ExchangeError::Unsupported(
+            "unsubscribe_markets not implemented".into(),
+        ))
+    }
+
     // ==================== 주문 관리 작업 ====================
 
     /// 새 주문을 생성합니다.

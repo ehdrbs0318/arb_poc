@@ -116,6 +116,41 @@ impl SpreadCalculator {
         }
     }
 
+    /// 새 코인을 추가하고 빈 윈도우를 초기화합니다.
+    ///
+    /// idempotent: 이미 존재하는 코인은 데이터를 유지하고 무시합니다.
+    pub fn add_coin(&mut self, coin: &str) {
+        if self.upbit_coin_windows.contains_key(coin) {
+            return;
+        }
+        self.upbit_coin_windows
+            .insert(coin.to_string(), CandleWindow::new(self.window_size));
+        self.bybit_windows
+            .insert(coin.to_string(), CandleWindow::new(self.window_size));
+        self.spread_pct_windows
+            .insert(coin.to_string(), CandleWindow::new(self.window_size));
+        self.upbit_ff
+            .insert(coin.to_string(), ForwardFillState::new());
+        self.bybit_ff
+            .insert(coin.to_string(), ForwardFillState::new());
+    }
+
+    /// 코인을 제거하고 관련 데이터를 삭제합니다.
+    ///
+    /// 존재하지 않는 코인은 패닉 없이 무시합니다.
+    pub fn remove_coin(&mut self, coin: &str) {
+        self.upbit_coin_windows.remove(coin);
+        self.bybit_windows.remove(coin);
+        self.spread_pct_windows.remove(coin);
+        self.upbit_ff.remove(coin);
+        self.bybit_ff.remove(coin);
+    }
+
+    /// 현재 감시 중인 코인 목록을 반환합니다.
+    pub fn active_coins(&self) -> Vec<&str> {
+        self.spread_pct_windows.keys().map(|k| k.as_str()).collect()
+    }
+
     /// 특정 코인의 캔들 데이터를 업데이트하고 spread_pct를 재계산합니다.
     ///
     /// 각 입력은 `Option` - `None`이면 forward-fill (직전 값 유지).
@@ -443,5 +478,125 @@ mod tests {
         // ETH: upbit_usdt = 3_000, bybit = 3_010, spread = (3010-3000)/3000*100 = 0.333...%
         let eth_spread = calc.last_spread_pct("ETH").unwrap();
         assert!((eth_spread - 10.0 / 3000.0 * 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_add_coin_new() {
+        let coins = vec!["BTC".to_string()];
+        let mut calc = SpreadCalculator::new(&coins, 10);
+
+        // 새 코인 추가
+        calc.add_coin("ETH");
+
+        // 추가된 코인에 대해 윈도우가 존재해야 함
+        assert!(calc.spread_window("ETH").is_some());
+        assert!(calc.upbit_window("ETH").is_some());
+        assert!(calc.bybit_window("ETH").is_some());
+
+        // 추가된 코인으로 업데이트 가능해야 함
+        let ts = Utc::now();
+        let result = calc.update(
+            "ETH",
+            ts,
+            Some(dec(4_140_000, 0)),
+            Some(dec(1380, 0)),
+            Some(dec(3_010, 0)),
+        );
+        assert!(result.is_ok());
+        assert!(calc.last_spread_pct("ETH").is_some());
+    }
+
+    #[test]
+    fn test_add_coin_idempotent() {
+        let coins = vec!["BTC".to_string()];
+        let mut calc = SpreadCalculator::new(&coins, 10);
+        let ts = Utc::now();
+
+        // 기존 데이터 추가
+        calc.update(
+            "BTC",
+            ts,
+            Some(dec(138_000_000, 0)),
+            Some(dec(1380, 0)),
+            Some(dec(100_050, 0)),
+        )
+        .unwrap();
+
+        let spread_before = calc.last_spread_pct("BTC").unwrap();
+
+        // 이미 존재하는 코인 재추가 → 데이터가 보존되어야 함
+        calc.add_coin("BTC");
+
+        let spread_after = calc.last_spread_pct("BTC").unwrap();
+        assert!((spread_before - spread_after).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_remove_coin() {
+        let coins = vec!["BTC".to_string(), "ETH".to_string()];
+        let mut calc = SpreadCalculator::new(&coins, 10);
+
+        // ETH 제거
+        calc.remove_coin("ETH");
+
+        // 제거된 코인에 대해 윈도우가 없어야 함
+        assert!(calc.spread_window("ETH").is_none());
+        assert!(calc.upbit_window("ETH").is_none());
+        assert!(calc.bybit_window("ETH").is_none());
+
+        // 제거된 코인으로 업데이트하면 에러
+        let ts = Utc::now();
+        let result = calc.update(
+            "ETH",
+            ts,
+            Some(dec(4_140_000, 0)),
+            Some(dec(1380, 0)),
+            Some(dec(3_010, 0)),
+        );
+        assert!(result.is_err());
+
+        // BTC는 영향 없음
+        assert!(calc.spread_window("BTC").is_some());
+    }
+
+    #[test]
+    fn test_remove_coin_nonexistent() {
+        let coins = vec!["BTC".to_string()];
+        let mut calc = SpreadCalculator::new(&coins, 10);
+
+        // 존재하지 않는 코인 제거 → 패닉 없이 무시
+        calc.remove_coin("XRP");
+
+        // BTC 영향 없음
+        assert!(calc.spread_window("BTC").is_some());
+    }
+
+    #[test]
+    fn test_active_coins() {
+        let coins = vec!["BTC".to_string(), "ETH".to_string()];
+        let calc = SpreadCalculator::new(&coins, 10);
+
+        let mut active = calc.active_coins();
+        active.sort();
+        assert_eq!(active, vec!["BTC", "ETH"]);
+    }
+
+    #[test]
+    fn test_active_coins_after_add_remove() {
+        let coins = vec!["BTC".to_string()];
+        let mut calc = SpreadCalculator::new(&coins, 10);
+
+        calc.add_coin("ETH");
+        calc.add_coin("XRP");
+
+        let mut active = calc.active_coins();
+        active.sort();
+        assert_eq!(active, vec!["BTC", "ETH", "XRP"]);
+
+        calc.remove_coin("ETH");
+
+        let mut active = calc.active_coins();
+        active.sort();
+        assert_eq!(active, vec!["BTC", "XRP"]);
     }
 }

@@ -11,8 +11,8 @@ use arb_exchange::{
 use crate::upbit::auth::{UpbitCredentials, build_query_string};
 use crate::upbit::stream::UpbitStreamInner;
 use crate::upbit::types::{
-    UpbitBalance, UpbitCandle, UpbitError, UpbitOrder, UpbitOrderRequest, UpbitOrderbook,
-    UpbitTicker,
+    UpbitBalance, UpbitCandle, UpbitError, UpbitMarketInfo, UpbitOrder, UpbitOrderRequest,
+    UpbitOrderbook, UpbitTicker,
 };
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use reqwest::Client;
@@ -334,6 +334,28 @@ impl MarketData for UpbitClient {
         let mut result: Vec<Candle> = candles.into_iter().map(convert_candle).collect();
         result.reverse();
         Ok(result)
+    }
+
+    async fn get_all_tickers(&self) -> ExchangeResult<Vec<Ticker>> {
+        // 1단계: 전체 마켓 목록 조회
+        let markets: Vec<UpbitMarketInfo> = self
+            .get_public("/market/all", Some(&[("is_details", "true")]))
+            .await?;
+
+        // KRW 마켓만 필터
+        let krw_markets: Vec<String> = markets
+            .into_iter()
+            .filter(|m| m.market.starts_with("KRW-"))
+            .map(|m| m.market)
+            .collect();
+
+        if krw_markets.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // 2단계: 기존 get_ticker()를 활용하여 전종목 시세 조회
+        let market_refs: Vec<&str> = krw_markets.iter().map(|s| s.as_str()).collect();
+        self.get_ticker(&market_refs).await
     }
 
     fn market_code(base: &str, quote: &str) -> String {

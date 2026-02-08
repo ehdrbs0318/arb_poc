@@ -335,6 +335,13 @@ impl MarketData for BithumbClient {
         ))
     }
 
+    async fn get_all_tickers(&self) -> ExchangeResult<Vec<Ticker>> {
+        // Bithumb은 자동 코인 선택에 사용되지 않음
+        Err(ExchangeError::Unsupported(
+            "get_all_tickers not implemented for Bithumb".into(),
+        ))
+    }
+
     fn market_code(base: &str, quote: &str) -> String {
         // Bithumb 형식: "{QUOTE}-{BASE}" (예: "KRW-BTC")
         format!("{}-{}", quote.to_uppercase(), base.to_uppercase())

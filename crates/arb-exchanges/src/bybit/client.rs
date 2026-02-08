@@ -429,6 +429,26 @@ impl MarketData for BybitClient {
         Ok(candles)
     }
 
+    async fn get_all_tickers(&self) -> ExchangeResult<Vec<Ticker>> {
+        // 단일 호출로 전종목 티커 조회 (category만 지정, symbol 생략)
+        let params = [("category", self.category.as_str())];
+
+        let result: BybitTickerList = self.get_public("/v5/market/tickers", &params).await?;
+
+        // USDT 페어만 필터하여 변환
+        let tickers = result
+            .list
+            .into_iter()
+            .filter(|t| t.symbol.ends_with("USDT"))
+            .map(|t| {
+                let market = Self::to_market_code(&t.symbol);
+                convert_ticker(t, &market)
+            })
+            .collect();
+
+        Ok(tickers)
+    }
+
     fn market_code(base: &str, quote: &str) -> String {
         // Bybit 형식: "{BASE}{QUOTE}" (예: "BTCUSDT")
         format!("{}{}", base.to_uppercase(), quote.to_uppercase())

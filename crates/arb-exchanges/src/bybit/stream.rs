@@ -3,8 +3,8 @@
 //! `MarketStream` trait을 구현하여 Bybit의 tickers (best bid/ask)
 //! 데이터를 WebSocket으로 실시간 수신합니다.
 
-use arb_exchange::error::ExchangeResult;
-use arb_exchange::stream::{MarketEvent, MarketStream, StreamConfig};
+use arb_exchange::error::{ExchangeError, ExchangeResult};
+use arb_exchange::stream::{MarketEvent, MarketStream, StreamCommand, StreamConfig};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -67,6 +67,8 @@ struct StreamState {
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// WebSocket task join handle.
     task_handle: Option<tokio::task::JoinHandle<()>>,
+    /// 동적 구독 변경 명령을 보내는 sender.
+    command_tx: Option<mpsc::Sender<StreamCommand>>,
 }
 
 /// Bybit MarketStream 구현을 위한 내부 상태.
@@ -110,6 +112,7 @@ impl MarketStream for BybitClient {
         let buffer_size = inner.config.channel_buffer_size;
         let (event_tx, event_rx) = mpsc::channel(buffer_size);
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (command_tx, command_rx) = mpsc::channel::<StreamCommand>(64);
 
         // tickers.{symbol} 형식으로 구독 토픽 생성
         let topics: Vec<String> = markets.iter().map(|m| format!("tickers.{m}")).collect();
@@ -121,13 +124,14 @@ impl MarketStream for BybitClient {
         );
 
         let task_handle = tokio::spawn(async move {
-            bybit_ws_loop(topics, event_tx, shutdown_rx, config).await;
+            bybit_ws_loop(topics, event_tx, shutdown_rx, command_rx, config).await;
         });
 
         let mut state_guard = inner.state.lock().await;
         *state_guard = Some(StreamState {
             shutdown_tx: Some(shutdown_tx),
             task_handle: Some(task_handle),
+            command_tx: Some(command_tx),
         });
 
         Ok(event_rx)
@@ -149,17 +153,59 @@ impl MarketStream for BybitClient {
 
         Ok(())
     }
+
+    async fn subscribe_markets(&self, markets: &[&str]) -> ExchangeResult<()> {
+        let inner = self.stream_inner();
+        let state_guard = inner.state.lock().await;
+        if let Some(ref state) = *state_guard {
+            if let Some(ref tx) = state.command_tx {
+                // Bybit은 심볼 이름으로 전달 (tickers. 접두사는 루프에서 추가)
+                tx.send(StreamCommand::Subscribe(
+                    markets.iter().map(|m| m.to_string()).collect(),
+                ))
+                .await
+                .map_err(|_| ExchangeError::WebSocketError("command channel closed".into()))?;
+                Ok(())
+            } else {
+                Err(ExchangeError::WebSocketError("not subscribed".into()))
+            }
+        } else {
+            Err(ExchangeError::WebSocketError("not subscribed".into()))
+        }
+    }
+
+    async fn unsubscribe_markets(&self, markets: &[&str]) -> ExchangeResult<()> {
+        let inner = self.stream_inner();
+        let state_guard = inner.state.lock().await;
+        if let Some(ref state) = *state_guard {
+            if let Some(ref tx) = state.command_tx {
+                tx.send(StreamCommand::Unsubscribe(
+                    markets.iter().map(|m| m.to_string()).collect(),
+                ))
+                .await
+                .map_err(|_| ExchangeError::WebSocketError("command channel closed".into()))?;
+                Ok(())
+            } else {
+                Err(ExchangeError::WebSocketError("not subscribed".into()))
+            }
+        } else {
+            Err(ExchangeError::WebSocketError("not subscribed".into()))
+        }
+    }
 }
 
-/// Bybit WebSocket 이벤트 루프 (재연결 + heartbeat 포함).
+/// Bybit WebSocket 이벤트 루프 (재연결 + heartbeat + 동적 구독 포함).
 async fn bybit_ws_loop(
-    topics: Vec<String>,
+    initial_topics: Vec<String>,
     event_tx: mpsc::Sender<MarketEvent>,
     mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    mut command_rx: mpsc::Receiver<StreamCommand>,
     config: StreamConfig,
 ) {
     let mut retry_count: u32 = 0;
     let mut backoff = config.initial_backoff;
+    // 현재 구독 중인 토픽 목록 (재연결 시 사용)
+    let mut current_topics = initial_topics;
 
     loop {
         // 종료 확인
@@ -168,7 +214,7 @@ async fn bybit_ws_loop(
             break;
         }
 
-        match connect_and_subscribe(&topics).await {
+        match connect_and_subscribe(&current_topics).await {
             Ok(ws_stream) => {
                 info!("Bybit WebSocket 연결 성공");
                 retry_count = 0;
@@ -183,6 +229,64 @@ async fn bybit_ws_loop(
                             info!("Bybit WebSocket 종료 요청 (루프 내)");
                             let _ = write.close().await;
                             return;
+                        }
+                        cmd = command_rx.recv() => {
+                            match cmd {
+                                Some(StreamCommand::Subscribe(symbols)) => {
+                                    // tickers.{symbol} 형식으로 토픽 변환
+                                    let new_topics: Vec<String> = symbols
+                                        .iter()
+                                        .map(|s| format!("tickers.{s}"))
+                                        .collect();
+                                    // 현재 목록에 추가 (중복 제거)
+                                    for t in &new_topics {
+                                        if !current_topics.contains(t) {
+                                            current_topics.push(t.clone());
+                                        }
+                                    }
+                                    info!(
+                                        topics = ?new_topics,
+                                        "Bybit 동적 구독 추가"
+                                    );
+                                    // Bybit은 개별 subscribe op 지원
+                                    let msg = serde_json::json!({
+                                        "op": "subscribe",
+                                        "args": new_topics
+                                    });
+                                    if let Err(e) = write.send(
+                                        Message::Text(msg.to_string().into())
+                                    ).await {
+                                        error!(error = %e, "Bybit subscribe 메시지 전송 실패");
+                                        break;
+                                    }
+                                }
+                                Some(StreamCommand::Unsubscribe(symbols)) => {
+                                    let remove_topics: Vec<String> = symbols
+                                        .iter()
+                                        .map(|s| format!("tickers.{s}"))
+                                        .collect();
+                                    // 현재 목록에서 제거
+                                    current_topics.retain(|t| !remove_topics.contains(t));
+                                    info!(
+                                        topics = ?remove_topics,
+                                        "Bybit 동적 구독 해제"
+                                    );
+                                    // Bybit은 개별 unsubscribe op 지원
+                                    let msg = serde_json::json!({
+                                        "op": "unsubscribe",
+                                        "args": remove_topics
+                                    });
+                                    if let Err(e) = write.send(
+                                        Message::Text(msg.to_string().into())
+                                    ).await {
+                                        error!(error = %e, "Bybit unsubscribe 메시지 전송 실패");
+                                        break;
+                                    }
+                                }
+                                None => {
+                                    debug!("Bybit command 채널 닫힘");
+                                }
+                            }
                         }
                         _ = heartbeat.tick() => {
                             // Bybit heartbeat ping

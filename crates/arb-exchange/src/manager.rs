@@ -256,6 +256,10 @@ mod tests {
             Ok(vec![])
         }
 
+        async fn get_all_tickers(&self) -> ExchangeResult<Vec<Ticker>> {
+            Ok(vec![])
+        }
+
         async fn get_orderbook(
             &self,
             _market: &str,

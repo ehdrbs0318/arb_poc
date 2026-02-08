@@ -19,6 +19,21 @@ pub struct UpbitErrorDetail {
     pub message: String,
 }
 
+/// Upbit 마켓 정보 응답.
+///
+/// `/v1/market/all` API의 응답 항목.
+#[derive(Debug, Deserialize)]
+pub struct UpbitMarketInfo {
+    /// 마켓 코드 (예: "KRW-BTC").
+    pub market: String,
+    /// 한글 이름 (예: "비트코인").
+    #[serde(default)]
+    pub korean_name: String,
+    /// 영문 이름 (예: "Bitcoin").
+    #[serde(default)]
+    pub english_name: String,
+}
+
 /// Upbit 시세(ticker) 응답.
 #[derive(Debug, Deserialize)]
 pub struct UpbitTicker {

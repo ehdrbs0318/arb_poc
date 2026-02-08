@@ -53,6 +53,22 @@ slippage_base_bps = 1.0
 # Square-Root Impact 계수: slippage_bps = base + coeff × √(participation_rate) × 10000
 slippage_impact_coeff = 0.001
 
+# 자동 코인 선택 (기본: 비활성)
+# 활성화하면 거래량/변동성 기반으로 감시 코인을 자동 선택합니다.
+# auto_select = true일 때 coins는 무시되고, 자동 선택된 코인이 사용됩니다.
+auto_select = false
+# 최대 감시 코인 수 (기본: 5)
+max_coins = 5
+# 재선택 주기 (분, 기본: 10)
+reselect_interval_min = 10
+# 1시간 최소 거래량 (USDT, 기본: 1,000,000)
+min_volume_1h_usdt = 1000000.0
+# 제외 코인 목록 (스테이블코인은 자동 제외)
+blacklist = []
+# 탈락 코인 포지션 최대 유지 시간 (기본: 24시간)
+# TTL 만료 시 강제 청산합니다.
+position_ttl_hours = 24
+
 # 파라미터 sweep 설정 (zscore_parameter_sweep 예제 전용)
 # cargo run --example zscore_parameter_sweep
 [sweep]

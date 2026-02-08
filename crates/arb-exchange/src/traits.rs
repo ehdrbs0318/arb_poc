@@ -72,6 +72,12 @@ pub trait MarketData: Send + Sync {
         before: DateTime<Utc>,
     ) -> impl Future<Output = ExchangeResult<Vec<Candle>>> + Send;
 
+    /// 전종목 Ticker를 조회합니다.
+    ///
+    /// 거래소가 지원하는 모든 마켓의 현재 티커 정보를 반환합니다.
+    /// 코인 자동 선택 등에서 활용됩니다.
+    fn get_all_tickers(&self) -> impl Future<Output = ExchangeResult<Vec<Ticker>>> + Send;
+
     /// 거래소에 맞는 마켓 코드를 생성합니다.
     ///
     /// # 인자

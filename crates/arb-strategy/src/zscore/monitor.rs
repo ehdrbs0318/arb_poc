@@ -14,6 +14,7 @@ use tracing::{debug, info, trace, warn};
 use crate::common::statistics;
 use crate::error::StrategyError;
 use crate::output::csv;
+use crate::zscore::coin_selector::{CoinCandidate, CoinSelector};
 use crate::zscore::config::ZScoreConfig;
 use crate::zscore::pnl::ClosedPosition;
 use crate::zscore::position::{self, PositionManager, VirtualPosition};
@@ -132,6 +133,64 @@ impl MinuteCandleBuilder {
     }
 }
 
+/// 코인 diff 결과.
+///
+/// 현재 목록과 새 후보 목록을 비교하여 추가/제거/유지를 분류합니다.
+struct CoinDiff {
+    /// 새로 추가할 코인 (새 목록에만 있는 코인).
+    to_add: Vec<String>,
+    /// 제거할 코인 (현재 목록에만 있고 포지션 없는 코인).
+    to_remove: Vec<String>,
+    /// 유지할 코인 (현재 목록에만 있지만 포지션 보유 중).
+    to_keep_with_position: Vec<String>,
+}
+
+/// 현재 코인 목록과 새 후보를 비교하여 diff를 계산합니다.
+///
+/// # 인자
+///
+/// * `current` - 현재 감시 중인 코인 목록
+/// * `new_candidates` - 새로 선택된 코인 후보
+/// * `position_mgr` - 포지션 매니저 (오픈 포지션 확인용)
+///
+/// # 반환값
+///
+/// 추가/제거/유지 분류 결과
+fn diff_coins(
+    current: &[String],
+    new_candidates: &[CoinCandidate],
+    position_mgr: &PositionManager,
+) -> CoinDiff {
+    use std::collections::HashSet;
+
+    let current_set: HashSet<&str> = current.iter().map(|s| s.as_str()).collect();
+    let new_set: HashSet<&str> = new_candidates.iter().map(|c| c.coin.as_str()).collect();
+
+    // 새 목록에만 있는 코인 → 추가
+    let to_add: Vec<String> = new_set
+        .difference(&current_set)
+        .map(|s| s.to_string())
+        .collect();
+
+    // 현재 목록에만 있는 코인 → 포지션 유무에 따라 제거 또는 유지
+    let mut to_remove = Vec::new();
+    let mut to_keep_with_position = Vec::new();
+
+    for coin in current_set.difference(&new_set) {
+        if position_mgr.has_position(coin) {
+            to_keep_with_position.push(coin.to_string());
+        } else {
+            to_remove.push(coin.to_string());
+        }
+    }
+
+    CoinDiff {
+        to_add,
+        to_remove,
+        to_keep_with_position,
+    }
+}
+
 /// 실시간 Z-Score 모니터.
 pub struct ZScoreMonitor<U: MarketData + MarketStream, B: MarketData + MarketStream> {
     upbit: U,
@@ -152,37 +211,53 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
     /// 실시간 모니터링을 시작합니다.
     ///
     /// CancellationToken이 cancel되면 graceful shutdown합니다.
+    /// `auto_select = true`이면 CoinSelector를 사용하여 자동 코인 선택 및
+    /// 주기적 재선택을 수행합니다.
     pub async fn run(
         &self,
         cancel_token: CancellationToken,
     ) -> Result<Vec<ClosedPosition>, StrategyError> {
         self.config.validate()?;
 
+        // 1. 코인 목록 결정
+        let mut current_coins: Vec<String> = if self.config.auto_select {
+            info!("자동 코인 선택 활성화: 초기 코인 선택 중...");
+            let selector = CoinSelector::new(&self.upbit, &self.bybit);
+            let candidates = selector
+                .select(
+                    self.config.max_coins,
+                    self.config.min_volume_1h_usdt,
+                    &self.config.blacklist,
+                )
+                .await?;
+
+            if candidates.is_empty() {
+                warn!("자동 선택 결과 후보 코인이 없습니다. 볼륨 조건을 확인하세요.");
+            }
+
+            let coins: Vec<String> = candidates.iter().map(|c| c.coin.clone()).collect();
+            info!(coins = ?coins, "초기 코인 자동 선택 완료");
+            coins
+        } else {
+            self.config.coins.clone()
+        };
+
         info!("실시간 모니터링 시작: 워밍업 데이터 로드 중...");
 
-        // 1. 워밍업: REST API로 캔들 사전 로드
-        let mut spread_calc = SpreadCalculator::new(&self.config.coins, self.config.window_size);
-        self.warmup(&mut spread_calc).await?;
+        // 2. 워밍업: REST API로 캔들 사전 로드
+        let mut spread_calc = SpreadCalculator::new(&current_coins, self.config.window_size);
+        self.warmup(&current_coins, &mut spread_calc).await?;
 
         info!("워밍업 완료. WebSocket 연결 중...");
 
-        // 2. WebSocket 구독
+        // 3. WebSocket 구독
         let upbit_markets: Vec<String> = {
-            let mut markets: Vec<String> = self
-                .config
-                .coins
-                .iter()
-                .map(|c| format!("KRW-{c}"))
-                .collect();
+            let mut markets: Vec<String> =
+                current_coins.iter().map(|c| format!("KRW-{c}")).collect();
             markets.push("KRW-USDT".to_string());
             markets
         };
-        let bybit_markets: Vec<String> = self
-            .config
-            .coins
-            .iter()
-            .map(|c| format!("{c}USDT"))
-            .collect();
+        let bybit_markets: Vec<String> = current_coins.iter().map(|c| format!("{c}USDT")).collect();
 
         info!(
             upbit_markets = ?upbit_markets,
@@ -198,7 +273,7 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
 
         info!("WebSocket 연결 완료. 이벤트 루프 시작.");
 
-        // 3. 이벤트 루프
+        // 4. 이벤트 루프
         let mut position_mgr = PositionManager::new();
         let mut candle_builder = MinuteCandleBuilder::new();
         let mut minute_timer = tokio::time::interval(Duration::from_secs(60));
@@ -209,6 +284,15 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
         let mut total_event_count: u64 = 0;
         let mut heartbeat_timer = tokio::time::interval(Duration::from_secs(300));
 
+        // 재선택 타이머 (auto_select=true일 때만 사용)
+        let reselect_interval = Duration::from_secs(self.config.reselect_interval_min * 60);
+        let mut reselect_timer = tokio::time::interval(reselect_interval);
+        // 첫 tick 소모 (interval은 즉시 첫 번째 tick을 발생시킴)
+        reselect_timer.tick().await;
+
+        // 탈락 코인 TTL 추적: 탈락 시각 기록
+        let mut dropped_at: HashMap<String, DateTime<Utc>> = HashMap::new();
+
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => {
@@ -217,39 +301,252 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                 }
                 Some(event) = upbit_rx.recv() => {
                     total_event_count += 1;
-                    self.handle_event(
+                    Self::handle_event(
+                        &self.config,
                         &event,
                         &mut candle_builder,
                         &mut spread_calc,
                         &mut position_mgr,
                         &mut timeseries_records,
                         &mut trades_for_csv,
+                        &current_coins,
                     )?;
                 }
                 Some(event) = bybit_rx.recv() => {
                     total_event_count += 1;
-                    self.handle_event(
+                    Self::handle_event(
+                        &self.config,
                         &event,
                         &mut candle_builder,
                         &mut spread_calc,
                         &mut position_mgr,
                         &mut timeseries_records,
                         &mut trades_for_csv,
+                        &current_coins,
                     )?;
                 }
                 _ = minute_timer.tick() => {
                     // 빈 분 감지: forward-fill 트리거
                     let now = Utc::now();
                     if candle_builder.is_new_minute(now) {
-                        self.finalize_and_process(
+                        Self::finalize_and_process(
+                            &self.config,
                             &mut candle_builder,
                             &mut spread_calc,
                             &mut position_mgr,
                             &mut timeseries_records,
                             &mut trades_for_csv,
                             now,
+                            &current_coins,
                         )?;
                     }
+                }
+                _ = reselect_timer.tick(), if self.config.auto_select => {
+                    // 자동 코인 재선택
+                    info!("코인 재선택 시작...");
+                    let selector = CoinSelector::new(&self.upbit, &self.bybit);
+                    let new_candidates = match selector
+                        .select(
+                            self.config.max_coins,
+                            self.config.min_volume_1h_usdt,
+                            &self.config.blacklist,
+                        )
+                        .await
+                    {
+                        Ok(candidates) => candidates,
+                        Err(e) => {
+                            warn!(error = %e, "코인 재선택 실패, 이전 목록 유지");
+                            continue;
+                        }
+                    };
+
+                    let diff = diff_coins(&current_coins, &new_candidates, &position_mgr);
+
+                    info!(
+                        to_add = ?diff.to_add,
+                        to_remove = ?diff.to_remove,
+                        to_keep_with_position = ?diff.to_keep_with_position,
+                        "코인 재선택 diff 결과"
+                    );
+
+                    // 제거 코인 (포지션 없음): 즉시 정리
+                    for coin in &diff.to_remove {
+                        spread_calc.remove_coin(coin);
+                        dropped_at.remove(coin);
+
+                        // WebSocket 구독 해제
+                        let upbit_market = format!("KRW-{coin}");
+                        let bybit_market = format!("{coin}USDT");
+                        if let Err(e) = self
+                            .upbit
+                            .unsubscribe_markets(&[&upbit_market])
+                            .await
+                        {
+                            warn!(
+                                coin = coin.as_str(),
+                                error = %e,
+                                "Upbit 구독 해제 실패"
+                            );
+                        }
+                        if let Err(e) = self
+                            .bybit
+                            .unsubscribe_markets(&[&bybit_market])
+                            .await
+                        {
+                            warn!(
+                                coin = coin.as_str(),
+                                error = %e,
+                                "Bybit 구독 해제 실패"
+                            );
+                        }
+
+                        info!(coin = coin.as_str(), "코인 제거 완료");
+                    }
+
+                    // 탈락 + 포지션 코인: 탈락 시각 기록
+                    for coin in &diff.to_keep_with_position {
+                        dropped_at.entry(coin.clone()).or_insert(Utc::now());
+                        info!(
+                            coin = coin.as_str(),
+                            "탈락 코인이지만 포지션 보유 중, 감시 유지"
+                        );
+                    }
+
+                    // TTL 만료 체크
+                    let ttl = chrono::Duration::hours(self.config.position_ttl_hours as i64);
+                    let now = Utc::now();
+                    let expired: Vec<String> = dropped_at
+                        .iter()
+                        .filter(|(_, time)| now - **time > ttl)
+                        .map(|(coin, _)| coin.clone())
+                        .collect();
+
+                    for coin in &expired {
+                        warn!(coin = coin.as_str(), "TTL 만료: 강제 청산");
+
+                        // 강제 청산: 현재 가격으로 시장가 청산
+                        let upbit_usdt = spread_calc
+                            .upbit_window(coin)
+                            .and_then(|w| w.last())
+                            .map(|f| Decimal::try_from(f).unwrap_or(Decimal::ZERO))
+                            .unwrap_or(Decimal::ZERO);
+                        let bybit_price = spread_calc
+                            .bybit_window(coin)
+                            .and_then(|w| w.last())
+                            .map(|f| Decimal::try_from(f).unwrap_or(Decimal::ZERO))
+                            .unwrap_or(Decimal::ZERO);
+                        let usdt_krw_val = spread_calc
+                            .usdt_krw_window()
+                            .last()
+                            .map(|f| Decimal::try_from(f).unwrap_or(Decimal::ZERO))
+                            .unwrap_or(Decimal::ZERO);
+                        let spread_pct = spread_calc.last_spread_pct(coin).unwrap_or(0.0);
+
+                        match position_mgr.close_position(
+                            coin,
+                            now,
+                            upbit_usdt,
+                            bybit_price,
+                            usdt_krw_val,
+                            spread_pct,
+                            f64::NAN,
+                            self.config.upbit_taker_fee,
+                            self.config.bybit_taker_fee,
+                            false,
+                        ) {
+                            Ok(closed) => {
+                                info!(
+                                    coin = coin.as_str(),
+                                    net_pnl = %closed.net_pnl,
+                                    "TTL 만료 강제 청산 완료"
+                                );
+                                trades_for_csv.push(closed);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    coin = coin.as_str(),
+                                    error = %e,
+                                    "TTL 만료 강제 청산 실패"
+                                );
+                            }
+                        }
+
+                        // 데이터 정리
+                        spread_calc.remove_coin(coin);
+                        dropped_at.remove(coin);
+
+                        // WebSocket 구독 해제
+                        let upbit_market = format!("KRW-{coin}");
+                        let bybit_market = format!("{coin}USDT");
+                        self.upbit.unsubscribe_markets(&[&upbit_market]).await.ok();
+                        self.bybit.unsubscribe_markets(&[&bybit_market]).await.ok();
+                    }
+
+                    // 추가 코인: 워밍업 후 구독
+                    for coin in &diff.to_add {
+                        match self
+                            .warmup_single_coin(coin, &mut spread_calc)
+                            .await
+                        {
+                            Ok(()) => {
+                                // WebSocket 구독 추가
+                                let upbit_market = format!("KRW-{coin}");
+                                let bybit_market = format!("{coin}USDT");
+                                if let Err(e) = self
+                                    .upbit
+                                    .subscribe_markets(&[&upbit_market])
+                                    .await
+                                {
+                                    warn!(
+                                        coin = coin.as_str(),
+                                        error = %e,
+                                        "Upbit 구독 추가 실패"
+                                    );
+                                    // 워밍업은 했지만 구독 실패 → 데이터 정리
+                                    spread_calc.remove_coin(coin);
+                                    continue;
+                                }
+                                if let Err(e) = self
+                                    .bybit
+                                    .subscribe_markets(&[&bybit_market])
+                                    .await
+                                {
+                                    warn!(
+                                        coin = coin.as_str(),
+                                        error = %e,
+                                        "Bybit 구독 추가 실패"
+                                    );
+                                    // Upbit는 구독 성공했지만 Bybit 실패 → 롤백
+                                    self.upbit
+                                        .unsubscribe_markets(&[&upbit_market])
+                                        .await
+                                        .ok();
+                                    spread_calc.remove_coin(coin);
+                                    continue;
+                                }
+
+                                info!(coin = coin.as_str(), "코인 추가 완료");
+                            }
+                            Err(e) => {
+                                warn!(
+                                    coin = coin.as_str(),
+                                    error = %e,
+                                    "코인 워밍업 실패, 건너뜀"
+                                );
+                                // 워밍업 중 add_coin으로 추가된 빈 윈도우 정리
+                                spread_calc.remove_coin(coin);
+                            }
+                        }
+                    }
+
+                    // current_coins 업데이트: SpreadCalculator에 실제 존재하는 코인만
+                    // (워밍업/구독 실패한 코인은 이미 remove_coin으로 제거됨)
+                    current_coins = spread_calc
+                        .active_coins()
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    info!(coins = ?current_coins, "코인 목록 업데이트 완료");
                 }
                 _ = heartbeat_timer.tick() => {
                     // 5분마다 heartbeat 로그
@@ -258,6 +555,7 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                         open_positions = position_mgr.open_count(),
                         total_trades = trades_for_csv.len(),
                         timeseries_records = timeseries_records.len(),
+                        coins = ?current_coins,
                         "[heartbeat] 실시간 모니터 상태"
                     );
                 }
@@ -283,117 +581,138 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
         Ok(trades_for_csv)
     }
 
-    /// REST API로 워밍업 데이터를 로드합니다.
-    async fn warmup(&self, spread_calc: &mut SpreadCalculator) -> Result<(), StrategyError> {
+    /// REST API로 전체 코인의 워밍업 데이터를 로드합니다.
+    async fn warmup(
+        &self,
+        coins: &[String],
+        spread_calc: &mut SpreadCalculator,
+    ) -> Result<(), StrategyError> {
+        for coin in coins {
+            self.warmup_single_coin(coin, spread_calc).await?;
+        }
+        Ok(())
+    }
+
+    /// 단일 코인의 워밍업 데이터를 REST API로 로드합니다.
+    ///
+    /// SpreadCalculator에 해당 코인이 없으면 `add_coin`으로 추가합니다.
+    async fn warmup_single_coin(
+        &self,
+        coin: &str,
+        spread_calc: &mut SpreadCalculator,
+    ) -> Result<(), StrategyError> {
         let end_time = Utc::now();
         let window_size = self.config.window_size;
 
-        for coin in &self.config.coins {
-            debug!(
-                coin = coin.as_str(),
-                window_size = window_size,
-                "워밍업 시작: 캔들 데이터 로드"
-            );
+        // SpreadCalculator에 코인이 없으면 추가 (idempotent)
+        spread_calc.add_coin(coin);
 
-            let upbit_market = format!("KRW-{coin}");
-            let bybit_market = format!("{coin}USDT");
+        debug!(
+            coin = coin,
+            window_size = window_size,
+            "워밍업 시작: 캔들 데이터 로드"
+        );
 
-            let upbit_candles = fetch_all_candles(
-                &self.upbit,
-                &upbit_market,
-                self.config.candle_interval,
-                window_size,
-                end_time,
-                200,
-                Duration::from_millis(100),
-            )
-            .await?;
+        let upbit_market = format!("KRW-{coin}");
+        let bybit_market = format!("{coin}USDT");
 
-            let bybit_candles = fetch_all_candles(
-                &self.bybit,
-                &bybit_market,
-                self.config.candle_interval,
-                window_size,
-                end_time,
-                1000,
-                Duration::from_millis(10),
-            )
-            .await?;
+        let upbit_candles = fetch_all_candles(
+            &self.upbit,
+            &upbit_market,
+            self.config.candle_interval,
+            window_size,
+            end_time,
+            200,
+            Duration::from_millis(100),
+        )
+        .await?;
 
-            let usdt_krw_candles = fetch_all_candles(
-                &self.upbit,
-                "KRW-USDT",
-                self.config.candle_interval,
-                window_size,
-                end_time,
-                200,
-                Duration::from_millis(100),
-            )
-            .await?;
+        let bybit_candles = fetch_all_candles(
+            &self.bybit,
+            &bybit_market,
+            self.config.candle_interval,
+            window_size,
+            end_time,
+            1000,
+            Duration::from_millis(10),
+        )
+        .await?;
 
-            info!(
-                coin = coin.as_str(),
-                upbit = upbit_candles.len(),
-                bybit = bybit_candles.len(),
-                usdt_krw = usdt_krw_candles.len(),
-                "워밍업 데이터 로드"
-            );
+        let usdt_krw_candles = fetch_all_candles(
+            &self.upbit,
+            "KRW-USDT",
+            self.config.candle_interval,
+            window_size,
+            end_time,
+            200,
+            Duration::from_millis(100),
+        )
+        .await?;
 
-            // 공통 타임스탬프 기준으로 SpreadCalculator 업데이트
-            use std::collections::BTreeSet;
-            let mut timestamps = BTreeSet::new();
-            for c in &upbit_candles {
-                timestamps.insert(c.timestamp);
-            }
-            for c in &bybit_candles {
-                timestamps.insert(c.timestamp);
-            }
-            for c in &usdt_krw_candles {
-                timestamps.insert(c.timestamp);
-            }
+        info!(
+            coin = coin,
+            upbit = upbit_candles.len(),
+            bybit = bybit_candles.len(),
+            usdt_krw = usdt_krw_candles.len(),
+            "워밍업 데이터 로드"
+        );
 
-            debug!(
-                coin = coin.as_str(),
-                common_timestamps = timestamps.len(),
-                "워밍업 공통 타임스탬프 수"
-            );
-
-            for ts in timestamps {
-                let upbit_close = upbit_candles
-                    .iter()
-                    .find(|c| c.timestamp == ts)
-                    .map(|c| c.close);
-                let usdt_krw_close = usdt_krw_candles
-                    .iter()
-                    .find(|c| c.timestamp == ts)
-                    .map(|c| c.close);
-                let bybit_close = bybit_candles
-                    .iter()
-                    .find(|c| c.timestamp == ts)
-                    .map(|c| c.close);
-
-                spread_calc.update(coin, ts, upbit_close, usdt_krw_close, bybit_close)?;
-            }
-
-            debug!(
-                coin = coin.as_str(),
-                is_ready = spread_calc.is_ready(coin),
-                "워밍업 완료"
-            );
+        // 공통 타임스탬프 기준으로 SpreadCalculator 업데이트
+        use std::collections::BTreeSet;
+        let mut timestamps = BTreeSet::new();
+        for c in &upbit_candles {
+            timestamps.insert(c.timestamp);
         }
+        for c in &bybit_candles {
+            timestamps.insert(c.timestamp);
+        }
+        for c in &usdt_krw_candles {
+            timestamps.insert(c.timestamp);
+        }
+
+        debug!(
+            coin = coin,
+            common_timestamps = timestamps.len(),
+            "워밍업 공통 타임스탬프 수"
+        );
+
+        for ts in timestamps {
+            let upbit_close = upbit_candles
+                .iter()
+                .find(|c| c.timestamp == ts)
+                .map(|c| c.close);
+            let usdt_krw_close = usdt_krw_candles
+                .iter()
+                .find(|c| c.timestamp == ts)
+                .map(|c| c.close);
+            let bybit_close = bybit_candles
+                .iter()
+                .find(|c| c.timestamp == ts)
+                .map(|c| c.close);
+
+            spread_calc.update(coin, ts, upbit_close, usdt_krw_close, bybit_close)?;
+        }
+
+        debug!(
+            coin = coin,
+            is_ready = spread_calc.is_ready(coin),
+            "워밍업 완료"
+        );
 
         Ok(())
     }
 
     /// MarketEvent를 처리합니다.
+    #[allow(clippy::too_many_arguments)]
     fn handle_event(
-        &self,
+        config: &ZScoreConfig,
         event: &MarketEvent,
         candle_builder: &mut MinuteCandleBuilder,
         spread_calc: &mut SpreadCalculator,
         position_mgr: &mut PositionManager,
         timeseries: &mut Vec<TimeseriesRecord>,
         trades: &mut Vec<ClosedPosition>,
+        current_coins: &[String],
     ) -> Result<(), StrategyError> {
         let (event_ts, event_market, event_type) = match event {
             MarketEvent::Trade {
@@ -419,13 +738,15 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                     new_minute = %truncate_to_minute(event_ts),
                     "분 경계 변경 감지: 이전 분 완결 처리"
                 );
-                self.finalize_and_process(
+                Self::finalize_and_process(
+                    config,
                     candle_builder,
                     spread_calc,
                     position_mgr,
                     timeseries,
                     trades,
                     event_ts,
+                    current_coins,
                 )?;
             }
             candle_builder.start_new_minute(event_ts);
@@ -445,14 +766,16 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
     }
 
     /// 현재 분을 완결하고 시그널 평가를 수행합니다.
+    #[allow(clippy::too_many_arguments)]
     fn finalize_and_process(
-        &self,
+        config: &ZScoreConfig,
         candle_builder: &mut MinuteCandleBuilder,
         spread_calc: &mut SpreadCalculator,
         position_mgr: &mut PositionManager,
         timeseries: &mut Vec<TimeseriesRecord>,
         trades: &mut Vec<ClosedPosition>,
         new_minute_ts: DateTime<Utc>,
+        current_coins: &[String],
     ) -> Result<(), StrategyError> {
         let ts = candle_builder
             .current_minute
@@ -460,14 +783,13 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
 
         debug!(
             timestamp = %ts,
-            coins = ?self.config.coins,
+            coins = ?current_coins,
             "분 완결 시작: 시그널 평가 수행"
         );
 
-        let (upbit_closes, usdt_krw, bybit_closes) =
-            candle_builder.finalize_minute(&self.config.coins);
+        let (upbit_closes, usdt_krw, bybit_closes) = candle_builder.finalize_minute(current_coins);
 
-        for coin in &self.config.coins {
+        for coin in current_coins {
             let upbit_close = upbit_closes.get(coin).copied().flatten();
             let bybit_close = bybit_closes.get(coin).copied().flatten();
 
@@ -504,8 +826,8 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                     usdt_krw_val,
                     spread_pct,
                     f64::NAN,
-                    self.config.upbit_taker_fee,
-                    self.config.bybit_taker_fee,
+                    config.upbit_taker_fee,
+                    config.bybit_taker_fee,
                     true,
                 ) {
                     Ok(closed) => {
@@ -518,7 +840,7 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
             }
 
             // 시그널 평가
-            let sig = signal::evaluate_signal(coin, spread_calc, position_mgr, &self.config)?;
+            let sig = signal::evaluate_signal(coin, spread_calc, position_mgr, config)?;
 
             // 시계열 기록
             let spread_window = spread_calc.spread_window(coin);
@@ -527,7 +849,7 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                     let data = w.data();
                     let m = statistics::mean(data);
                     let s = statistics::stddev(data, m);
-                    let z = if s >= self.config.min_stddev_threshold {
+                    let z = if s >= config.min_stddev_threshold {
                         spread_calc
                             .last_spread_pct(coin)
                             .map(|sp| (sp - m) / s)
@@ -594,7 +916,7 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                     spread_pct,
                     expected_profit_pct,
                 }) => {
-                    let size_usdt = self.config.total_capital_usdt * self.config.position_ratio;
+                    let size_usdt = config.total_capital_usdt * config.position_ratio;
                     let upbit_usdt = spread_calc
                         .upbit_window(&c)
                         .and_then(|w| w.last())
@@ -611,9 +933,9 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
 
                     let liq_price = position::calculate_liquidation_price(
                         bybit_price_dec,
-                        self.config.leverage,
-                        self.config.bybit_mmr,
-                        self.config.bybit_taker_fee,
+                        config.leverage,
+                        config.bybit_mmr,
+                        config.bybit_taker_fee,
                     );
 
                     let pos = VirtualPosition {
@@ -688,8 +1010,8 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                         Decimal::try_from(usdt_krw_val).unwrap_or(Decimal::ZERO),
                         spread_pct,
                         z_score,
-                        self.config.upbit_taker_fee,
-                        self.config.bybit_taker_fee,
+                        config.upbit_taker_fee,
+                        config.bybit_taker_fee,
                         false,
                     ) {
                         Ok(closed) => {
@@ -717,6 +1039,7 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zscore::coin_selector::CoinCandidate;
 
     #[test]
     fn test_truncate_to_minute() {
@@ -788,5 +1111,155 @@ mod tests {
         assert!(builder.upbit_last_trade.is_empty());
         assert!(builder.usdt_krw_last_trade.is_none());
         assert!(builder.bybit_last_bid.is_empty());
+    }
+
+    // --- diff_coins 테스트 ---
+
+    #[test]
+    fn test_diff_coins_with_position() {
+        let mut pm = PositionManager::new();
+        // XRP에 포지션 오픈
+        pm.open_position(VirtualPosition {
+            coin: "XRP".to_string(),
+            entry_time: Utc::now(),
+            upbit_entry_price: Decimal::new(1, 0),
+            bybit_entry_price: Decimal::new(1, 0),
+            bybit_liquidation_price: Decimal::new(2, 0),
+            entry_usdt_krw: Decimal::new(1380, 0),
+            entry_spread_pct: 0.05,
+            entry_z_score: 2.5,
+            size_usdt: Decimal::new(1000, 0),
+        })
+        .unwrap();
+
+        let current = vec![
+            "BTC".to_string(),
+            "ETH".to_string(),
+            "XRP".to_string(),
+            "DOGE".to_string(),
+        ];
+        let new_candidates = vec![
+            CoinCandidate {
+                coin: "BTC".to_string(),
+                volume_1h_usdt: 1_000_000.0,
+                volatility_24h_pct: 5.0,
+            },
+            CoinCandidate {
+                coin: "ETH".to_string(),
+                volume_1h_usdt: 500_000.0,
+                volatility_24h_pct: 4.0,
+            },
+            CoinCandidate {
+                coin: "AVAX".to_string(),
+                volume_1h_usdt: 300_000.0,
+                volatility_24h_pct: 8.0,
+            },
+        ];
+
+        let diff = diff_coins(&current, &new_candidates, &pm);
+
+        // AVAX는 새로 추가
+        assert!(diff.to_add.contains(&"AVAX".to_string()));
+
+        // DOGE는 포지션 없으므로 제거
+        assert!(diff.to_remove.contains(&"DOGE".to_string()));
+
+        // XRP는 포지션 있으므로 유지
+        assert!(diff.to_keep_with_position.contains(&"XRP".to_string()));
+
+        // BTC, ETH는 양쪽 모두 있으므로 diff에 나타나지 않음
+        assert!(!diff.to_add.contains(&"BTC".to_string()));
+        assert!(!diff.to_add.contains(&"ETH".to_string()));
+        assert!(!diff.to_remove.contains(&"BTC".to_string()));
+        assert!(!diff.to_remove.contains(&"ETH".to_string()));
+    }
+
+    #[test]
+    fn test_diff_coins_without_position() {
+        let pm = PositionManager::new();
+
+        let current = vec!["BTC".to_string(), "ETH".to_string()];
+        let new_candidates = vec![CoinCandidate {
+            coin: "SOL".to_string(),
+            volume_1h_usdt: 500_000.0,
+            volatility_24h_pct: 6.0,
+        }];
+
+        let diff = diff_coins(&current, &new_candidates, &pm);
+
+        // SOL 추가
+        assert!(diff.to_add.contains(&"SOL".to_string()));
+        // BTC, ETH 포지션 없으므로 제거
+        assert!(diff.to_remove.contains(&"BTC".to_string()));
+        assert!(diff.to_remove.contains(&"ETH".to_string()));
+        // 포지션 보유 중인 코인 없음
+        assert!(diff.to_keep_with_position.is_empty());
+    }
+
+    #[test]
+    fn test_diff_coins_no_change() {
+        let pm = PositionManager::new();
+
+        let current = vec!["BTC".to_string(), "ETH".to_string()];
+        let new_candidates = vec![
+            CoinCandidate {
+                coin: "BTC".to_string(),
+                volume_1h_usdt: 1_000_000.0,
+                volatility_24h_pct: 5.0,
+            },
+            CoinCandidate {
+                coin: "ETH".to_string(),
+                volume_1h_usdt: 500_000.0,
+                volatility_24h_pct: 4.0,
+            },
+        ];
+
+        let diff = diff_coins(&current, &new_candidates, &pm);
+
+        // 변경 없음
+        assert!(diff.to_add.is_empty());
+        assert!(diff.to_remove.is_empty());
+        assert!(diff.to_keep_with_position.is_empty());
+    }
+
+    #[test]
+    fn test_diff_coins_empty_new_candidates() {
+        let pm = PositionManager::new();
+
+        let current = vec!["BTC".to_string(), "ETH".to_string()];
+        let new_candidates: Vec<CoinCandidate> = vec![];
+
+        let diff = diff_coins(&current, &new_candidates, &pm);
+
+        // 모든 코인이 제거 대상
+        assert!(diff.to_add.is_empty());
+        assert_eq!(diff.to_remove.len(), 2);
+        assert!(diff.to_keep_with_position.is_empty());
+    }
+
+    #[test]
+    fn test_diff_coins_empty_current() {
+        let pm = PositionManager::new();
+
+        let current: Vec<String> = vec![];
+        let new_candidates = vec![
+            CoinCandidate {
+                coin: "BTC".to_string(),
+                volume_1h_usdt: 1_000_000.0,
+                volatility_24h_pct: 5.0,
+            },
+            CoinCandidate {
+                coin: "ETH".to_string(),
+                volume_1h_usdt: 500_000.0,
+                volatility_24h_pct: 4.0,
+            },
+        ];
+
+        let diff = diff_coins(&current, &new_candidates, &pm);
+
+        // 모든 코인이 추가 대상
+        assert_eq!(diff.to_add.len(), 2);
+        assert!(diff.to_remove.is_empty());
+        assert!(diff.to_keep_with_position.is_empty());
     }
 }

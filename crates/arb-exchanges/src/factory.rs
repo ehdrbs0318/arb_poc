@@ -6,7 +6,8 @@
 use arb_config::{Config, ExchangeConfig};
 use arb_exchange::{
     Balance, Candle, CandleInterval, ExchangeAdapter, ExchangeError, ExchangeManager, ExchangeName,
-    ExchangeResult, MarketData, Order, OrderBook, OrderManagement, OrderRequest, Ticker,
+    ExchangeResult, MarketData, MarketStream, Order, OrderBook, OrderManagement, OrderRequest,
+    Ticker,
 };
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
@@ -70,6 +71,10 @@ impl ExchangeAdapter for UpbitAdapter {
         MarketData::get_ticker(&self.client, markets).await
     }
 
+    async fn get_all_tickers(&self) -> ExchangeResult<Vec<Ticker>> {
+        MarketData::get_all_tickers(&self.client).await
+    }
+
     async fn get_orderbook(&self, market: &str, depth: Option<u32>) -> ExchangeResult<OrderBook> {
         MarketData::get_orderbook(&self.client, market, depth).await
     }
@@ -91,6 +96,14 @@ impl ExchangeAdapter for UpbitAdapter {
         before: DateTime<Utc>,
     ) -> ExchangeResult<Vec<Candle>> {
         MarketData::get_candles_before(&self.client, market, interval, count, before).await
+    }
+
+    async fn subscribe_markets(&self, markets: &[&str]) -> ExchangeResult<()> {
+        MarketStream::subscribe_markets(&self.client, markets).await
+    }
+
+    async fn unsubscribe_markets(&self, markets: &[&str]) -> ExchangeResult<()> {
+        MarketStream::unsubscribe_markets(&self.client, markets).await
     }
 
     async fn place_order(&self, request: &OrderRequest) -> ExchangeResult<Order> {
@@ -170,6 +183,10 @@ impl ExchangeAdapter for BithumbAdapter {
 
     async fn get_ticker(&self, markets: &[&str]) -> ExchangeResult<Vec<Ticker>> {
         MarketData::get_ticker(&self.client, markets).await
+    }
+
+    async fn get_all_tickers(&self) -> ExchangeResult<Vec<Ticker>> {
+        MarketData::get_all_tickers(&self.client).await
     }
 
     async fn get_orderbook(&self, market: &str, depth: Option<u32>) -> ExchangeResult<OrderBook> {
@@ -297,6 +314,10 @@ impl ExchangeAdapter for BybitAdapter {
         MarketData::get_ticker(&self.client, markets).await
     }
 
+    async fn get_all_tickers(&self) -> ExchangeResult<Vec<Ticker>> {
+        MarketData::get_all_tickers(&self.client).await
+    }
+
     async fn get_orderbook(&self, market: &str, depth: Option<u32>) -> ExchangeResult<OrderBook> {
         MarketData::get_orderbook(&self.client, market, depth).await
     }
@@ -318,6 +339,14 @@ impl ExchangeAdapter for BybitAdapter {
         before: DateTime<Utc>,
     ) -> ExchangeResult<Vec<Candle>> {
         MarketData::get_candles_before(&self.client, market, interval, count, before).await
+    }
+
+    async fn subscribe_markets(&self, markets: &[&str]) -> ExchangeResult<()> {
+        MarketStream::subscribe_markets(&self.client, markets).await
+    }
+
+    async fn unsubscribe_markets(&self, markets: &[&str]) -> ExchangeResult<()> {
+        MarketStream::unsubscribe_markets(&self.client, markets).await
     }
 
     async fn place_order(&self, request: &OrderRequest) -> ExchangeResult<Order> {

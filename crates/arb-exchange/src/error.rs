@@ -55,6 +55,10 @@ pub enum ExchangeError {
     #[error("Internal error: {0}")]
     InternalError(String),
 
+    /// 지원하지 않는 작업.
+    #[error("Operation not supported: {0}")]
+    Unsupported(String),
+
     /// 거래소의 알 수 없는 에러.
     #[error("Unknown error: {code} - {message}")]
     UnknownError { code: String, message: String },
@@ -90,6 +94,15 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Unknown error: E001 - Something went wrong"
+        );
+    }
+
+    #[test]
+    fn test_unsupported_error_display() {
+        let err = ExchangeError::Unsupported("subscribe_markets not implemented".to_string());
+        assert_eq!(
+            err.to_string(),
+            "Operation not supported: subscribe_markets not implemented"
         );
     }
 }

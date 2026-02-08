@@ -2,7 +2,7 @@
 //!
 //! WebSocket 기반 실시간 데이터를 위한 추상화 계층입니다.
 
-use crate::error::ExchangeResult;
+use crate::error::{ExchangeError, ExchangeResult};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -62,6 +62,15 @@ impl Default for StreamConfig {
     }
 }
 
+/// WebSocket 루프에 전달하는 명령.
+#[derive(Debug, Clone)]
+pub enum StreamCommand {
+    /// 마켓 추가 (Upbit: 전체 재구독, Bybit: 개별 subscribe).
+    Subscribe(Vec<String>),
+    /// 마켓 제거 (Upbit: 전체 재구독, Bybit: 개별 unsubscribe).
+    Unsubscribe(Vec<String>),
+}
+
 /// 실시간 마켓 데이터 스트림 trait.
 ///
 /// WebSocket 기반 실시간 데이터 구독을 위한 인터페이스입니다.
@@ -85,6 +94,26 @@ pub trait MarketStream: Send + Sync {
 
     /// 모든 구독을 종료합니다.
     async fn unsubscribe(&self) -> ExchangeResult<()>;
+
+    /// 기존 연결을 유지하면서 마켓을 추가 구독합니다.
+    ///
+    /// 기본 구현은 `Unsupported` 에러를 반환합니다.
+    /// 거래소별 구현체에서 필요에 따라 오버라이드하세요.
+    async fn subscribe_markets(&self, _markets: &[&str]) -> ExchangeResult<()> {
+        Err(ExchangeError::Unsupported(
+            "subscribe_markets not implemented".into(),
+        ))
+    }
+
+    /// 기존 연결을 유지하면서 마켓 구독을 해제합니다.
+    ///
+    /// 기본 구현은 `Unsupported` 에러를 반환합니다.
+    /// 거래소별 구현체에서 필요에 따라 오버라이드하세요.
+    async fn unsubscribe_markets(&self, _markets: &[&str]) -> ExchangeResult<()> {
+        Err(ExchangeError::Unsupported(
+            "unsubscribe_markets not implemented".into(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -242,6 +271,52 @@ mod tests {
                 assert_eq!(t, now);
             }
             _ => panic!("Expected BestQuote variant"),
+        }
+    }
+
+    #[test]
+    fn test_stream_command_subscribe_debug() {
+        let cmd = StreamCommand::Subscribe(vec!["KRW-BTC".to_string(), "KRW-ETH".to_string()]);
+        let debug_str = format!("{:?}", cmd);
+        assert!(debug_str.contains("Subscribe"));
+        assert!(debug_str.contains("KRW-BTC"));
+    }
+
+    #[test]
+    fn test_stream_command_unsubscribe_debug() {
+        let cmd = StreamCommand::Unsubscribe(vec!["BTCUSDT".to_string()]);
+        let debug_str = format!("{:?}", cmd);
+        assert!(debug_str.contains("Unsubscribe"));
+        assert!(debug_str.contains("BTCUSDT"));
+    }
+
+    #[test]
+    fn test_stream_command_clone() {
+        let cmd = StreamCommand::Subscribe(vec!["KRW-BTC".to_string()]);
+        let cloned = cmd.clone();
+        match (&cmd, &cloned) {
+            (StreamCommand::Subscribe(a), StreamCommand::Subscribe(b)) => {
+                assert_eq!(a, b);
+            }
+            _ => panic!("Clone should produce the same variant"),
+        }
+    }
+
+    #[test]
+    fn test_stream_command_subscribe_empty() {
+        let cmd = StreamCommand::Subscribe(vec![]);
+        match cmd {
+            StreamCommand::Subscribe(markets) => assert!(markets.is_empty()),
+            _ => panic!("Expected Subscribe variant"),
+        }
+    }
+
+    #[test]
+    fn test_stream_command_unsubscribe_multiple() {
+        let cmd = StreamCommand::Unsubscribe(vec!["KRW-BTC".to_string(), "KRW-ETH".to_string()]);
+        match cmd {
+            StreamCommand::Unsubscribe(markets) => assert_eq!(markets.len(), 2),
+            _ => panic!("Expected Unsubscribe variant"),
         }
     }
 }
