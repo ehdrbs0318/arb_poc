@@ -18,6 +18,8 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use tracing::debug;
 
+use crate::common::fee::roundtrip_fee_pct;
+
 /// 슬리피지 계산 결과.
 #[derive(Debug, Clone)]
 pub struct SlippageResult {
@@ -34,9 +36,9 @@ pub struct SlippageResult {
 /// # 인자
 ///
 /// - `order_usdt`: 주문 크기 (USDT, 단일 leg)
-/// - `candle_volume`: 캔들 거래량 (Upbit: 코인 수량, Bybit: USDT 금액)
+/// - `candle_volume`: 캔들 거래량 (코인 수량 또는 USDT, `is_coin_volume` 참조)
 /// - `close_price`: 캔들 종가
-/// - `is_coin_volume`: true면 볼륨 단위가 코인 수량 (Upbit), false면 USDT (Bybit)
+/// - `is_coin_volume`: true면 볼륨 단위가 코인 수량 (Upbit/Bybit 모두 해당), false면 USDT
 /// - `is_buy`: true면 매수 (가격 불리: 상승), false면 매도 (가격 불리: 하락)
 /// - `max_participation_rate`: 최대 참여율 한도 (초과 시 None)
 /// - `base_bps`: 기본 슬리피지 (bps)
@@ -112,6 +114,49 @@ pub fn calculate_slippage(
         slippage_bps,
         adjusted_price,
     })
+}
+
+/// 슬리피지 포함 라운드트립 수익성을 검증합니다.
+///
+/// 진입 슬리피지가 적용된 가격과 추정 청산 슬리피지를 포함하여
+/// 기대 수익이 양수인지 판단합니다.
+///
+/// # 반환
+///
+/// `(수익성 여부, 조정된 기대 수익률 %)`
+#[allow(clippy::too_many_arguments)]
+pub fn is_entry_profitable(
+    adjusted_upbit_price: Decimal,
+    adjusted_bybit_price: Decimal,
+    mean_spread_pct: f64,
+    upbit_entry_slippage_bps: f64,
+    bybit_entry_slippage_bps: f64,
+    upbit_taker_fee: Decimal,
+    bybit_taker_fee: Decimal,
+) -> (bool, f64) {
+    let adj_upbit = adjusted_upbit_price.to_f64().unwrap_or(0.0);
+    let adj_bybit = adjusted_bybit_price.to_f64().unwrap_or(0.0);
+
+    // 슬리피지 적용 후 실제 진입 스프레드
+    let adjusted_entry_spread = if adj_upbit > 0.0 {
+        (adj_bybit - adj_upbit) / adj_upbit * 100.0
+    } else {
+        0.0
+    };
+
+    // 라운드트립 수수료 (%)
+    let fee_pct = roundtrip_fee_pct(upbit_taker_fee, bybit_taker_fee)
+        .to_f64()
+        .unwrap_or(0.0);
+
+    // 청산 슬리피지 추정 (동일 볼륨 가정, bps → %)
+    let exit_slippage_cost_pct = (upbit_entry_slippage_bps + bybit_entry_slippage_bps) / 100.0;
+
+    // 조정된 기대 수익
+    let adjusted_profit =
+        (adjusted_entry_spread - mean_spread_pct) - fee_pct - exit_slippage_cost_pct;
+
+    (adjusted_profit > 0.0, adjusted_profit)
 }
 
 #[cfg(test)]
@@ -288,5 +333,102 @@ mod tests {
         let r = result.unwrap();
         assert_eq!(r.slippage_bps, 0.0);
         assert_eq!(r.adjusted_price, Decimal::new(50000, 0));
+    }
+
+    // --- is_entry_profitable 테스트 ---
+
+    #[test]
+    fn test_is_entry_profitable_no_slippage() {
+        // Upbit 100000, Bybit 100300 → 스프레드 0.3%, mean=0, slippage=0, fee=0.21%
+        // profit = 0.3 - 0 - 0.21 - 0 = 0.09
+        let upbit_fee = Decimal::new(5, 4); // 0.0005
+        let bybit_fee = Decimal::new(55, 5); // 0.00055
+        let (profitable, profit) = is_entry_profitable(
+            Decimal::new(100_000, 0),
+            Decimal::new(100_300, 0),
+            0.0,
+            0.0,
+            0.0,
+            upbit_fee,
+            bybit_fee,
+        );
+        assert!(profitable);
+        assert!((profit - 0.09).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_is_entry_profitable_with_moderate_slippage() {
+        // 스프레드 충분히 넓음 (0.5%), slippage_bps=1.5/1.5 → exit slippage=0.03%
+        // profit = 0.5 - 0.0 - 0.21 - 0.03 = 0.26
+        let upbit_fee = Decimal::new(5, 4);
+        let bybit_fee = Decimal::new(55, 5);
+        let (profitable, profit) = is_entry_profitable(
+            Decimal::new(100_000, 0),
+            Decimal::new(100_500, 0),
+            0.0,
+            1.5,
+            1.5,
+            upbit_fee,
+            bybit_fee,
+        );
+        assert!(profitable);
+        assert!(profit > 0.2);
+    }
+
+    #[test]
+    fn test_is_entry_profitable_rejected_by_slippage() {
+        // 스프레드 좁음 (0.25%), mean=0, slippage_bps=10/10 → exit slippage=0.2%
+        // profit = 0.25 - 0 - 0.21 - 0.2 = -0.16
+        let upbit_fee = Decimal::new(5, 4);
+        let bybit_fee = Decimal::new(55, 5);
+        let (profitable, profit) = is_entry_profitable(
+            Decimal::new(100_000, 0),
+            Decimal::new(100_250, 0),
+            0.0,
+            10.0,
+            10.0,
+            upbit_fee,
+            bybit_fee,
+        );
+        assert!(!profitable);
+        assert!(profit < 0.0);
+    }
+
+    #[test]
+    fn test_is_entry_profitable_borderline() {
+        // 경계값: profit ≈ 0에 가깝지만 ≤ 0 → 거부
+        // 스프레드 0.21%, mean=0, slippage=0 → profit = 0.21 - 0 - 0.21 - 0 = 0.0
+        let upbit_fee = Decimal::new(5, 4);
+        let bybit_fee = Decimal::new(55, 5);
+        let (profitable, profit) = is_entry_profitable(
+            Decimal::new(100_000, 0),
+            Decimal::new(100_210, 0),
+            0.0,
+            0.0,
+            0.0,
+            upbit_fee,
+            bybit_fee,
+        );
+        assert!(!profitable);
+        assert!(profit <= 0.001); // 부동소수점 오차 허용
+    }
+
+    #[test]
+    fn test_is_entry_profitable_negative_mean() {
+        // mean=-0.1 (역김프), 스프레드 0.3% → 마진 넓어짐
+        // profit = 0.3 - (-0.1) - 0.21 - 0 = 0.19
+        let upbit_fee = Decimal::new(5, 4);
+        let bybit_fee = Decimal::new(55, 5);
+        let (profitable, profit) = is_entry_profitable(
+            Decimal::new(100_000, 0),
+            Decimal::new(100_300, 0),
+            -0.1,
+            0.0,
+            0.0,
+            upbit_fee,
+            bybit_fee,
+        );
+        assert!(profitable);
+        assert!((profit - 0.19).abs() < 0.01);
     }
 }

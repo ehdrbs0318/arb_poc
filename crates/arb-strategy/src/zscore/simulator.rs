@@ -503,6 +503,9 @@ pub fn simulate_with_cache(
 
                     // 볼륨/슬리피지 적용
                     if config.volume_filter_enabled {
+                        let mut upbit_slippage_bps = 0.0_f64;
+                        let mut bybit_slippage_bps = 0.0_f64;
+
                         let upbit_vol = cache
                             .upbit_coin_candles
                             .get(&c)
@@ -532,6 +535,7 @@ pub fn simulate_with_cache(
                                         slippage_bps = r.slippage_bps,
                                         "진입 슬리피지 적용"
                                     );
+                                    upbit_slippage_bps = r.slippage_bps;
                                     upbit_price = r.adjusted_price;
                                 }
                                 None => {
@@ -565,6 +569,7 @@ pub fn simulate_with_cache(
                                         slippage_bps = r.slippage_bps,
                                         "진입 슬리피지 적용"
                                     );
+                                    bybit_slippage_bps = r.slippage_bps;
                                     bybit_price_dec = r.adjusted_price;
                                 }
                                 None => {
@@ -577,6 +582,35 @@ pub fn simulate_with_cache(
                                 }
                             }
                         }
+
+                        // 슬리피지 포함 수익성 재검증
+                        let (profitable, adj_profit) = slippage::is_entry_profitable(
+                            upbit_price,
+                            bybit_price_dec,
+                            mean_pct,
+                            upbit_slippage_bps,
+                            bybit_slippage_bps,
+                            config.upbit_taker_fee,
+                            config.bybit_taker_fee,
+                        );
+
+                        if !profitable {
+                            debug!(
+                                coin = c.as_str(),
+                                adjusted_profit_pct = adj_profit,
+                                original_expected_profit = expected_profit_pct,
+                                upbit_slippage_bps,
+                                bybit_slippage_bps,
+                                "진입 거부: 슬리피지 포함 시 수익성 부족"
+                            );
+                            continue;
+                        }
+
+                        debug!(
+                            coin = c.as_str(),
+                            adjusted_profit_pct = adj_profit,
+                            "슬리피지 포함 수익성 확인됨"
+                        );
                     }
 
                     let liq_price = position::calculate_liquidation_price(
@@ -675,7 +709,7 @@ pub fn simulate_with_cache(
                                 exit_bybit,
                                 true, // Bybit: 코인 수량 (volume=base coin, turnover=USDT)
                                 true, // 매수 (short close)
-                                1.0,   // 청산은 참여율 무시
+                                1.0,  // 청산은 참여율 무시
                                 config.slippage_base_bps,
                                 config.slippage_impact_coeff,
                             )

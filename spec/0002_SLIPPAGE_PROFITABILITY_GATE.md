@@ -224,6 +224,7 @@ if config.volume_filter_enabled {
 | `test_is_entry_profitable_with_moderate_slippage` | slippage_bps=1.5 each, 스프레드 충분 | profitable=true |
 | `test_is_entry_profitable_rejected_by_slippage` | slippage_bps=10 each, 스프레드 좁음 | profitable=false |
 | `test_is_entry_profitable_borderline` | 수익=0에 가까운 경계값 | profitable=false (0 이하) |
+| `test_is_entry_profitable_negative_mean` | mean < 0 (역김프), 스프레드 양수 | profitable=true (더 넓은 마진) |
 
 ---
 
@@ -248,26 +249,29 @@ if config.volume_filter_enabled {
 ## 체크리스트
 
 ### Phase 1: 수익성 검증 헬퍼
-- [ ] `slippage.rs`에 `is_entry_profitable()` 함수 추가
-- [ ] `fee.rs`의 `roundtrip_fee_pct()` 임포트 확인
+- [x] `slippage.rs`에 `is_entry_profitable()` 함수 추가
+- [x] `#[allow(clippy::too_many_arguments)]` 어트리뷰트 추가 (7개 인자)
+- [x] `fee.rs`의 `roundtrip_fee_pct()` 임포트 (`use crate::common::fee::roundtrip_fee_pct;`)
+- [x] `is_coin_volume` docstring 수정 (Bybit도 코인 수량임을 명시)
 
 ### Phase 2: simulator.rs 수정
-- [ ] Enter 핸들러에 `upbit_slippage_bps`, `bybit_slippage_bps` 변수 추가
-- [ ] 기존 슬리피지 적용 블록에서 bps 캡처 추가
-- [ ] 수익성 재검증 블록 추가 (`is_entry_profitable()` 호출)
-- [ ] 거부 시 `continue` + 디버그 로그
+- [x] bps 캡처 변수를 `if config.volume_filter_enabled` 블록 **안**에 선언 (`unused_mut` 방지)
+- [x] 기존 슬리피지 적용 블록에서 bps 캡처 추가
+- [x] 수익성 재검증: 기존 `mean_pct` 변수 재사용 (중복 계산 방지)
+- [x] 거부 시 `continue` + 디버그 로그
 
 ### Phase 3: 테스트
-- [ ] `test_is_entry_profitable_no_slippage`
-- [ ] `test_is_entry_profitable_with_moderate_slippage`
-- [ ] `test_is_entry_profitable_rejected_by_slippage`
-- [ ] `test_is_entry_profitable_borderline`
+- [x] `test_is_entry_profitable_no_slippage`
+- [x] `test_is_entry_profitable_with_moderate_slippage`
+- [x] `test_is_entry_profitable_rejected_by_slippage`
+- [x] `test_is_entry_profitable_borderline`
+- [x] `test_is_entry_profitable_negative_mean`
 
 ### Phase 4: 검증
-- [ ] `cargo test -p arb-strategy` — 기존 108 + 신규 4 통과
-- [ ] `cargo clippy -p arb-strategy` — 경고 0
-- [ ] sweep 비교 실행 (volume_filter OFF vs ON)
-- [ ] 디버그 로그 확인
+- [x] `cargo test -p arb-strategy` — 113 통과 (기존 108 + 신규 5)
+- [x] `cargo clippy -p arb-strategy` — 경고 0
+- [x] sweep 비교 실행 (volume_filter OFF vs ON)
+- [x] 디버그 로그 확인
 
 ---
 
@@ -276,3 +280,27 @@ if config.volume_filter_enabled {
 - **청산 슬리피지 추정**: 진입 시점의 슬리피지를 청산 슬리피지로 가정한다. 실제 청산 시 볼륨이 다를 수 있어 추정과 괴리가 발생할 수 있다.
 - **라이브 미적용**: `monitor.rs` 라이브 경로는 캔들 볼륨 데이터가 없어 슬리피지 게이트를 적용하지 않는다. 향후 `MinuteCandleBuilder`에 볼륨 집계를 추가하면 동일 패턴으로 확장 가능하다.
 - **보수적 필터링**: 슬리피지를 포함하면 진입 기회가 줄어든다. 이는 의도된 동작이며, 줄어든 거래 중 실제 수익 거래의 비율이 높아져야 한다.
+- **filter ratio 모니터링**: 게이트 차단 비율이 90% 이상이면 전략 자체의 수익성을 재검토해야 한다.
+
+---
+
+## 리뷰 이력
+
+### Rev 1 (2026-02-08) — spec-0002-review 팀 리뷰 반영
+
+**Trader 리뷰 반영:**
+- [확인] 수익성 공식 수학적 정확성 — bps→% 변환, 이중 차감 없음 확인
+- [확인] 4이벤트 슬리피지 방향 모두 올바름
+- [확인] 청산 슬리피지 추정은 모델 정밀도에 부합하는 합리적 근사치
+- [반영] filter ratio 모니터링 권고 → 알려진 한계에 추가
+- [반영] `is_coin_volume` docstring 불일치 수정 → 체크리스트에 추가
+- [참고] 6-B 게이트 카운터, 6-C exit_slippage_multiplier → 향후 과제
+
+**Coder 리뷰 반영:**
+- [반영] `#[allow(clippy::too_many_arguments)]` 필수 → 체크리스트에 추가
+- [반영] `mean_pct` 재사용 (중복 계산 방지) → Phase 2 수정
+- [반영] bps 변수를 `volume_filter_enabled` 블록 안으로 이동 (`unused_mut` 방지) → Phase 2 수정
+- [반영] 음수 mean 테스트 케이스 추가 → Phase 3에 추가 (5개 테스트)
+- [확인] import 경로 `crate::common::fee::roundtrip_fee_pct` 문제없음
+- [확인] signal.rs 불변 결정 아키텍처적으로 올바름
+- [확인] 기존 108개 테스트 완전 호환
