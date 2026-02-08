@@ -329,13 +329,22 @@ mod tests {
 
     #[test]
     fn test_exchange_name_from_str() {
-        assert_eq!("upbit".parse::<ExchangeName>().ok(), Some(ExchangeName::Upbit));
-        assert_eq!("UPBIT".parse::<ExchangeName>().ok(), Some(ExchangeName::Upbit));
+        assert_eq!(
+            "upbit".parse::<ExchangeName>().ok(),
+            Some(ExchangeName::Upbit)
+        );
+        assert_eq!(
+            "UPBIT".parse::<ExchangeName>().ok(),
+            Some(ExchangeName::Upbit)
+        );
         assert_eq!(
             "bithumb".parse::<ExchangeName>().ok(),
             Some(ExchangeName::Bithumb)
         );
-        assert_eq!("bybit".parse::<ExchangeName>().ok(), Some(ExchangeName::Bybit));
+        assert_eq!(
+            "bybit".parse::<ExchangeName>().ok(),
+            Some(ExchangeName::Bybit)
+        );
         assert!("unknown".parse::<ExchangeName>().is_err());
     }
 
@@ -348,8 +357,14 @@ mod tests {
 
     #[test]
     fn test_to_internal_format_upbit() {
-        assert_eq!(to_internal_format(ExchangeName::Upbit, "KRW-BTC"), "KRW-BTC");
-        assert_eq!(to_internal_format(ExchangeName::Upbit, "krw-btc"), "KRW-BTC");
+        assert_eq!(
+            to_internal_format(ExchangeName::Upbit, "KRW-BTC"),
+            "KRW-BTC"
+        );
+        assert_eq!(
+            to_internal_format(ExchangeName::Upbit, "krw-btc"),
+            "KRW-BTC"
+        );
     }
 
     #[test]
@@ -370,10 +385,7 @@ mod tests {
             to_internal_format(ExchangeName::Bybit, "ETHUSDC"),
             "USDC-ETH"
         );
-        assert_eq!(
-            to_internal_format(ExchangeName::Bybit, "ETHBTC"),
-            "BTC-ETH"
-        );
+        assert_eq!(to_internal_format(ExchangeName::Bybit, "ETHBTC"), "BTC-ETH");
     }
 
     #[test]

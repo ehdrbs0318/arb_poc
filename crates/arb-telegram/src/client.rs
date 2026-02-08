@@ -182,12 +182,12 @@ impl TelegramClient {
             serde_json::from_str(&body).map_err(TelegramError::JsonError)?;
 
         if telegram_response.ok {
-            let message = telegram_response.result.ok_or_else(|| {
-                TelegramError::ApiError {
+            let message = telegram_response
+                .result
+                .ok_or_else(|| TelegramError::ApiError {
                     error_code: 0,
                     description: "No result in response".to_string(),
-                }
-            })?;
+                })?;
 
             debug!(
                 message_id = message.message_id,
@@ -196,7 +196,9 @@ impl TelegramClient {
 
             Ok(message)
         } else {
-            let error_code = telegram_response.error_code.unwrap_or(status.as_u16() as i32);
+            let error_code = telegram_response
+                .error_code
+                .unwrap_or(status.as_u16() as i32);
             let description = telegram_response
                 .description
                 .unwrap_or_else(|| "Unknown error".to_string());
@@ -208,10 +210,7 @@ impl TelegramClient {
                     .and_then(|p| p.retry_after)
                     .unwrap_or(30);
 
-                warn!(
-                    retry_after = retry_after,
-                    "Telegram rate limit exceeded"
-                );
+                warn!(retry_after = retry_after, "Telegram rate limit exceeded");
 
                 return Err(TelegramError::RateLimited { retry_after });
             }

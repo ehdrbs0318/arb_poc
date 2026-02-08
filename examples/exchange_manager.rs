@@ -9,9 +9,9 @@
 //! 실행 방법: `cargo run --example exchange_manager`
 
 use arb_poc::config::Config;
-use arb_poc::exchange::{ExchangeManager, ExchangeName, MarketCodeBuilder};
 use arb_poc::exchange::market::convert_market_code;
-use arb_poc::exchanges::{create_exchange, ExchangeManagerExt};
+use arb_poc::exchange::{ExchangeManager, ExchangeName, MarketCodeBuilder};
+use arb_poc::exchanges::{ExchangeManagerExt, create_exchange};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

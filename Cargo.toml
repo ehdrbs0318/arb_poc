@@ -6,6 +6,7 @@ members = [
     "crates/arb-telegram",
     "crates/arb-exchange",
     "crates/arb-exchanges",
+    "crates/arb-strategy",
 ]
 
 [package]
@@ -20,6 +21,7 @@ arb-logging = { path = "crates/arb-logging" }
 arb-telegram = { path = "crates/arb-telegram" }
 arb-exchange = { path = "crates/arb-exchange" }
 arb-exchanges = { path = "crates/arb-exchanges" }
+arb-strategy = { path = "crates/arb-strategy" }
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
@@ -30,6 +32,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
 
 # Decimal precision for financial calculations
 rust_decimal = { version = "1.36", features = ["serde"] }
+
+# Cancellation token for graceful shutdown
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]
 # Testing
@@ -93,6 +98,12 @@ chrono = { version = "0.4", features = ["serde"] }
 # Hex encoding
 hex = "0.4"
 
+# CSV parsing
+csv = "1.3"
+
+# TOML parsing
+toml = "0.8"
+
 [[example]]
 name = "upbit_public"
 path = "examples/upbit_public.rs"
@@ -124,3 +135,11 @@ path = "examples/exchange_manager.rs"
 [[example]]
 name = "telegram"
 path = "examples/telegram.rs"
+
+[[example]]
+name = "zscore_backtest"
+path = "examples/zscore_backtest.rs"
+
+[[example]]
+name = "zscore_monitor"
+path = "examples/zscore_monitor.rs"

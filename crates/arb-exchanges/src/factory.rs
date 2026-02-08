@@ -5,10 +5,12 @@
 
 use arb_config::{Config, ExchangeConfig};
 use arb_exchange::{
-    Balance, Candle, CandleInterval, ExchangeAdapter, ExchangeError, ExchangeManager,
+    Balance, Candle, CandleInterval, ExchangeAdapter, ExchangeError, ExchangeManager, ExchangeName,
     ExchangeResult, MarketData, Order, OrderBook, OrderManagement, OrderRequest, Ticker,
 };
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
+use tracing::{debug, info, warn};
 
 use crate::{BithumbClient, BybitClient, UpbitClient};
 
@@ -79,6 +81,16 @@ impl ExchangeAdapter for UpbitAdapter {
         count: u32,
     ) -> ExchangeResult<Vec<Candle>> {
         MarketData::get_candles(&self.client, market, interval, count).await
+    }
+
+    async fn get_candles_before(
+        &self,
+        market: &str,
+        interval: CandleInterval,
+        count: u32,
+        before: DateTime<Utc>,
+    ) -> ExchangeResult<Vec<Candle>> {
+        MarketData::get_candles_before(&self.client, market, interval, count, before).await
     }
 
     async fn place_order(&self, request: &OrderRequest) -> ExchangeResult<Order> {
@@ -171,6 +183,16 @@ impl ExchangeAdapter for BithumbAdapter {
         count: u32,
     ) -> ExchangeResult<Vec<Candle>> {
         MarketData::get_candles(&self.client, market, interval, count).await
+    }
+
+    async fn get_candles_before(
+        &self,
+        market: &str,
+        interval: CandleInterval,
+        count: u32,
+        before: DateTime<Utc>,
+    ) -> ExchangeResult<Vec<Candle>> {
+        MarketData::get_candles_before(&self.client, market, interval, count, before).await
     }
 
     async fn place_order(&self, request: &OrderRequest) -> ExchangeResult<Order> {
@@ -288,6 +310,16 @@ impl ExchangeAdapter for BybitAdapter {
         MarketData::get_candles(&self.client, market, interval, count).await
     }
 
+    async fn get_candles_before(
+        &self,
+        market: &str,
+        interval: CandleInterval,
+        count: u32,
+        before: DateTime<Utc>,
+    ) -> ExchangeResult<Vec<Candle>> {
+        MarketData::get_candles_before(&self.client, market, interval, count, before).await
+    }
+
     async fn place_order(&self, request: &OrderRequest) -> ExchangeResult<Order> {
         OrderManagement::place_order(&self.client, request).await
     }
@@ -315,63 +347,6 @@ impl ExchangeAdapter for BybitAdapter {
 
 // ==================== 팩토리 함수 ====================
 
-/// 지원되는 거래소 이름.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ExchangeName {
-    /// Upbit (한국 거래소).
-    Upbit,
-    /// Bithumb (한국 거래소).
-    Bithumb,
-    /// Bybit (글로벌 거래소).
-    Bybit,
-}
-
-impl ExchangeName {
-    /// 거래소 이름의 문자열 표현을 반환합니다.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Upbit => "upbit",
-            Self::Bithumb => "bithumb",
-            Self::Bybit => "bybit",
-        }
-    }
-
-    /// 지원되는 모든 거래소 이름을 반환합니다.
-    pub fn all() -> &'static [Self] {
-        &[Self::Upbit, Self::Bithumb, Self::Bybit]
-    }
-
-    /// 문자열에서 거래소 이름을 파싱합니다 (편의 메서드).
-    ///
-    /// `FromStr::from_str`의 편의 래퍼로 `Option<Self>`를 반환합니다.
-    pub fn parse(s: &str) -> Option<Self> {
-        s.parse().ok()
-    }
-}
-
-impl std::str::FromStr for ExchangeName {
-    type Err = ExchangeError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "upbit" => Ok(Self::Upbit),
-            "bithumb" => Ok(Self::Bithumb),
-            "bybit" => Ok(Self::Bybit),
-            _ => Err(ExchangeError::ConfigError(format!(
-                "Unknown exchange: {}. Supported exchanges: {:?}",
-                s,
-                Self::all()
-            ))),
-        }
-    }
-}
-
-impl std::fmt::Display for ExchangeName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
 /// 이름으로 거래소 어댑터를 생성합니다.
 ///
 /// # 인자
@@ -393,7 +368,17 @@ pub fn create_exchange(
     name: &str,
     config: Option<&ExchangeConfig>,
 ) -> ExchangeResult<Arc<dyn ExchangeAdapter>> {
-    let exchange_name: ExchangeName = name.parse()?;
+    let exchange_name: ExchangeName = name.parse().map_err(|e: String| {
+        warn!(name = name, error = %e, "거래소 이름 파싱 실패");
+        ExchangeError::ConfigError(e)
+    })?;
+
+    let has_credentials = config.is_some_and(|c| c.has_credentials());
+    debug!(
+        exchange = name,
+        authenticated = has_credentials,
+        "거래소 인스턴스 생성 시작"
+    );
 
     let adapter: Arc<dyn ExchangeAdapter> = match exchange_name {
         ExchangeName::Upbit => {
@@ -419,6 +404,12 @@ pub fn create_exchange(
         }
     };
 
+    info!(
+        exchange = adapter.name(),
+        authenticated = adapter.is_authenticated(),
+        "거래소 인스턴스 생성 완료"
+    );
+
     Ok(adapter)
 }
 
@@ -429,7 +420,9 @@ pub fn create_exchange_boxed(
     name: &str,
     config: Option<&ExchangeConfig>,
 ) -> ExchangeResult<Box<dyn ExchangeAdapter>> {
-    let exchange_name: ExchangeName = name.parse()?;
+    let exchange_name: ExchangeName = name
+        .parse()
+        .map_err(|e: String| ExchangeError::ConfigError(e))?;
 
     let adapter: Box<dyn ExchangeAdapter> = match exchange_name {
         ExchangeName::Upbit => {
@@ -488,6 +481,7 @@ impl ExchangeManagerExt for ExchangeManager {
     ) -> ExchangeResult<()> {
         let adapter = create_exchange(name, config)?;
         self.register_arc(name, adapter);
+        debug!(exchange = name, "설정에서 거래소 등록 완료");
         Ok(())
     }
 
@@ -500,6 +494,8 @@ impl ExchangeManagerExt for ExchangeManager {
 
         // Bybit 등록
         self.register_from_config("bybit", Some(&config.bybit))?;
+
+        info!(count = self.len(), "모든 거래소 등록 완료");
 
         Ok(())
     }

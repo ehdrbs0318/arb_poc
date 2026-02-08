@@ -4,7 +4,7 @@
 //! Bithumb은 비공개 API 요청에 SHA512 쿼리 해시와 함께 JWT (HS256)를 사용합니다.
 
 use arb_exchange::ExchangeError;
-use jsonwebtoken::{encode, EncodingKey, Header};
+use jsonwebtoken::{EncodingKey, Header, encode};
 use serde::Serialize;
 use sha2::{Digest, Sha512};
 use uuid::Uuid;

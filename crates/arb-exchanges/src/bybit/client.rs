@@ -2,20 +2,23 @@
 //!
 //! 이 모듈은 Bybit V5 API와 상호작용하기 위한 메인 클라이언트를 제공합니다.
 
-use arb_exchange::{
-    Balance, Candle, CandleInterval, ExchangeError, ExchangeResult, MarketData, Order, OrderBook,
-    OrderBookLevel, OrderManagement, OrderRequest, OrderSide, OrderStatus, OrderType, PriceChange,
-    Ticker, TimeInForce,
-};
-use crate::bybit::auth::{build_query_string, AuthHeaders, BybitCredentials};
+use crate::bybit::auth::{AuthHeaders, BybitCredentials, build_query_string};
+use crate::bybit::stream::BybitStreamInner;
 use crate::bybit::types::{
     BybitCancelOrderRequest, BybitCancelOrderResult, BybitCreateOrderResult, BybitKlineList,
     BybitOrder, BybitOrderList, BybitOrderRequest, BybitOrderbookResult, BybitResponse,
     BybitTickerList, BybitWalletBalanceResult,
 };
-use chrono::{TimeZone, Utc};
+use arb_exchange::{
+    Balance, Candle, CandleInterval, ExchangeError, ExchangeResult, MarketData, Order, OrderBook,
+    OrderBookLevel, OrderManagement, OrderRequest, OrderSide, OrderStatus, OrderType, PriceChange,
+    StreamConfig, Ticker, TimeInForce,
+};
+use chrono::{DateTime, TimeZone, Utc};
 use reqwest::Client;
 use rust_decimal::Decimal;
+use std::sync::Arc;
+use tracing::{debug, warn};
 
 /// Bybit V5 REST API 기본 URL (메인넷).
 const BASE_URL_MAINNET: &str = "https://api.bybit.com";
@@ -30,12 +33,23 @@ const DEFAULT_CATEGORY: &str = "spot";
 ///
 /// 이 클라이언트는 공개(시장 데이터) 및 비공개(거래) API를 모두 지원합니다.
 /// 비공개 API를 사용하려면 인증 정보를 제공해야 합니다.
-#[derive(Debug)]
 pub struct BybitClient {
     client: Client,
     pub(crate) credentials: Option<BybitCredentials>,
     base_url: String,
     category: String,
+    /// WebSocket 스트림 내부 상태.
+    pub(crate) stream: Arc<BybitStreamInner>,
+}
+
+impl std::fmt::Debug for BybitClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BybitClient")
+            .field("base_url", &self.base_url)
+            .field("category", &self.category)
+            .field("credentials", &self.credentials.is_some())
+            .finish()
+    }
 }
 
 impl BybitClient {
@@ -117,7 +131,13 @@ impl BybitClient {
             credentials,
             base_url,
             category: DEFAULT_CATEGORY.to_string(),
+            stream: Arc::new(BybitStreamInner::new(StreamConfig::default())),
         })
+    }
+
+    /// WebSocket 스트림 내부 상태에 접근합니다.
+    pub(crate) fn stream_inner(&self) -> &BybitStreamInner {
+        &self.stream
     }
 
     /// 거래 카테고리를 설정합니다 (spot, linear, inverse, option).
@@ -145,6 +165,7 @@ impl BybitClient {
         params: &[(&str, &str)],
     ) -> ExchangeResult<T> {
         let url = format!("{}{}", self.base_url, endpoint);
+        debug!(endpoint, "Bybit public GET 요청");
         let response = self
             .client
             .get(&url)
@@ -164,6 +185,7 @@ impl BybitClient {
     ) -> ExchangeResult<T> {
         let creds = self.credentials()?;
         let url = format!("{}{}", self.base_url, endpoint);
+        debug!(endpoint, "Bybit private GET 요청");
 
         let query_string = build_query_string(params.iter().map(|(k, v)| (*k, *v)));
         let auth = creds.auth_headers_get(&query_string)?;
@@ -194,6 +216,7 @@ impl BybitClient {
     ) -> ExchangeResult<T> {
         let creds = self.credentials()?;
         let url = format!("{}{}", self.base_url, endpoint);
+        debug!(endpoint, "Bybit private POST 요청");
 
         let body_json = serde_json::to_string(body).map_err(ExchangeError::JsonError)?;
         let auth = creds.auth_headers_post(&body_json)?;
@@ -226,6 +249,7 @@ impl BybitClient {
         let body = response.text().await.map_err(ExchangeError::HttpError)?;
 
         if !status.is_success() {
+            warn!(status = status.as_u16(), "Bybit API HTTP 에러");
             return Err(self.parse_error(&body, status.as_u16()));
         }
 
@@ -234,6 +258,7 @@ impl BybitClient {
             serde_json::from_str(&body).map_err(ExchangeError::JsonError)?;
 
         if !bybit_resp.is_success() {
+            warn!(ret_code = bybit_resp.ret_code, ret_msg = %bybit_resp.ret_msg, "Bybit API 비즈니스 에러");
             return Err(self.convert_bybit_error(bybit_resp.ret_code, &bybit_resp.ret_msg));
         }
 
@@ -361,11 +386,52 @@ impl MarketData for BybitClient {
 
         let result: BybitKlineList = self.get_public("/v5/market/kline", &params).await?;
 
-        Ok(result
+        // Bybit는 최신순으로 반환하므로 오름차순으로 정렬
+        let mut candles: Vec<Candle> = result
             .list
             .into_iter()
             .map(|k| convert_candle(k, market))
-            .collect())
+            .collect();
+        candles.reverse();
+        Ok(candles)
+    }
+
+    async fn get_candles_before(
+        &self,
+        market: &str,
+        interval: CandleInterval,
+        count: u32,
+        before: DateTime<Utc>,
+    ) -> ExchangeResult<Vec<Candle>> {
+        let symbol = Self::to_bybit_symbol(market);
+        let interval_str = interval_to_bybit(interval);
+        let limit_str = count.min(1000).to_string();
+        // Bybit의 `end`는 inclusive (밀리초)이므로 1ms를 빼서 exclusive 시맨틱을 구현
+        let end_ms = (before.timestamp_millis() - 1).to_string();
+
+        let params = [
+            ("category", self.category.as_str()),
+            ("symbol", &symbol),
+            ("interval", interval_str),
+            ("limit", &limit_str),
+            ("end", &end_ms),
+        ];
+
+        let result: BybitKlineList = self.get_public("/v5/market/kline", &params).await?;
+
+        // Bybit는 최신순으로 반환하므로 오름차순으로 정렬
+        let mut candles: Vec<Candle> = result
+            .list
+            .into_iter()
+            .map(|k| convert_candle(k, market))
+            .collect();
+        candles.reverse();
+        Ok(candles)
+    }
+
+    fn market_code(base: &str, quote: &str) -> String {
+        // Bybit 형식: "{BASE}{QUOTE}" (예: "BTCUSDT")
+        format!("{}{}", base.to_uppercase(), quote.to_uppercase())
     }
 }
 
@@ -633,7 +699,7 @@ fn convert_balance(b: crate::bybit::types::BybitCoinBalance) -> Balance {
         currency: b.coin,
         balance: b.available_to_withdraw,
         locked,
-        avg_buy_price: Decimal::ZERO,      // Bybit은 이 정보를 제공하지 않음
+        avg_buy_price: Decimal::ZERO, // Bybit은 이 정보를 제공하지 않음
         unit_currency: "USDT".to_string(), // 기본값 USDT
     }
 }
@@ -718,6 +784,14 @@ mod tests {
     fn test_market_data_name() {
         let client = BybitClient::new().unwrap();
         assert_eq!(client.name(), "Bybit");
+    }
+
+    #[test]
+    fn test_market_code() {
+        // Bybit 형식: "{BASE}{QUOTE}"
+        assert_eq!(BybitClient::market_code("BTC", "USDT"), "BTCUSDT");
+        assert_eq!(BybitClient::market_code("ETH", "USDC"), "ETHUSDC");
+        assert_eq!(BybitClient::market_code("btc", "usdt"), "BTCUSDT");
     }
 
     #[test]

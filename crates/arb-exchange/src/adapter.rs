@@ -6,6 +6,7 @@
 use crate::error::ExchangeResult;
 use crate::types::{Balance, Candle, CandleInterval, Order, OrderBook, OrderRequest, Ticker};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use std::fmt::Debug;
 
 /// 거래소 작업을 위한 객체 안전 어댑터 trait.
@@ -56,6 +57,8 @@ pub trait ExchangeAdapter: Send + Sync + Debug {
 
     /// 마켓의 캔들 데이터를 조회합니다.
     ///
+    /// 반환값은 timestamp 오름차순 정렬을 보장합니다.
+    ///
     /// # 인자
     ///
     /// * `market` - 마켓 코드 (예: "KRW-BTC")
@@ -66,6 +69,25 @@ pub trait ExchangeAdapter: Send + Sync + Debug {
         market: &str,
         interval: CandleInterval,
         count: u32,
+    ) -> ExchangeResult<Vec<Candle>>;
+
+    /// 특정 시점 이전의 캔들 데이터를 조회합니다 (페이지네이션용).
+    ///
+    /// `before`는 exclusive (해당 timestamp 미포함).
+    /// 반환값은 timestamp 오름차순 정렬을 보장합니다.
+    ///
+    /// # 인자
+    ///
+    /// * `market` - 마켓 코드 (예: "KRW-BTC")
+    /// * `interval` - 캔들 간격
+    /// * `count` - 조회할 캔들 수
+    /// * `before` - 이 시점 이전의 캔들만 조회 (exclusive)
+    async fn get_candles_before(
+        &self,
+        market: &str,
+        interval: CandleInterval,
+        count: u32,
+        before: DateTime<Utc>,
     ) -> ExchangeResult<Vec<Candle>>;
 
     // ==================== 주문 관리 작업 ====================
@@ -107,122 +129,6 @@ pub trait ExchangeAdapter: Send + Sync + Debug {
     ///
     /// * `currency` - 통화 코드 (예: "BTC", "KRW")
     async fn get_balance(&self, currency: &str) -> ExchangeResult<Balance>;
-}
-
-/// MarketData + OrderManagement를 구현하는 기존 클라이언트를 ExchangeAdapter로 적응시키는 래퍼.
-///
-/// 이 macro는 주어진 클라이언트 타입에 대해 ExchangeAdapter를 구현하는 어댑터 구조체를 생성합니다.
-#[macro_export]
-macro_rules! impl_exchange_adapter {
-    ($adapter_name:ident, $client_type:ty, $exchange_name:expr, $quote_currency:expr) => {
-        /// 거래소 클라이언트를 위한 어댑터 래퍼.
-        #[derive(Debug)]
-        pub struct $adapter_name {
-            client: $client_type,
-        }
-
-        impl $adapter_name {
-            /// 클라이언트로부터 새 어댑터를 생성합니다.
-            pub fn new(client: $client_type) -> Self {
-                Self { client }
-            }
-
-            /// 기본 클라이언트에 대한 참조를 반환합니다.
-            pub fn client(&self) -> &$client_type {
-                &self.client
-            }
-        }
-
-        #[async_trait::async_trait]
-        impl $crate::adapter::ExchangeAdapter for $adapter_name {
-            fn name(&self) -> &str {
-                use $crate::traits::MarketData;
-                self.client.name()
-            }
-
-            fn is_authenticated(&self) -> bool {
-                self.client.credentials.is_some()
-            }
-
-            fn native_quote_currency(&self) -> &str {
-                $quote_currency
-            }
-
-            async fn get_ticker(
-                &self,
-                markets: &[&str],
-            ) -> $crate::ExchangeResult<Vec<$crate::Ticker>> {
-                use $crate::traits::MarketData;
-                self.client.get_ticker(markets).await
-            }
-
-            async fn get_orderbook(
-                &self,
-                market: &str,
-                depth: Option<u32>,
-            ) -> $crate::ExchangeResult<$crate::OrderBook> {
-                use $crate::traits::MarketData;
-                self.client.get_orderbook(market, depth).await
-            }
-
-            async fn get_candles(
-                &self,
-                market: &str,
-                interval: $crate::CandleInterval,
-                count: u32,
-            ) -> $crate::ExchangeResult<Vec<$crate::Candle>> {
-                use $crate::traits::MarketData;
-                self.client.get_candles(market, interval, count).await
-            }
-
-            async fn place_order(
-                &self,
-                request: &$crate::OrderRequest,
-            ) -> $crate::ExchangeResult<$crate::Order> {
-                use $crate::traits::OrderManagement;
-                self.client.place_order(request).await
-            }
-
-            async fn cancel_order(
-                &self,
-                order_id: &str,
-            ) -> $crate::ExchangeResult<$crate::Order> {
-                use $crate::traits::OrderManagement;
-                self.client.cancel_order(order_id).await
-            }
-
-            async fn get_order(
-                &self,
-                order_id: &str,
-            ) -> $crate::ExchangeResult<$crate::Order> {
-                use $crate::traits::OrderManagement;
-                self.client.get_order(order_id).await
-            }
-
-            async fn get_open_orders(
-                &self,
-                market: Option<&str>,
-            ) -> $crate::ExchangeResult<Vec<$crate::Order>> {
-                use $crate::traits::OrderManagement;
-                self.client.get_open_orders(market).await
-            }
-
-            async fn get_balances(
-                &self,
-            ) -> $crate::ExchangeResult<Vec<$crate::Balance>> {
-                use $crate::traits::OrderManagement;
-                self.client.get_balances().await
-            }
-
-            async fn get_balance(
-                &self,
-                currency: &str,
-            ) -> $crate::ExchangeResult<$crate::Balance> {
-                use $crate::traits::OrderManagement;
-                self.client.get_balance(currency).await
-            }
-        }
-    };
 }
 
 #[cfg(test)]

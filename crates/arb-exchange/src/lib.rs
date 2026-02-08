@@ -33,8 +33,12 @@ pub mod adapter;
 pub mod error;
 pub mod manager;
 pub mod market;
+pub mod stream;
 pub mod traits;
 pub mod types;
+
+// chrono 재내보내기 (전략 크레이트에서 DateTime<Utc> 사용 시 호환성 보장)
+pub use chrono;
 
 // 핵심 trait 재내보내기
 pub use error::{ExchangeError, ExchangeResult};
@@ -45,9 +49,12 @@ pub use types::*;
 pub use adapter::ExchangeAdapter;
 pub use manager::ExchangeManager;
 
+// stream trait 재내보내기
+pub use stream::{MarketEvent, MarketStream, StreamConfig};
+
 // market 유틸리티 재내보내기
 pub use market::{
-    convert_market_code, create_market_code, get_base_currency, get_quote_currency,
-    normalize_currency, parse_market_code, to_exchange_format, to_internal_format,
-    ExchangeName, MarketCodeBuilder,
+    ExchangeName, MarketCodeBuilder, convert_market_code, create_market_code, get_base_currency,
+    get_quote_currency, normalize_currency, parse_market_code, to_exchange_format,
+    to_internal_format,
 };

@@ -1,0 +1,44 @@
+# Z-Score 차익거래 전략 설정 템플릿
+#
+# 이 파일을 strategy.toml로 복사하여 사용하세요.
+# arb-config의 간이 파서는 중첩 섹션을 지원하지 않으므로,
+# 전략 설정은 별도 파일로 분리합니다.
+
+[zscore]
+# 대상 코인 목록
+coins = ["BTC", "ETH", "XRP"]
+
+# 캔들 윈도우 크기 (1분봉 기준, 기본값: 1440 = 1일)
+# 가이드라인: 최적 윈도우 = 추정 half-life의 3~5배
+window_size = 1440
+
+# Z-Score 진입 임계값 (기본값: 2.0)
+entry_z_threshold = 2.0
+
+# Z-Score 청산 임계값 (기본값: 0.5)
+exit_z_threshold = 0.5
+
+# 총 자본금 (USDT, 양 거래소 합산)
+total_capital_usdt = 10000.0
+
+# 포지션당 자본금 비율 (0.1 = 총 자본의 10%)
+# 실제 필요 자본 = total_capital × position_ratio × 2 (양 거래소)
+position_ratio = 0.1
+
+# Bybit 레버리지 (기본값: 1)
+leverage = 1
+
+# Bybit maintenance margin rate (기본값: 0.005 = 0.5%)
+bybit_mmr = 0.005
+
+# 백테스트 기간 (분 단위, 워밍업 제외, 기본값: 8640 = 6일)
+backtest_period_minutes = 8640
+
+# Z-Score 계산 시 최소 stddev 임계값 (기본값: 0.01)
+min_stddev_threshold = 0.01
+
+# 결과 CSV 출력 디렉토리
+output_dir = "./output/"
+
+# 최대 동시 포지션 수 (생략 시 코인 수만큼 허용)
+# max_concurrent_positions = 2

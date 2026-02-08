@@ -1,18 +1,23 @@
 [package]
-name = "arb-exchange"
+name = "arb-strategy"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Exchange abstraction layer for arb_poc"
+description = "Trading strategy implementations for arb_poc"
 
 [dependencies]
-async-trait = { workspace = true }
+arb-exchange = { path = "../arb-exchange" }
 chrono = { workspace = true }
+csv = { workspace = true }
 rust_decimal = { workspace = true }
-reqwest = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+toml = { workspace = true }
+tokio-util = "0.7"
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = "3"

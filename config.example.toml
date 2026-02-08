@@ -21,3 +21,6 @@ testnet = false
 # [binance]
 # api_key = "YOUR_BINANCE_API_KEY"
 # secret_key = "YOUR_BINANCE_SECRET_KEY"
+
+# NOTE: Z-Score 전략 설정은 별도 파일(strategy.toml)에서 관리합니다.
+# strategy.example.toml을 strategy.toml로 복사하여 사용하세요.

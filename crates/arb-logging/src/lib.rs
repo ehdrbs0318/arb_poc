@@ -29,10 +29,10 @@ use std::sync::OnceLock;
 
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::{
+    EnvFilter,
     fmt::{self, format::FmtSpan, time::ChronoLocal},
     layer::SubscriberExt,
     util::SubscriberInitExt,
-    EnvFilter,
 };
 
 /// 로깅 초기화 상태를 추적하는 전역 변수
@@ -204,8 +204,8 @@ pub fn init_logging(config: &LogConfig) -> Result<(), LogError> {
     }
 
     // EnvFilter 생성
-    let filter = EnvFilter::try_new(&config.level)
-        .map_err(|e| LogError::FilterParse(e.to_string()))?;
+    let filter =
+        EnvFilter::try_new(&config.level).map_err(|e| LogError::FilterParse(e.to_string()))?;
 
     // span 이벤트 설정
     let span_events = if config.show_span_events {
@@ -220,7 +220,9 @@ pub fn init_logging(config: &LogConfig) -> Result<(), LogError> {
     // 콘솔 레이어 생성
     if config.console_enabled && config.file_enabled {
         // 콘솔 + 파일 출력
-        let file_path = config.file_path.as_ref()
+        let file_path = config
+            .file_path
+            .as_ref()
             .ok_or_else(|| LogError::FilterParse("파일 경로가 지정되지 않았습니다".to_string()))?;
 
         let file = std::fs::OpenOptions::new()
@@ -253,7 +255,9 @@ pub fn init_logging(config: &LogConfig) -> Result<(), LogError> {
             .map_err(|e| LogError::SubscriberSetup(e.to_string()))?;
     } else if config.file_enabled {
         // 파일 출력만
-        let file_path = config.file_path.as_ref()
+        let file_path = config
+            .file_path
+            .as_ref()
             .ok_or_else(|| LogError::FilterParse("파일 경로가 지정되지 않았습니다".to_string()))?;
 
         let file = std::fs::OpenOptions::new()
@@ -334,12 +338,8 @@ pub fn init_logging(config: &LogConfig) -> Result<(), LogError> {
 #[must_use = "span guard는 스코프 내에서 유지되어야 합니다"]
 pub fn exchange_span(exchange: &str, symbol: Option<&str>) -> tracing::span::EnteredSpan {
     match symbol {
-        Some(sym) => {
-            tracing::info_span!("exchange", exchange = %exchange, symbol = %sym).entered()
-        }
-        None => {
-            tracing::info_span!("exchange", exchange = %exchange).entered()
-        }
+        Some(sym) => tracing::info_span!("exchange", exchange = %exchange, symbol = %sym).entered(),
+        None => tracing::info_span!("exchange", exchange = %exchange).entered(),
     }
 }
 
@@ -361,21 +361,19 @@ pub fn operation_span(
     symbol: Option<&str>,
 ) -> tracing::span::EnteredSpan {
     match symbol {
-        Some(sym) => {
-            tracing::info_span!(
-                "operation",
-                op = %operation,
-                exchange = %exchange,
-                symbol = %sym
-            ).entered()
-        }
-        None => {
-            tracing::info_span!(
-                "operation",
-                op = %operation,
-                exchange = %exchange
-            ).entered()
-        }
+        Some(sym) => tracing::info_span!(
+            "operation",
+            op = %operation,
+            exchange = %exchange,
+            symbol = %sym
+        )
+        .entered(),
+        None => tracing::info_span!(
+            "operation",
+            op = %operation,
+            exchange = %exchange
+        )
+        .entered(),
     }
 }
 

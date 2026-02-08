@@ -41,6 +41,7 @@
 
 mod auth;
 mod client;
+mod stream;
 mod types;
 
 pub use client::BybitClient;

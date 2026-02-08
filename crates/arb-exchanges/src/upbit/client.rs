@@ -5,17 +5,20 @@
 use arb_exchange::{
     Balance, Candle, CandleInterval, ExchangeError, ExchangeResult, MarketData, Order, OrderBook,
     OrderBookLevel, OrderManagement, OrderRequest, OrderSide, OrderStatus, OrderType, PriceChange,
-    Ticker, TimeInForce,
+    StreamConfig, Ticker, TimeInForce,
 };
 
-use crate::upbit::auth::{build_query_string, UpbitCredentials};
+use crate::upbit::auth::{UpbitCredentials, build_query_string};
+use crate::upbit::stream::UpbitStreamInner;
 use crate::upbit::types::{
     UpbitBalance, UpbitCandle, UpbitError, UpbitOrder, UpbitOrderRequest, UpbitOrderbook,
     UpbitTicker,
 };
-use chrono::{NaiveDateTime, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use reqwest::Client;
 use std::collections::HashMap;
+use std::sync::Arc;
+use tracing::{debug, warn};
 
 /// Upbit REST API 기본 URL.
 const BASE_URL: &str = "https://api.upbit.com/v1";
@@ -24,10 +27,19 @@ const BASE_URL: &str = "https://api.upbit.com/v1";
 ///
 /// 이 클라이언트는 공개(시세) API와 비공개(거래) API를 모두 지원합니다.
 /// 비공개 API를 사용하려면 인증 정보가 필요합니다.
-#[derive(Debug)]
 pub struct UpbitClient {
     client: Client,
     pub(crate) credentials: Option<UpbitCredentials>,
+    /// WebSocket 스트림 내부 상태.
+    pub(crate) stream: Arc<UpbitStreamInner>,
+}
+
+impl std::fmt::Debug for UpbitClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpbitClient")
+            .field("credentials", &self.credentials.is_some())
+            .finish()
+    }
 }
 
 impl UpbitClient {
@@ -47,6 +59,7 @@ impl UpbitClient {
         Ok(Self {
             client,
             credentials: None,
+            stream: Arc::new(UpbitStreamInner::new(StreamConfig::default())),
         })
     }
 
@@ -74,7 +87,13 @@ impl UpbitClient {
         Ok(Self {
             client,
             credentials: Some(UpbitCredentials::new(access_key, secret_key)),
+            stream: Arc::new(UpbitStreamInner::new(StreamConfig::default())),
         })
+    }
+
+    /// WebSocket 스트림 내부 상태에 접근합니다.
+    pub(crate) fn stream_inner(&self) -> &UpbitStreamInner {
+        &self.stream
     }
 
     /// 인증 정보가 있으면 반환합니다.
@@ -91,6 +110,7 @@ impl UpbitClient {
         params: Option<&[(&str, &str)]>,
     ) -> ExchangeResult<T> {
         let url = format!("{BASE_URL}{endpoint}");
+        debug!(endpoint, "Upbit public GET 요청");
         let mut request = self.client.get(&url);
 
         if let Some(params) = params {
@@ -109,6 +129,7 @@ impl UpbitClient {
     ) -> ExchangeResult<T> {
         let creds = self.credentials()?;
         let url = format!("{BASE_URL}{endpoint}");
+        debug!(endpoint, "Upbit private GET 요청");
 
         let auth_header = if let Some(params) = params {
             let query_string = build_query_string(params.iter().map(|(k, v)| (*k, *v)));
@@ -135,6 +156,7 @@ impl UpbitClient {
     ) -> ExchangeResult<T> {
         let creds = self.credentials()?;
         let url = format!("{BASE_URL}{endpoint}");
+        debug!(endpoint, "Upbit private POST 요청");
 
         // 해시를 위해 body를 쿼리 스트링 형식으로 직렬화
         let body_map: HashMap<String, serde_json::Value> =
@@ -177,6 +199,7 @@ impl UpbitClient {
     ) -> ExchangeResult<T> {
         let creds = self.credentials()?;
         let url = format!("{BASE_URL}{endpoint}");
+        debug!(endpoint, "Upbit private DELETE 요청");
 
         let query_string = build_query_string(params.iter().map(|(k, v)| (*k, *v)));
         let auth_header = creds.authorization_header_with_query(&query_string)?;
@@ -204,6 +227,7 @@ impl UpbitClient {
             response.json::<T>().await.map_err(ExchangeError::HttpError)
         } else {
             let error_text = response.text().await.unwrap_or_default();
+            warn!(status = status.as_u16(), error = %error_text, "Upbit API 에러 응답");
 
             // Upbit 오류 형식으로 파싱 시도
             if let Ok(upbit_error) = serde_json::from_str::<UpbitError>(&error_text) {
@@ -275,23 +299,46 @@ impl MarketData for UpbitClient {
         let count_str = count.min(200).to_string();
         let params = [("market", market), ("count", &count_str)];
 
-        let endpoint = match interval {
-            CandleInterval::Minute1 => "/candles/minutes/1",
-            CandleInterval::Minute3 => "/candles/minutes/3",
-            CandleInterval::Minute5 => "/candles/minutes/5",
-            CandleInterval::Minute10 => "/candles/minutes/10",
-            CandleInterval::Minute15 => "/candles/minutes/15",
-            CandleInterval::Minute30 => "/candles/minutes/30",
-            CandleInterval::Minute60 => "/candles/minutes/60",
-            CandleInterval::Minute240 => "/candles/minutes/240",
-            CandleInterval::Day => "/candles/days",
-            CandleInterval::Week => "/candles/weeks",
-            CandleInterval::Month => "/candles/months",
-        };
+        let endpoint = upbit_candle_endpoint(interval);
 
         let candles: Vec<UpbitCandle> = self.get_public(endpoint, Some(&params)).await?;
 
-        Ok(candles.into_iter().map(convert_candle).collect())
+        // Upbit는 최신순으로 반환하므로 오름차순으로 정렬
+        let mut result: Vec<Candle> = candles.into_iter().map(convert_candle).collect();
+        result.reverse();
+        Ok(result)
+    }
+
+    async fn get_candles_before(
+        &self,
+        market: &str,
+        interval: CandleInterval,
+        count: u32,
+        before: DateTime<Utc>,
+    ) -> ExchangeResult<Vec<Candle>> {
+        let count_str = count.min(200).to_string();
+        // Upbit의 `to` 파라미터는 inclusive이므로 1초를 빼서 exclusive 시맨틱을 구현
+        let to_time = before - Duration::seconds(1);
+        let to_str = to_time.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let params = [
+            ("market", market),
+            ("count", count_str.as_str()),
+            ("to", to_str.as_str()),
+        ];
+
+        let endpoint = upbit_candle_endpoint(interval);
+
+        let candles: Vec<UpbitCandle> = self.get_public(endpoint, Some(&params)).await?;
+
+        // Upbit는 최신순으로 반환하므로 오름차순으로 정렬
+        let mut result: Vec<Candle> = candles.into_iter().map(convert_candle).collect();
+        result.reverse();
+        Ok(result)
+    }
+
+    fn market_code(base: &str, quote: &str) -> String {
+        // Upbit 형식: "{QUOTE}-{BASE}" (예: "KRW-BTC")
+        format!("{}-{}", quote.to_uppercase(), base.to_uppercase())
     }
 }
 
@@ -365,6 +412,23 @@ impl OrderManagement for UpbitClient {
             .ok_or_else(|| {
                 ExchangeError::InvalidParameter(format!("Currency not found: {currency}"))
             })
+    }
+}
+
+/// CandleInterval에 대응하는 Upbit API 엔드포인트를 반환합니다.
+fn upbit_candle_endpoint(interval: CandleInterval) -> &'static str {
+    match interval {
+        CandleInterval::Minute1 => "/candles/minutes/1",
+        CandleInterval::Minute3 => "/candles/minutes/3",
+        CandleInterval::Minute5 => "/candles/minutes/5",
+        CandleInterval::Minute10 => "/candles/minutes/10",
+        CandleInterval::Minute15 => "/candles/minutes/15",
+        CandleInterval::Minute30 => "/candles/minutes/30",
+        CandleInterval::Minute60 => "/candles/minutes/60",
+        CandleInterval::Minute240 => "/candles/minutes/240",
+        CandleInterval::Day => "/candles/days",
+        CandleInterval::Week => "/candles/weeks",
+        CandleInterval::Month => "/candles/months",
     }
 }
 
@@ -543,5 +607,34 @@ mod tests {
     fn test_market_data_name() {
         let client = UpbitClient::new().unwrap();
         assert_eq!(client.name(), "Upbit");
+    }
+
+    #[test]
+    fn test_market_code() {
+        // Upbit 형식: "{QUOTE}-{BASE}"
+        assert_eq!(UpbitClient::market_code("BTC", "KRW"), "KRW-BTC");
+        assert_eq!(UpbitClient::market_code("ETH", "KRW"), "KRW-ETH");
+        assert_eq!(UpbitClient::market_code("btc", "krw"), "KRW-BTC");
+    }
+
+    #[test]
+    fn test_upbit_candle_endpoint() {
+        assert_eq!(
+            upbit_candle_endpoint(CandleInterval::Minute1),
+            "/candles/minutes/1"
+        );
+        assert_eq!(
+            upbit_candle_endpoint(CandleInterval::Minute5),
+            "/candles/minutes/5"
+        );
+        assert_eq!(upbit_candle_endpoint(CandleInterval::Day), "/candles/days");
+        assert_eq!(
+            upbit_candle_endpoint(CandleInterval::Week),
+            "/candles/weeks"
+        );
+        assert_eq!(
+            upbit_candle_endpoint(CandleInterval::Month),
+            "/candles/months"
+        );
     }
 }

@@ -7,6 +7,7 @@ use crate::adapter::ExchangeAdapter;
 use crate::error::{ExchangeError, ExchangeResult};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::{debug, info, warn};
 
 /// 여러 거래소 인스턴스를 위한 관리자.
 ///
@@ -72,7 +73,13 @@ impl ExchangeManager {
         exchange: impl ExchangeAdapter + 'static,
     ) -> Option<Arc<dyn ExchangeAdapter>> {
         let name = name.into().to_lowercase();
-        self.exchanges.insert(name, Arc::new(exchange))
+        let prev = self.exchanges.insert(name.clone(), Arc::new(exchange));
+        if prev.is_some() {
+            warn!(name = %name, "기존 거래소 교체 등록");
+        } else {
+            info!(name = %name, "거래소 등록 완료");
+        }
+        prev
     }
 
     /// Arc로 래핑된 거래소를 등록합니다.
@@ -87,7 +94,13 @@ impl ExchangeManager {
         exchange: Arc<dyn ExchangeAdapter>,
     ) -> Option<Arc<dyn ExchangeAdapter>> {
         let name = name.into().to_lowercase();
-        self.exchanges.insert(name, exchange)
+        let prev = self.exchanges.insert(name.clone(), exchange);
+        if prev.is_some() {
+            warn!(name = %name, "기존 거래소 교체 등록 (arc)");
+        } else {
+            info!(name = %name, "거래소 등록 완료 (arc)");
+        }
+        prev
     }
 
     /// 관리자에서 거래소를 제거합니다.
@@ -100,7 +113,13 @@ impl ExchangeManager {
     ///
     /// 제거된 거래소가 존재했다면 반환합니다.
     pub fn unregister(&mut self, name: &str) -> Option<Arc<dyn ExchangeAdapter>> {
-        self.exchanges.remove(&name.to_lowercase())
+        let removed = self.exchanges.remove(&name.to_lowercase());
+        if removed.is_some() {
+            info!(name = name, "거래소 등록 해제");
+        } else {
+            debug!(name = name, "거래소 등록 해제 시도: 미등록 상태");
+        }
+        removed
     }
 
     /// 이름으로 거래소 참조를 가져옵니다.
@@ -127,9 +146,11 @@ impl ExchangeManager {
     ///
     /// 거래소가 등록되지 않은 경우 에러를 반환합니다.
     pub fn get_or_error(&self, name: &str) -> ExchangeResult<Arc<dyn ExchangeAdapter>> {
-        self.get(name).ok_or_else(|| {
-            ExchangeError::ConfigError(format!("Exchange not registered: {}", name))
-        })
+        self.get(name)
+            .ok_or_else(|| {
+                warn!(name = name, "미등록 거래소 접근 시도");
+                ExchangeError::ConfigError(format!("Exchange not registered: {}", name))
+            })
     }
 
     /// 주어진 이름의 거래소가 등록되어 있으면 true를 반환합니다.
@@ -249,6 +270,16 @@ mod tests {
             _market: &str,
             _interval: CandleInterval,
             _count: u32,
+        ) -> ExchangeResult<Vec<Candle>> {
+            Ok(vec![])
+        }
+
+        async fn get_candles_before(
+            &self,
+            _market: &str,
+            _interval: CandleInterval,
+            _count: u32,
+            _before: chrono::DateTime<chrono::Utc>,
         ) -> ExchangeResult<Vec<Candle>> {
             Ok(vec![])
         }

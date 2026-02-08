@@ -4,6 +4,7 @@
 
 use crate::error::ExchangeResult;
 use crate::types::{Balance, Candle, CandleInterval, Order, OrderBook, OrderRequest, Ticker};
+use chrono::{DateTime, Utc};
 use std::future::Future;
 
 /// 시장 데이터 조회 trait (공개 API).
@@ -38,6 +39,8 @@ pub trait MarketData: Send + Sync {
 
     /// 특정 마켓의 캔들 데이터를 조회합니다.
     ///
+    /// 반환값은 timestamp 오름차순 정렬을 보장합니다.
+    ///
     /// # 인자
     ///
     /// * `market` - 마켓 코드 (예: "KRW-BTC")
@@ -49,6 +52,38 @@ pub trait MarketData: Send + Sync {
         interval: CandleInterval,
         count: u32,
     ) -> impl Future<Output = ExchangeResult<Vec<Candle>>> + Send;
+
+    /// 특정 시점 이전의 캔들 데이터를 조회합니다 (페이지네이션용).
+    ///
+    /// `before`는 exclusive (해당 timestamp 미포함, 직전까지 반환).
+    /// 반환값은 timestamp 오름차순 정렬을 보장합니다.
+    ///
+    /// # 인자
+    ///
+    /// * `market` - 마켓 코드 (예: "KRW-BTC")
+    /// * `interval` - 캔들 간격
+    /// * `count` - 조회할 캔들 개수
+    /// * `before` - 이 시점 이전의 캔들만 조회 (exclusive)
+    fn get_candles_before(
+        &self,
+        market: &str,
+        interval: CandleInterval,
+        count: u32,
+        before: DateTime<Utc>,
+    ) -> impl Future<Output = ExchangeResult<Vec<Candle>>> + Send;
+
+    /// 거래소에 맞는 마켓 코드를 생성합니다.
+    ///
+    /// # 인자
+    ///
+    /// * `base` - Base 통화 (예: "BTC")
+    /// * `quote` - Quote 통화 (예: "KRW", "USDT")
+    ///
+    /// # 예제
+    ///
+    /// Upbit: `market_code("BTC", "KRW")` → `"KRW-BTC"`
+    /// Bybit: `market_code("BTC", "USDT")` → `"BTCUSDT"`
+    fn market_code(base: &str, quote: &str) -> String;
 }
 
 /// 주문 관리 trait (비공개 API).

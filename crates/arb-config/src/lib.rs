@@ -9,6 +9,7 @@ pub use error::ConfigError;
 
 use serde::Deserialize;
 use std::path::Path;
+use tracing::{debug, info, warn};
 
 /// 애플리케이션 설정.
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -79,14 +80,16 @@ impl Config {
         let path = path.as_ref();
 
         if !path.exists() {
+            warn!(path = %path.display(), "설정 파일 미발견");
             return Err(ConfigError::FileNotFound(path.display().to_string()));
         }
 
-        let content = std::fs::read_to_string(path).map_err(|e| {
-            ConfigError::ReadError(format!("Failed to read config file: {e}"))
-        })?;
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| ConfigError::ReadError(format!("Failed to read config file: {e}")))?;
 
-        parse_toml_simple(&content)
+        let config = parse_toml_simple(&content)?;
+        info!(path = %path.display(), "설정 파일 로드 완료");
+        Ok(config)
     }
 
     /// 다음 우선순위로 설정을 로드합니다:
@@ -102,10 +105,12 @@ impl Config {
 
         // 파일에서 로드 시도 (낮은 우선순위부터)
         if let Ok(file_config) = Self::from_file("config.toml") {
+            debug!("config.toml 로드 성공");
             config = file_config;
         }
 
         if let Ok(local_config) = Self::from_file("config.local.toml") {
+            debug!("config.local.toml 로드 성공 (우선 적용)");
             config = local_config;
         }
 
@@ -141,6 +146,14 @@ impl Config {
         if let Ok(chat_id) = std::env::var("TELEGRAM_CHAT_ID") {
             config.telegram.chat_id = chat_id;
         }
+
+        debug!(
+            upbit_configured = config.upbit.has_credentials(),
+            bithumb_configured = config.bithumb.has_credentials(),
+            bybit_configured = config.bybit.has_credentials(),
+            telegram_configured = config.telegram.is_configured(),
+            "설정 로드 완료: 자격 증명 상태"
+        );
 
         Ok(config)
     }

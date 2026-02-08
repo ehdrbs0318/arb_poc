@@ -8,14 +8,15 @@ use arb_exchange::{
     Ticker, TimeInForce,
 };
 
-use crate::bithumb::auth::{build_query_string, BithumbCredentials};
+use crate::bithumb::auth::{BithumbCredentials, build_query_string};
 use crate::bithumb::types::{
     BithumbBalance, BithumbCandle, BithumbError, BithumbOrder, BithumbOrderRequest,
     BithumbOrderbook, BithumbTicker,
 };
-use chrono::{NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use reqwest::Client;
 use std::collections::HashMap;
+use tracing::{debug, warn};
 
 /// Bithumb REST API 기본 URL.
 const BASE_URL: &str = "https://api.bithumb.com";
@@ -91,6 +92,7 @@ impl BithumbClient {
         params: Option<&[(&str, &str)]>,
     ) -> ExchangeResult<T> {
         let url = format!("{BASE_URL}{endpoint}");
+        debug!(endpoint, "Bithumb public GET 요청");
         let mut request = self.client.get(&url);
 
         if let Some(params) = params {
@@ -109,6 +111,7 @@ impl BithumbClient {
     ) -> ExchangeResult<T> {
         let creds = self.credentials()?;
         let url = format!("{BASE_URL}{endpoint}");
+        debug!(endpoint, "Bithumb private GET 요청");
 
         let auth_header = if let Some(params) = params {
             let query_string = build_query_string(params.iter().map(|(k, v)| (*k, *v)));
@@ -135,6 +138,7 @@ impl BithumbClient {
     ) -> ExchangeResult<T> {
         let creds = self.credentials()?;
         let url = format!("{BASE_URL}{endpoint}");
+        debug!(endpoint, "Bithumb private POST 요청");
 
         // 해시를 위해 본문을 쿼리 스트링 형식으로 직렬화
         let body_map: HashMap<String, serde_json::Value> =
@@ -177,6 +181,7 @@ impl BithumbClient {
     ) -> ExchangeResult<T> {
         let creds = self.credentials()?;
         let url = format!("{BASE_URL}{endpoint}");
+        debug!(endpoint, "Bithumb private DELETE 요청");
 
         let query_string = build_query_string(params.iter().map(|(k, v)| (*k, *v)));
         let auth_header = creds.authorization_header_with_query(&query_string)?;
@@ -204,6 +209,7 @@ impl BithumbClient {
             response.json::<T>().await.map_err(ExchangeError::HttpError)
         } else {
             let error_text = response.text().await.unwrap_or_default();
+            warn!(status = status.as_u16(), error = %error_text, "Bithumb API 에러 응답");
 
             // Bithumb 오류로 파싱 시도
             if let Ok(bithumb_error) = serde_json::from_str::<BithumbError>(&error_text) {
@@ -306,23 +312,32 @@ impl MarketData for BithumbClient {
         let count_str = count.min(200).to_string();
         let params = [("market", market), ("count", &count_str)];
 
-        let endpoint = match interval {
-            CandleInterval::Minute1 => "/v1/candles/minutes/1",
-            CandleInterval::Minute3 => "/v1/candles/minutes/3",
-            CandleInterval::Minute5 => "/v1/candles/minutes/5",
-            CandleInterval::Minute10 => "/v1/candles/minutes/10",
-            CandleInterval::Minute15 => "/v1/candles/minutes/15",
-            CandleInterval::Minute30 => "/v1/candles/minutes/30",
-            CandleInterval::Minute60 => "/v1/candles/minutes/60",
-            CandleInterval::Minute240 => "/v1/candles/minutes/240",
-            CandleInterval::Day => "/v1/candles/days",
-            CandleInterval::Week => "/v1/candles/weeks",
-            CandleInterval::Month => "/v1/candles/months",
-        };
+        let endpoint = bithumb_candle_endpoint(interval);
 
         let candles: Vec<BithumbCandle> = self.get_public(endpoint, Some(&params)).await?;
 
-        Ok(candles.into_iter().map(convert_candle).collect())
+        // Bithumb은 최신순으로 반환하므로 오름차순으로 정렬
+        let mut result: Vec<Candle> = candles.into_iter().map(convert_candle).collect();
+        result.reverse();
+        Ok(result)
+    }
+
+    async fn get_candles_before(
+        &self,
+        _market: &str,
+        _interval: CandleInterval,
+        _count: u32,
+        _before: DateTime<Utc>,
+    ) -> ExchangeResult<Vec<Candle>> {
+        warn!("Bithumb get_candles_before 미구현: API 미지원");
+        Err(ExchangeError::InternalError(
+            "get_candles_before not implemented for Bithumb".to_string(),
+        ))
+    }
+
+    fn market_code(base: &str, quote: &str) -> String {
+        // Bithumb 형식: "{QUOTE}-{BASE}" (예: "KRW-BTC")
+        format!("{}-{}", quote.to_uppercase(), base.to_uppercase())
     }
 }
 
@@ -397,6 +412,23 @@ impl OrderManagement for BithumbClient {
             .ok_or_else(|| {
                 ExchangeError::InvalidParameter(format!("Currency not found: {currency}"))
             })
+    }
+}
+
+/// CandleInterval에 대응하는 Bithumb API 엔드포인트를 반환합니다.
+fn bithumb_candle_endpoint(interval: CandleInterval) -> &'static str {
+    match interval {
+        CandleInterval::Minute1 => "/v1/candles/minutes/1",
+        CandleInterval::Minute3 => "/v1/candles/minutes/3",
+        CandleInterval::Minute5 => "/v1/candles/minutes/5",
+        CandleInterval::Minute10 => "/v1/candles/minutes/10",
+        CandleInterval::Minute15 => "/v1/candles/minutes/15",
+        CandleInterval::Minute30 => "/v1/candles/minutes/30",
+        CandleInterval::Minute60 => "/v1/candles/minutes/60",
+        CandleInterval::Minute240 => "/v1/candles/minutes/240",
+        CandleInterval::Day => "/v1/candles/days",
+        CandleInterval::Week => "/v1/candles/weeks",
+        CandleInterval::Month => "/v1/candles/months",
     }
 }
 
@@ -586,5 +618,37 @@ mod tests {
     fn test_market_data_name() {
         let client = BithumbClient::new().unwrap();
         assert_eq!(client.name(), "Bithumb");
+    }
+
+    #[test]
+    fn test_market_code() {
+        // Bithumb 형식: "{QUOTE}-{BASE}"
+        assert_eq!(BithumbClient::market_code("BTC", "KRW"), "KRW-BTC");
+        assert_eq!(BithumbClient::market_code("ETH", "KRW"), "KRW-ETH");
+        assert_eq!(BithumbClient::market_code("btc", "krw"), "KRW-BTC");
+    }
+
+    #[test]
+    fn test_bithumb_candle_endpoint() {
+        assert_eq!(
+            bithumb_candle_endpoint(CandleInterval::Minute1),
+            "/v1/candles/minutes/1"
+        );
+        assert_eq!(
+            bithumb_candle_endpoint(CandleInterval::Minute5),
+            "/v1/candles/minutes/5"
+        );
+        assert_eq!(
+            bithumb_candle_endpoint(CandleInterval::Day),
+            "/v1/candles/days"
+        );
+        assert_eq!(
+            bithumb_candle_endpoint(CandleInterval::Week),
+            "/v1/candles/weeks"
+        );
+        assert_eq!(
+            bithumb_candle_endpoint(CandleInterval::Month),
+            "/v1/candles/months"
+        );
     }
 }

@@ -3,7 +3,7 @@
 //! 이 모듈은 Upbit API 인증을 위한 JWT 토큰 생성을 처리합니다.
 
 use arb_exchange::ExchangeError;
-use jsonwebtoken::{encode, EncodingKey, Header};
+use jsonwebtoken::{EncodingKey, Header, encode};
 use serde::Serialize;
 use sha2::{Digest, Sha512};
 use uuid::Uuid;

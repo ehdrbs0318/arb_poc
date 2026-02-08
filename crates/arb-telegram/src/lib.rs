@@ -160,10 +160,7 @@ mod tests {
     fn test_escape_markdown_v2_special_chars() {
         let text = "_*[]()~`>#+-=|{}.!";
         let escaped = escape_markdown_v2(text);
-        assert_eq!(
-            escaped,
-            r"\_\*\[\]\(\)\~\`\>\#\+\-\=\|\{\}\.\!"
-        );
+        assert_eq!(escaped, r"\_\*\[\]\(\)\~\`\>\#\+\-\=\|\{\}\.\!");
     }
 
     #[test]

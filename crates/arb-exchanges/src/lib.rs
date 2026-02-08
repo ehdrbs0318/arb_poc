@@ -40,10 +40,11 @@ pub mod bybit;
 pub mod factory;
 pub mod upbit;
 
+pub use arb_exchange::ExchangeName;
 pub use bithumb::BithumbClient;
 pub use bybit::BybitClient;
 pub use factory::{
-    create_exchange, create_exchange_boxed, BithumbAdapter, BybitAdapter, ExchangeManagerExt,
-    ExchangeName, UpbitAdapter,
+    BithumbAdapter, BybitAdapter, ExchangeManagerExt, UpbitAdapter, create_exchange,
+    create_exchange_boxed,
 };
 pub use upbit::UpbitClient;
