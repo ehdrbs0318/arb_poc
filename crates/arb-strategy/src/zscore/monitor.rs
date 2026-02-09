@@ -20,6 +20,8 @@ use arb_forex::ForexCache;
 use crate::common::candle_fetcher::fetch_all_candles;
 use crate::common::convert::truncate_to_minute;
 use crate::error::StrategyError;
+use crate::output::summary::SessionSummary;
+use crate::output::writer::{MinuteRecord, SessionWriter};
 use crate::zscore::coin_selector::{CoinCandidate, CoinSelector};
 use crate::zscore::config::ZScoreConfig;
 use crate::zscore::pnl::ClosedPosition;
@@ -214,6 +216,13 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
     ) -> Result<Vec<ClosedPosition>, StrategyError> {
         self.config.validate()?;
 
+        // 세션 시작 시각 및 환율 기록
+        let session_start = Utc::now();
+
+        // SessionWriter 초기화
+        let mut session_writer = SessionWriter::new(&self.config.output)
+            .map_err(|e| StrategyError::Config(format!("SessionWriter init failed: {e}")))?;
+
         // 환율 초기 로드
         self.forex_cache.refresh_if_expired().await.map_err(|e| {
             StrategyError::DataAlignment(format!("Initial forex refresh failed: {e}"))
@@ -247,10 +256,7 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
         let mut current_coins: Vec<String> = if self.config.auto_select {
             info!("자동 코인 선택 활성화: 초기 코인 선택 중...");
             let selector = CoinSelector::new(&self.upbit, &self.bybit);
-            let usd_krw_for_select = self
-                .forex_cache
-                .get_cached_rate()
-                .unwrap_or(0.0);
+            let usd_krw_for_select = self.forex_cache.get_cached_rate().unwrap_or(0.0);
             let candidates = selector
                 .select(
                     self.config.max_coins,
@@ -271,11 +277,29 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
             self.config.coins.clone()
         };
 
+        // 시작 시점 환율 기록
+        let usd_krw_start = self.forex_cache.get_cached_rate().unwrap_or(0.0);
+
         info!("실시간 모니터링 시작: 워밍업 데이터 로드 중...");
 
         // 2. 워밍업: REST API로 캔들 사전 로드
         let mut spread_calc = SpreadCalculator::new(&current_coins, self.config.window_size);
         self.warmup(&current_coins, &mut spread_calc).await?;
+
+        // 워밍업 완료 후 요약 레코드 생성 및 기록
+        let mut minute_records: Vec<MinuteRecord> = Vec::new();
+        if let Some(ref mut writer) = session_writer {
+            let warmup_records = Self::generate_warmup_records(
+                &spread_calc,
+                &current_coins,
+                &self.config,
+                &self.forex_cache,
+            );
+            minute_records.extend(warmup_records.iter().cloned());
+            if let Err(e) = writer.append_minutes_batch(&warmup_records) {
+                warn!(error = %e, "워밍업 요약 기록 실패");
+            }
+        }
 
         info!("워밍업 완료. WebSocket 연결 중...");
 
@@ -333,6 +357,8 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                         &mut trades,
                         &current_coins,
                         &self.forex_cache,
+                        &mut session_writer,
+                        &mut minute_records,
                     )?;
                 }
                 Some(event) = bybit_rx.recv() => {
@@ -346,6 +372,8 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                         &mut trades,
                         &current_coins,
                         &self.forex_cache,
+                        &mut session_writer,
+                        &mut minute_records,
                     )?;
                 }
                 _ = minute_timer.tick() => {
@@ -361,6 +389,8 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                             now,
                             &current_coins,
                             &self.forex_cache,
+                            &mut session_writer,
+                            &mut minute_records,
                         )?;
                     }
                 }
@@ -486,6 +516,11 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                                     net_pnl = %closed.net_pnl,
                                     "TTL 만료 강제 청산 완료"
                                 );
+                                if let Some(ref mut w) = session_writer
+                                    && let Err(e) = w.append_trade(&closed)
+                                {
+                                    warn!(coin = coin.as_str(), error = %e, "TTL 만료 거래 CSV 기록 실패");
+                                }
                                 trades.push(closed);
                             }
                             Err(e) => {
@@ -591,6 +626,29 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
         // 정리: WebSocket 구독 해제
         self.upbit.unsubscribe().await.ok();
         self.bybit.unsubscribe().await.ok();
+
+        // 세션 종료 시 JSON 일괄 저장 및 요약 출력
+        if let Some(ref mut writer) = session_writer {
+            let session_end = Utc::now();
+            let usd_krw_end = self.forex_cache.get_cached_rate().unwrap_or(0.0);
+
+            let summary = SessionSummary::calculate(
+                &trades,
+                session_start,
+                session_end,
+                &current_coins,
+                usd_krw_start,
+                usd_krw_end,
+                total_event_count,
+            );
+
+            if let Err(e) = writer.finalize(&trades, &minute_records, &summary) {
+                warn!(error = %e, "세션 파일 저장 실패");
+            }
+
+            // 콘솔에도 요약 출력
+            println!("\n{}", summary.to_text());
+        }
 
         info!(trades = trades.len(), "실시간 모니터링 종료");
 
@@ -764,6 +822,8 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
         trades: &mut Vec<ClosedPosition>,
         current_coins: &[String],
         forex_cache: &ForexCache,
+        session_writer: &mut Option<SessionWriter>,
+        minute_records: &mut Vec<MinuteRecord>,
     ) -> Result<(), StrategyError> {
         let (event_ts, event_market, event_type) = match event {
             MarketEvent::Trade {
@@ -798,6 +858,8 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                     event_ts,
                     current_coins,
                     forex_cache,
+                    session_writer,
+                    minute_records,
                 )?;
             }
             candle_builder.start_new_minute(event_ts);
@@ -831,6 +893,7 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                 position_mgr,
                 trades,
                 forex_cache,
+                session_writer,
             )
         {
             warn!(coin = coin.as_str(), error = %e, "틱 시그널 평가 실패");
@@ -840,6 +903,7 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
     }
 
     /// 틱 수신 시 즉시 시그널을 평가합니다.
+    #[allow(clippy::too_many_arguments)]
     fn check_tick_signal(
         coin: &str,
         config: &ZScoreConfig,
@@ -848,6 +912,7 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
         position_mgr: &mut PositionManager,
         trades: &mut Vec<ClosedPosition>,
         forex_cache: &ForexCache,
+        session_writer: &mut Option<SessionWriter>,
     ) -> Result<(), StrategyError> {
         // 1. 양쪽 last_trade가 모두 있어야 함
         let upbit_krw = match candle_builder.upbit_last_trade.get(coin) {
@@ -895,7 +960,11 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
             mean = mean,
             stddev = stddev,
             spread = current_spread,
-            z_approx = if stddev > 0.0 { (current_spread - mean) / stddev } else { 0.0 },
+            z_approx = if stddev > 0.0 {
+                (current_spread - mean) / stddev
+            } else {
+                0.0
+            },
             "틱 시그널 평가 입력"
         );
 
@@ -974,6 +1043,11 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                 ) {
                     Ok(closed) => {
                         info!(coin = c.as_str(), net_pnl = %closed.net_pnl, "[틱] 포지션 청산 완료");
+                        if let Some(w) = session_writer
+                            && let Err(e) = w.append_trade(&closed)
+                        {
+                            warn!(coin = c.as_str(), error = %e, "거래 내역 CSV 기록 실패");
+                        }
                         trades.push(closed);
                     }
                     Err(e) => {
@@ -1001,6 +1075,8 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
         new_minute_ts: DateTime<Utc>,
         current_coins: &[String],
         forex_cache: &ForexCache,
+        session_writer: &mut Option<SessionWriter>,
+        minute_records: &mut Vec<MinuteRecord>,
     ) -> Result<(), StrategyError> {
         let ts = candle_builder
             .current_minute
@@ -1063,6 +1139,11 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                     true,
                 ) {
                     Ok(closed) => {
+                        if let Some(w) = session_writer
+                            && let Err(e) = w.append_trade(&closed)
+                        {
+                            warn!(coin = coin.as_str(), error = %e, "강제 청산 거래 CSV 기록 실패");
+                        }
                         trades.push(closed);
                     }
                     Err(e) => {
@@ -1079,24 +1160,104 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                 } else {
                     0.0
                 };
+
+                let position_str = if position_mgr.has_position(coin) {
+                    "OPEN"
+                } else {
+                    "NONE"
+                };
+
                 debug!(
                     coin = coin.as_str(),
                     spread_pct = last_spread,
                     mean = mean,
                     stddev = stddev,
                     z_score = z,
-                    position = if position_mgr.has_position(coin) {
-                        "OPEN"
-                    } else {
-                        "NONE"
-                    },
+                    position = position_str,
                     "분 완결: 통계 갱신 완료 (시그널은 틱에서 처리)"
                 );
+
+                // MinuteRecord 생성 및 CSV 기록
+                let upbit_close_f64 = spread_calc
+                    .upbit_window(coin)
+                    .and_then(|w| w.last())
+                    .unwrap_or(0.0);
+                let bybit_close_f64 = spread_calc
+                    .bybit_window(coin)
+                    .and_then(|w| w.last())
+                    .unwrap_or(0.0);
+
+                let record = MinuteRecord {
+                    timestamp: ts.to_rfc3339(),
+                    coin: coin.clone(),
+                    upbit_close: upbit_close_f64,
+                    bybit_close: bybit_close_f64,
+                    usd_krw,
+                    spread_pct: last_spread,
+                    mean,
+                    stddev,
+                    z_score: z,
+                    position: position_str.to_string(),
+                    source: "live".to_string(),
+                };
+
+                minute_records.push(record.clone());
+                if let Some(w) = session_writer
+                    && let Err(e) = w.append_minute(&record)
+                {
+                    warn!(coin = coin.as_str(), error = %e, "분봉 통계 CSV 기록 실패");
+                }
             }
         }
 
         candle_builder.start_new_minute(new_minute_ts);
         Ok(())
+    }
+
+    /// 워밍업 완료 후 각 코인의 현재 통계를 `MinuteRecord`로 생성합니다.
+    fn generate_warmup_records(
+        spread_calc: &SpreadCalculator,
+        coins: &[String],
+        config: &ZScoreConfig,
+        forex_cache: &ForexCache,
+    ) -> Vec<MinuteRecord> {
+        let mut records = Vec::new();
+        let usd_krw = forex_cache.get_cached_rate().unwrap_or(0.0);
+
+        for coin in coins {
+            if let Some((mean, stddev)) = spread_calc.cached_stats(coin) {
+                let spread = spread_calc.last_spread_pct(coin).unwrap_or(0.0);
+                let z = if stddev >= config.min_stddev_threshold {
+                    (spread - mean) / stddev
+                } else {
+                    0.0
+                };
+                let upbit_close = spread_calc
+                    .upbit_window(coin)
+                    .and_then(|w| w.last())
+                    .unwrap_or(0.0);
+                let bybit_close = spread_calc
+                    .bybit_window(coin)
+                    .and_then(|w| w.last())
+                    .unwrap_or(0.0);
+
+                records.push(MinuteRecord {
+                    timestamp: Utc::now().to_rfc3339(),
+                    coin: coin.clone(),
+                    upbit_close,
+                    bybit_close,
+                    usd_krw,
+                    spread_pct: spread,
+                    mean,
+                    stddev,
+                    z_score: z,
+                    position: "NONE".to_string(),
+                    source: "warmup".to_string(),
+                });
+            }
+        }
+
+        records
     }
 
     /// 설정에 접근합니다.
@@ -1360,6 +1521,7 @@ mod tests {
         let mut position_mgr = PositionManager::new();
         let mut trades = Vec::new();
         let forex_cache = ForexCache::new(Duration::from_secs(600));
+        let mut session_writer: Option<SessionWriter> = None;
         // 캐시 비어있음 -> 즉시 Ok(()) 반환
         let result = ZScoreMonitor::<MockMarket, MockMarket>::check_tick_signal(
             "BTC",
@@ -1369,6 +1531,7 @@ mod tests {
             &mut position_mgr,
             &mut trades,
             &forex_cache,
+            &mut session_writer,
         );
         assert!(result.is_ok());
         assert!(trades.is_empty());
@@ -1391,6 +1554,7 @@ mod tests {
         let mut trades = Vec::new();
         let forex_cache = ForexCache::new(Duration::from_secs(600));
         forex_cache.update_cache_for_test(1450.0);
+        let mut session_writer: Option<SessionWriter> = None;
 
         let result = ZScoreMonitor::<MockMarket, MockMarket>::check_tick_signal(
             "BTC",
@@ -1400,6 +1564,7 @@ mod tests {
             &mut position_mgr,
             &mut trades,
             &forex_cache,
+            &mut session_writer,
         );
         assert!(result.is_ok());
         assert!(trades.is_empty());
@@ -1426,6 +1591,7 @@ mod tests {
         let mut trades = Vec::new();
         let forex_cache = ForexCache::new(Duration::from_secs(600));
         forex_cache.update_cache_for_test(1450.0);
+        let mut session_writer: Option<SessionWriter> = None;
 
         let result = ZScoreMonitor::<MockMarket, MockMarket>::check_tick_signal(
             "BTC",
@@ -1435,6 +1601,7 @@ mod tests {
             &mut position_mgr,
             &mut trades,
             &forex_cache,
+            &mut session_writer,
         );
         assert!(result.is_ok());
         // 윈도우 미충족이므로 시그널 없음

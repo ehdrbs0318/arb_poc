@@ -4,10 +4,11 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
+use serde::Serialize;
 use tracing::debug;
 
 /// 청산된 포지션 기록.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ClosedPosition {
     /// 코인 심볼.
     pub coin: String,
@@ -18,18 +19,37 @@ pub struct ClosedPosition {
     /// 보유 시간 (분).
     pub holding_minutes: u64,
     /// 포지션 크기 (USDT, 단일 leg 기준).
+    #[serde(with = "rust_decimal::serde::str")]
     pub size_usdt: Decimal,
+    /// Upbit 진입가 (USD 환산).
+    #[serde(with = "rust_decimal::serde::str")]
+    pub upbit_entry_price: Decimal,
+    /// Bybit 진입가 (USDT).
+    #[serde(with = "rust_decimal::serde::str")]
+    pub bybit_entry_price: Decimal,
+    /// Upbit 청산가 (USD 환산).
+    #[serde(with = "rust_decimal::serde::str")]
+    pub upbit_exit_price: Decimal,
+    /// Bybit 청산가 (USDT).
+    #[serde(with = "rust_decimal::serde::str")]
+    pub bybit_exit_price: Decimal,
     /// Upbit 측 PnL (현물 매수 -> 매도 손익).
+    #[serde(with = "rust_decimal::serde::str")]
     pub upbit_pnl: Decimal,
     /// Bybit 측 PnL (선물 short -> 청산 손익).
+    #[serde(with = "rust_decimal::serde::str")]
     pub bybit_pnl: Decimal,
     /// Upbit 측 수수료.
+    #[serde(with = "rust_decimal::serde::str")]
     pub upbit_fees: Decimal,
     /// Bybit 측 수수료.
+    #[serde(with = "rust_decimal::serde::str")]
     pub bybit_fees: Decimal,
     /// 총 수수료 (양 거래소 합산) = upbit_fees + bybit_fees.
+    #[serde(with = "rust_decimal::serde::str")]
     pub total_fees: Decimal,
     /// 순 PnL = upbit_pnl + bybit_pnl - total_fees.
+    #[serde(with = "rust_decimal::serde::str")]
     pub net_pnl: Decimal,
     /// 진입 시 Z-Score.
     pub entry_z_score: f64,
@@ -109,6 +129,10 @@ mod tests {
             exit_time: Utc::now(),
             holding_minutes: 30,
             size_usdt: Decimal::new(1000, 0),
+            upbit_entry_price: Decimal::new(95_000, 0),
+            bybit_entry_price: Decimal::new(95_100, 0),
+            upbit_exit_price: Decimal::new(95_050, 0),
+            bybit_exit_price: Decimal::new(95_080, 0),
             upbit_pnl: Decimal::ZERO,
             bybit_pnl: Decimal::ZERO,
             upbit_fees: Decimal::ZERO,

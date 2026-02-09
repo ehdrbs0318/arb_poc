@@ -58,6 +58,8 @@ pub struct ZScoreConfig {
     /// 포지션 TTL (시간 단위, 기본값: 24).
     /// 해당 시간 이후 자동 청산합니다.
     pub position_ttl_hours: u64,
+    /// 세션 출력 설정.
+    pub output: crate::output::writer::OutputConfig,
 }
 
 impl Default for ZScoreConfig {
@@ -82,6 +84,7 @@ impl Default for ZScoreConfig {
             min_volume_1h_usdt: Decimal::new(1_000_000, 0),
             blacklist: vec![],
             position_ttl_hours: 24,
+            output: crate::output::writer::OutputConfig::default(),
         }
     }
 }
@@ -179,15 +182,34 @@ impl ZScoreConfig {
     pub fn from_toml_str(s: &str) -> Result<Self, StrategyError> {
         let wrapper: TomlWrapper = toml::from_str(s)
             .map_err(|e| StrategyError::Config(format!("TOML parse error: {e}")))?;
-        Ok(wrapper.zscore.into())
+        let mut config: ZScoreConfig = wrapper.zscore.into();
+
+        // [output] 섹션이 있으면 OutputConfig로 변환
+        if let Some(raw_output) = wrapper.output {
+            config.output = crate::output::writer::OutputConfig {
+                enabled: raw_output.enabled.unwrap_or(true),
+                dir: raw_output.dir.unwrap_or_else(|| "output".to_string()),
+            };
+        }
+
+        Ok(config)
     }
 }
 
-/// TOML 최상위 래퍼 (`[zscore]` 섹션).
+/// TOML 최상위 래퍼 (`[zscore]`, `[output]` 섹션).
 #[derive(Deserialize)]
 struct TomlWrapper {
     #[serde(default)]
     zscore: RawZScoreConfig,
+    #[serde(default)]
+    output: Option<RawOutputConfig>,
+}
+
+/// TOML 출력 설정 역직렬화용 중간 구조체.
+#[derive(Deserialize, Default)]
+struct RawOutputConfig {
+    enabled: Option<bool>,
+    dir: Option<String>,
 }
 
 /// TOML 역직렬화 전용 중간 구조체.
@@ -269,6 +291,7 @@ impl From<RawZScoreConfig> for ZScoreConfig {
                 .unwrap_or(Decimal::new(1_000_000, 0)),
             blacklist: raw.blacklist.unwrap_or_default(),
             position_ttl_hours: raw.position_ttl_hours.unwrap_or(24),
+            output: crate::output::writer::OutputConfig::default(),
         }
     }
 }
@@ -450,5 +473,43 @@ auto_select = true
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("max_coins"));
+    }
+
+    // --- OutputConfig 테스트 ---
+
+    #[test]
+    fn test_output_config_default() {
+        // 기본 ZScoreConfig의 output 필드가 기본값인지 확인
+        let config = ZScoreConfig::default();
+        assert!(config.output.enabled);
+        assert_eq!(config.output.dir, "output");
+    }
+
+    #[test]
+    fn test_output_config_from_toml() {
+        // TOML에서 [output] 섹션을 파싱하여 OutputConfig로 변환
+        let toml = r#"
+[zscore]
+coins = ["BTC"]
+
+[output]
+enabled = false
+dir = "my_output"
+"#;
+        let config = ZScoreConfig::from_toml_str(toml).unwrap();
+        assert!(!config.output.enabled);
+        assert_eq!(config.output.dir, "my_output");
+    }
+
+    #[test]
+    fn test_output_config_missing_uses_default() {
+        // [output] 섹션이 없으면 기본값 사용
+        let toml = r#"
+[zscore]
+coins = ["BTC"]
+"#;
+        let config = ZScoreConfig::from_toml_str(toml).unwrap();
+        assert!(config.output.enabled);
+        assert_eq!(config.output.dir, "output");
     }
 }

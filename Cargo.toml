@@ -33,7 +33,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
 
 # Decimal precision for financial calculations
-rust_decimal = { version = "1.36", features = ["serde"] }
+rust_decimal = { workspace = true }
 
 # Cancellation token for graceful shutdown
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -81,7 +81,7 @@ thiserror = "2.0"
 async-trait = "0.1"
 
 # Decimal precision for financial calculations
-rust_decimal = { version = "1.36", features = ["serde"] }
+rust_decimal = { version = "1.36", features = ["serde", "serde-with-str"] }
 
 # Configuration
 config = "0.15"
