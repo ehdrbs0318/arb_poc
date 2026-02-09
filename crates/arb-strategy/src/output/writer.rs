@@ -152,7 +152,7 @@ impl SessionWriter {
         if !self.trades_header_written {
             writeln!(
                 self.trades_writer,
-                "coin,entry_time,exit_time,holding_minutes,size_usdt,\
+                "id,coin,entry_time,exit_time,holding_minutes,size_usdt,\
                  upbit_entry_price,bybit_entry_price,upbit_exit_price,bybit_exit_price,\
                  entry_spread_pct,exit_spread_pct,entry_z_score,exit_z_score,\
                  entry_usd_krw,exit_usd_krw,upbit_pnl,bybit_pnl,\
@@ -163,7 +163,8 @@ impl SessionWriter {
 
         writeln!(
             self.trades_writer,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            trade.id,
             trade.coin,
             trade.entry_time.to_rfc3339(),
             trade.exit_time.to_rfc3339(),
@@ -304,6 +305,7 @@ fn open_csv_file(dir: &Path, filename: &str) -> io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::summary::MonitoringCounters;
     use chrono::TimeZone;
     use rust_decimal::Decimal;
 
@@ -311,6 +313,7 @@ mod tests {
     fn make_trade(coin: &str, net_pnl: Decimal) -> ClosedPosition {
         let now = Utc::now();
         ClosedPosition {
+            id: 0,
             coin: coin.to_string(),
             entry_time: now,
             exit_time: now,
@@ -395,9 +398,9 @@ mod tests {
 
         // 헤더 + 데이터 2행 = 3행
         assert_eq!(lines.len(), 3);
-        assert!(lines[0].starts_with("coin,"));
-        assert!(lines[1].starts_with("BTC,"));
-        assert!(lines[2].starts_with("ETH,"));
+        assert!(lines[0].starts_with("id,coin,"));
+        assert!(lines[1].starts_with("0,BTC,"));
+        assert!(lines[2].starts_with("0,ETH,"));
     }
 
     #[test]
@@ -460,8 +463,16 @@ mod tests {
 
         let trades = vec![make_trade("BTC", Decimal::new(10, 0))];
         let minutes = vec![make_minute("BTC", 1.5, "live")];
-        let summary =
-            SessionSummary::calculate(&trades, start, end, &coins, 1463.33, 1465.20, 54320);
+        let summary = SessionSummary::calculate(
+            &trades,
+            start,
+            end,
+            &coins,
+            1463.33,
+            1465.20,
+            54320,
+            &MonitoringCounters::default(),
+        );
 
         writer.finalize(&trades, &minutes, &summary).unwrap();
 

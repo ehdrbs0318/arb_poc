@@ -320,7 +320,7 @@ impl MarketData for UpbitClient {
 
     async fn get_orderbook(&self, market: &str, depth: Option<u32>) -> ExchangeResult<OrderBook> {
         let depth_str = depth.unwrap_or(15).to_string();
-        let params = [("markets", market), ("level", &depth_str)];
+        let params = [("markets", market), ("count", &depth_str)];
 
         let orderbooks: Vec<UpbitOrderbook> = self.get_public("/orderbook", Some(&params)).await?;
 

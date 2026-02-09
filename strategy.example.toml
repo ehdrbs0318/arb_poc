@@ -1,11 +1,16 @@
 # Z-Score 차익거래 전략 설정 템플릿
 #
-# 이 파일을 strategy.toml로 복사하여 사용하세요.
-# arb-config의 간이 파서는 중첩 섹션을 지원하지 않으므로,
-# 전략 설정은 별도 파일로 분리합니다.
+# 이 파일을 strategy.toml로 복사하여 사용하세요:
+#   cp strategy.example.toml strategy.toml
+#
+# 실행:
+#   cargo run --example zscore_monitor
+#   RUST_LOG=debug cargo run --example zscore_monitor
 
 [zscore]
-# 대상 코인 목록
+# ── 기본 전략 파라미터 ──────────────────────────────────
+
+# 대상 코인 목록 (auto_select=false일 때 사용)
 coins = ["BTC", "ETH", "XRP"]
 
 # 캔들 윈도우 크기 (1분봉 기준, 기본값: 1440 = 1일)
@@ -21,57 +26,68 @@ exit_z_threshold = 0.5
 # 총 자본금 (USDT, 양 거래소 합산)
 total_capital_usdt = 10000.0
 
-# 포지션당 자본금 비율 (0.1 = 총 자본의 10%)
-# 실제 필요 자본 = total_capital × position_ratio × 2 (양 거래소)
-position_ratio = 0.1
-
-# Bybit 레버리지 (기본값: 1)
-leverage = 1
-
-# Bybit maintenance margin rate (기본값: 0.005 = 0.5%)
-bybit_mmr = 0.005
-
-# 백테스트 기간 (분 단위, 워밍업 제외, 기본값: 8640 = 6일)
-backtest_period_minutes = 8640
-
 # Z-Score 계산 시 최소 stddev 임계값 (기본값: 0.01)
 min_stddev_threshold = 0.01
 
-# 결과 CSV 출력 디렉토리
-output_dir = "./output/"
+# ── 수수료/레버리지 ─────────────────────────────────────
+
+# Upbit taker 수수료율 (기본값: 0.0005 = 0.05%)
+# upbit_taker_fee = 0.0005
+
+# Bybit linear taker 수수료율 (기본값: 0.00055 = 0.055%)
+# bybit_taker_fee = 0.00055
+
+# Bybit 레버리지 (기본값: 1)
+# leverage = 1
+
+# Bybit maintenance margin rate (기본값: 0.005 = 0.5%)
+# bybit_mmr = 0.005
+
+# ── 오더북 기반 동적 포지션 사이징 (spec/0006) ──────────
+
+# 코인 페어당 최대 포지션 크기 비율 (기본값: 0.2 = 총 자본의 20%)
+max_position_ratio = 0.2
+
+# TTL 초과 후 분할 청산 유예 기간 (시간, 기본값: 4)
+# 1단계: TTL 만료 → 오더북 기반 분할 청산 시도
+# 2단계: TTL + grace_period → 강제 전량 청산
+grace_period_hours = 4
+
+# 같은 코인에 대한 재진입 최소 간격 (초, 기본값: 10)
+entry_cooldown_sec = 10
+
+# 오더북 캐시 최대 유효 시간 (초, 기본값: 5)
+max_cache_age_sec = 5
 
 # 최대 동시 포지션 수 (생략 시 코인 수만큼 허용)
-# max_concurrent_positions = 2
+# max_concurrent_positions = 3
 
-# 볼륨/슬리피지 모델 (기본: 비활성)
-# 활성화하면 캔들 거래량 대비 주문 비율로 슬리피지를 추정합니다.
-volume_filter_enabled = false
-# 최대 참여율 (캔들 거래량의 10%, 초과 시 진입 거부)
-max_participation_rate = 0.1
-# 기본 슬리피지 (bps, 1 bps = 0.01%)
-slippage_base_bps = 1.0
-# Square-Root Impact 계수: slippage_bps = base + coeff × √(participation_rate) × 10000
-slippage_impact_coeff = 0.001
+# ── 자동 코인 선택 ──────────────────────────────────────
 
-# 자동 코인 선택 (기본: 비활성)
-# 활성화하면 거래량/변동성 기반으로 감시 코인을 자동 선택합니다.
-# auto_select = true일 때 coins는 무시되고, 자동 선택된 코인이 사용됩니다.
-auto_select = false
-# 최대 감시 코인 수 (기본: 5)
-max_coins = 5
-# 재선택 주기 (분, 기본: 10)
+# true이면 거래량/변동성 기반으로 감시 코인을 자동 선택합니다.
+# coins 목록은 무시됩니다.
+auto_select = true
+
+# 최대 감시 코인 수 (기본값: 5)
+max_coins = 3
+
+# 재선택 주기 (분, 기본값: 10)
 reselect_interval_min = 10
-# 1시간 최소 거래량 (USDT, 기본: 1,000,000)
-min_volume_1h_usdt = 1000000.0
-# 제외 코인 목록 (스테이블코인은 자동 제외)
+
+# 1시간 최소 거래량 필터 (USDT, 기본값: 50000)
+min_volume_1h_usdt = 50000.0
+
+# 제외 코인 블랙리스트 (스테이블코인은 자동 제외)
 blacklist = []
-# 탈락 코인 포지션 최대 유지 시간 (기본: 24시간)
+
+# 탈락 코인 포지션 최대 유지 시간 (기본값: 24시간)
 # TTL 만료 시 강제 청산합니다.
 position_ttl_hours = 24
 
-# 파라미터 sweep 설정 (zscore_parameter_sweep 예제 전용)
-# cargo run --example zscore_parameter_sweep
-[sweep]
-entry_z_values = [2.0, 2.5, 3.0, 3.5, 4.0]
-# exit_z_values = [0.3, 0.5, 0.7]   # 생략 시 기본 exit_z 사용
-# max_combinations = 50              # 조합 수 가드레일 (기본 50)
+# ── 세션 출력 ───────────────────────────────────────────
+
+[output]
+# 세션 출력 활성화 (기본값: true)
+enabled = true
+# 출력 디렉토리 (기본값: "output", 하위에 타임스탬프 폴더 생성)
+dir = "output"

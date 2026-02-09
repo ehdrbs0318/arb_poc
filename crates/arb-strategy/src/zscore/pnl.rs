@@ -10,6 +10,8 @@ use tracing::debug;
 /// 청산된 포지션 기록.
 #[derive(Debug, Clone, Serialize)]
 pub struct ClosedPosition {
+    /// 포지션 고유 ID.
+    pub id: u64,
     /// 코인 심볼.
     pub coin: String,
     /// 진입 시간.
@@ -124,6 +126,7 @@ mod tests {
 
     fn make_closed(net_pnl: i64, scale: u32) -> ClosedPosition {
         ClosedPosition {
+            id: 0,
             coin: "BTC".to_string(),
             entry_time: Utc::now(),
             exit_time: Utc::now(),

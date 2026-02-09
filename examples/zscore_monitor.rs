@@ -1,29 +1,41 @@
-//! Z-Score 실시간 모니터링 예제.
+//! Z-Score 실시간 모니터링 (시뮬레이션).
 //!
 //! Upbit/Bybit WebSocket 스트림에서 실시간으로 Z-Score 기반
-//! 차익거래 시그널을 감지합니다.
+//! 차익거래 시그널을 감지하고, 가상 포지션으로 시뮬레이션합니다.
+//!
+//! ## 사전 준비
+//!
+//! 1. 설정 파일 생성 (최초 1회):
+//!    ```bash
+//!    cp strategy.example.toml strategy.toml
+//!    ```
+//!
+//! 2. `strategy.toml` 편집 — 필요한 파라미터 조정
 //!
 //! ## 실행 방법
 //!
 //! ```bash
-//! # 기본 설정으로 실행
+//! # 기본 실행 (info 로그)
 //! cargo run --example zscore_monitor
 //!
-//! # 커스텀 설정 파일 지정
-//! STRATEGY_CONFIG=strategy.toml cargo run --example zscore_monitor
-//!
-//! # 디버그 로그 활성화
+//! # 디버그 로그 (오더북/시그널 상세 출력)
 //! RUST_LOG=debug cargo run --example zscore_monitor
+//!
+//! # 커스텀 설정 파일 지정
+//! STRATEGY_CONFIG=my_strategy.toml cargo run --example zscore_monitor
 //! ```
 //!
-//! ## 사전 준비
+//! ## 출력
 //!
-//! - 인터넷 연결 (WebSocket + REST API)
-//! - (선택) `strategy.toml` 파일 생성 (`strategy.example.toml` 참조)
+//! `output/<타임스탬프>/` 디렉토리에 다음 파일이 생성됩니다:
+//! - `trades.csv` — 개별 거래 기록 (진입/청산 가격, PnL 등)
+//! - `minutes.csv` — 분단위 스프레드/Z-Score 스냅샷
+//! - `summary.json` / `summary.txt` — 세션 요약 통계
 //!
 //! ## 종료
 //!
 //! `Ctrl+C`로 graceful shutdown합니다.
+//! 종료 시 summary 파일이 생성됩니다.
 
 use std::sync::Arc;
 use std::time::Duration;

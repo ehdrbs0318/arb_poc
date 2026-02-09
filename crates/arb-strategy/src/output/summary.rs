@@ -11,6 +11,27 @@ use serde::Serialize;
 
 use crate::zscore::pnl::{ClosedPosition, calculate_max_drawdown, daily_pnl};
 
+/// 모니터링 카운터.
+///
+/// 세션 중 발생한 각종 이벤트를 집계합니다.
+#[derive(Debug, Clone, Default)]
+pub struct MonitoringCounters {
+    /// 드롭된 틱 수 (처리 지연으로 스킵된 이벤트).
+    pub dropped_tick_count: u64,
+    /// 오더북 조회 시도 횟수.
+    pub orderbook_fetch_count: u64,
+    /// 오더북 조회 실패 횟수.
+    pub orderbook_fetch_fail_count: u64,
+    /// 오래된 캐시 스킵 횟수.
+    pub stale_cache_skip_count: u64,
+    /// 슬리피지로 인한 진입 거부 횟수.
+    pub entry_rejected_slippage_count: u64,
+    /// 부분 청산 횟수.
+    pub partial_close_count: u64,
+    /// 강제 청산 횟수.
+    pub forced_liquidation_count: u64,
+}
+
 /// 일별 PnL 기록.
 #[derive(Debug, Clone, Serialize)]
 pub struct DailyPnl {
@@ -84,6 +105,20 @@ pub struct SessionSummary {
     pub total_fees: Decimal,
     /// 강제 청산 횟수.
     pub liquidation_count: usize,
+    /// 드롭된 틱 수.
+    pub dropped_tick_count: u64,
+    /// 오더북 조회 시도 횟수.
+    pub orderbook_fetch_count: u64,
+    /// 오더북 조회 실패 횟수.
+    pub orderbook_fetch_fail_count: u64,
+    /// 오래된 캐시 스킵 횟수.
+    pub stale_cache_skip_count: u64,
+    /// 슬리피지로 인한 진입 거부 횟수.
+    pub entry_rejected_slippage_count: u64,
+    /// 부분 청산 횟수.
+    pub partial_close_count: u64,
+    /// 강제 청산 (카운터 기반) 횟수.
+    pub forced_liquidation_count: u64,
 }
 
 impl SessionSummary {
@@ -98,6 +133,7 @@ impl SessionSummary {
     /// * `usd_krw_start` - 시작 시 USD/KRW 환율
     /// * `usd_krw_end` - 종료 시 USD/KRW 환율
     /// * `total_events` - 총 수신 이벤트 수
+    /// * `counters` - 모니터링 카운터
     #[allow(clippy::too_many_arguments)]
     pub fn calculate(
         trades: &[ClosedPosition],
@@ -107,6 +143,7 @@ impl SessionSummary {
         usd_krw_start: f64,
         usd_krw_end: f64,
         total_events: u64,
+        counters: &MonitoringCounters,
     ) -> Self {
         let duration_minutes = (session_end - session_start).num_minutes();
         let total_trades = trades.len();
@@ -205,6 +242,13 @@ impl SessionSummary {
             sharpe_ratio,
             total_fees,
             liquidation_count,
+            dropped_tick_count: counters.dropped_tick_count,
+            orderbook_fetch_count: counters.orderbook_fetch_count,
+            orderbook_fetch_fail_count: counters.orderbook_fetch_fail_count,
+            stale_cache_skip_count: counters.stale_cache_skip_count,
+            entry_rejected_slippage_count: counters.entry_rejected_slippage_count,
+            partial_close_count: counters.partial_close_count,
+            forced_liquidation_count: counters.forced_liquidation_count,
         }
     }
 
@@ -273,6 +317,34 @@ impl SessionSummary {
         s.push_str(&format!(
             "총 이벤트: {}건\n",
             format_number(self.total_events)
+        ));
+
+        // 모니터링 카운터
+        s.push_str("\n--- 모니터링 카운터 ---\n");
+        s.push_str(&format!(
+            "드롭 틱: {}건\n",
+            format_number(self.dropped_tick_count)
+        ));
+        s.push_str(&format!(
+            "오더북 조회: {}건 (실패 {}건)\n",
+            format_number(self.orderbook_fetch_count),
+            format_number(self.orderbook_fetch_fail_count)
+        ));
+        s.push_str(&format!(
+            "캐시 만료 스킵: {}건\n",
+            format_number(self.stale_cache_skip_count)
+        ));
+        s.push_str(&format!(
+            "슬리피지 진입 거부: {}건\n",
+            format_number(self.entry_rejected_slippage_count)
+        ));
+        s.push_str(&format!(
+            "부분 청산: {}건\n",
+            format_number(self.partial_close_count)
+        ));
+        s.push_str(&format!(
+            "강제 청산 (카운터): {}건\n",
+            format_number(self.forced_liquidation_count)
         ));
 
         s
@@ -377,6 +449,7 @@ mod tests {
         is_liquidated: bool,
     ) -> ClosedPosition {
         ClosedPosition {
+            id: 0,
             coin: coin.to_string(),
             entry_time: exit_time - chrono::Duration::minutes(holding_minutes as i64),
             exit_time,
@@ -408,7 +481,16 @@ mod tests {
         let end = Utc.with_ymd_and_hms(2026, 2, 10, 8, 30, 0).unwrap();
         let coins = vec!["BTC".to_string()];
 
-        let summary = SessionSummary::calculate(&[], start, end, &coins, 1463.33, 1465.20, 54320);
+        let summary = SessionSummary::calculate(
+            &[],
+            start,
+            end,
+            &coins,
+            1463.33,
+            1465.20,
+            54320,
+            &MonitoringCounters::default(),
+        );
 
         assert_eq!(summary.total_trades, 0);
         assert_eq!(summary.winning_trades, 0);
@@ -465,8 +547,16 @@ mod tests {
             ),
         ];
 
-        let summary =
-            SessionSummary::calculate(&trades, start, end, &coins, 1463.33, 1465.20, 10000);
+        let summary = SessionSummary::calculate(
+            &trades,
+            start,
+            end,
+            &coins,
+            1463.33,
+            1465.20,
+            10000,
+            &MonitoringCounters::default(),
+        );
 
         // net_pnl 합산: 10 + (-3) + 5 = 12
         assert_eq!(summary.total_net_pnl, Decimal::new(12, 0));
@@ -504,8 +594,16 @@ mod tests {
             false,
         )];
 
-        let summary =
-            SessionSummary::calculate(&trades, start, end, &coins, 1463.33, 1465.20, 54320);
+        let summary = SessionSummary::calculate(
+            &trades,
+            start,
+            end,
+            &coins,
+            1463.33,
+            1465.20,
+            54320,
+            &MonitoringCounters::default(),
+        );
         let text = summary.to_text();
 
         // 핵심 문자열 포함 확인
@@ -562,7 +660,16 @@ mod tests {
             ),
         ];
 
-        let summary = SessionSummary::calculate(&trades, start, end, &coins, 1400.0, 1410.0, 0);
+        let summary = SessionSummary::calculate(
+            &trades,
+            start,
+            end,
+            &coins,
+            1400.0,
+            1410.0,
+            0,
+            &MonitoringCounters::default(),
+        );
 
         assert_eq!(summary.daily_pnl.len(), 2);
         // 2월 9일: 10 + (-3) = 7
@@ -593,7 +700,16 @@ mod tests {
             make_trade("XRP", Decimal::new(3, 0), Decimal::ZERO, 30, exit, false),
         ];
 
-        let summary = SessionSummary::calculate(&trades, start, end, &coins, 1400.0, 1410.0, 0);
+        let summary = SessionSummary::calculate(
+            &trades,
+            start,
+            end,
+            &coins,
+            1400.0,
+            1410.0,
+            0,
+            &MonitoringCounters::default(),
+        );
 
         assert_eq!(summary.coin_pnl.len(), 2);
 
@@ -646,8 +762,16 @@ mod tests {
             false,
         )];
 
-        let summary =
-            SessionSummary::calculate(&trades, start, end, &["BTC".to_string()], 1400.0, 1410.0, 0);
+        let summary = SessionSummary::calculate(
+            &trades,
+            start,
+            end,
+            &["BTC".to_string()],
+            1400.0,
+            1410.0,
+            0,
+            &MonitoringCounters::default(),
+        );
 
         assert!((summary.profit_factor - 9999.99).abs() < 0.01);
         // JSON 직렬화 시 null이 아닌 숫자로 출력 확인
@@ -667,8 +791,16 @@ mod tests {
             make_trade("XRP", Decimal::new(-3, 0), Decimal::ZERO, 30, exit, true),
         ];
 
-        let summary =
-            SessionSummary::calculate(&trades, start, end, &["BTC".to_string()], 1400.0, 1410.0, 0);
+        let summary = SessionSummary::calculate(
+            &trades,
+            start,
+            end,
+            &["BTC".to_string()],
+            1400.0,
+            1410.0,
+            0,
+            &MonitoringCounters::default(),
+        );
 
         assert_eq!(summary.liquidation_count, 2);
     }

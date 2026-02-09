@@ -20,10 +20,12 @@ use arb_forex::ForexCache;
 use crate::common::candle_fetcher::fetch_all_candles;
 use crate::common::convert::truncate_to_minute;
 use crate::error::StrategyError;
+use crate::output::summary::MonitoringCounters;
 use crate::output::summary::SessionSummary;
 use crate::output::writer::{MinuteRecord, SessionWriter};
 use crate::zscore::coin_selector::{CoinCandidate, CoinSelector};
 use crate::zscore::config::ZScoreConfig;
+use crate::zscore::orderbook;
 use crate::zscore::pnl::ClosedPosition;
 use crate::zscore::position::{self, PositionManager, VirtualPosition};
 use crate::zscore::signal::{self, Signal};
@@ -301,6 +303,24 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
             }
         }
 
+        // OrderBookCache 및 MonitoringCounters 초기화
+        let mut ob_cache = orderbook::OrderBookCache::new();
+        let mut counters = MonitoringCounters::default();
+
+        // 워밍업 완료 후 오더북 프리페치
+        for coin in &current_coins {
+            let upbit_market = format!("KRW-{coin}");
+            let bybit_market = format!("{coin}USDT");
+            if let Ok(ob) = self.upbit.get_orderbook(&upbit_market, Some(15)).await {
+                ob_cache.update(orderbook::Exchange::Upbit, coin, ob);
+                counters.orderbook_fetch_count += 1;
+            }
+            if let Ok(ob) = self.bybit.get_orderbook(&bybit_market, Some(25)).await {
+                ob_cache.update(orderbook::Exchange::Bybit, coin, ob);
+                counters.orderbook_fetch_count += 1;
+            }
+        }
+
         info!("워밍업 완료. WebSocket 연결 중...");
 
         // 3. WebSocket 구독 (KRW-USDT 제거)
@@ -359,7 +379,11 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                         &self.forex_cache,
                         &mut session_writer,
                         &mut minute_records,
-                    )?;
+                        &mut ob_cache,
+                        &mut counters,
+                        &self.upbit,
+                        &self.bybit,
+                    ).await?;
                 }
                 Some(event) = bybit_rx.recv() => {
                     total_event_count += 1;
@@ -374,7 +398,11 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                         &self.forex_cache,
                         &mut session_writer,
                         &mut minute_records,
-                    )?;
+                        &mut ob_cache,
+                        &mut counters,
+                        &self.upbit,
+                        &self.bybit,
+                    ).await?;
                 }
                 _ = minute_timer.tick() => {
                     // 빈 분 감지: forward-fill 트리거
@@ -393,6 +421,18 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                             &mut minute_records,
                         )?;
                     }
+
+                    // TTL 만료 포지션 체크 (모든 코인)
+                    Self::check_ttl_positions(
+                        &self.config,
+                        &mut position_mgr,
+                        &mut trades,
+                        &mut spread_calc,
+                        &mut counters,
+                        &dropped_at,
+                        &self.forex_cache,
+                        &mut session_writer,
+                    )?;
                 }
                 _ = reselect_timer.tick(), if self.config.auto_select => {
                     // 자동 코인 재선택
@@ -470,78 +510,7 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                         );
                     }
 
-                    // TTL 만료 체크
-                    let ttl = chrono::Duration::hours(self.config.position_ttl_hours as i64);
-                    let now = Utc::now();
-                    let expired: Vec<String> = dropped_at
-                        .iter()
-                        .filter(|(_, time)| now - **time > ttl)
-                        .map(|(coin, _)| coin.clone())
-                        .collect();
-
-                    for coin in &expired {
-                        warn!(coin = coin.as_str(), "TTL 만료: 강제 청산");
-
-                        // 강제 청산: 현재 가격으로 시장가 청산
-                        let upbit_usdt = spread_calc
-                            .upbit_window(coin)
-                            .and_then(|w| w.last())
-                            .map(|f| Decimal::try_from(f).unwrap_or(Decimal::ZERO))
-                            .unwrap_or(Decimal::ZERO);
-                        let bybit_price = spread_calc
-                            .bybit_window(coin)
-                            .and_then(|w| w.last())
-                            .map(|f| Decimal::try_from(f).unwrap_or(Decimal::ZERO))
-                            .unwrap_or(Decimal::ZERO);
-                        let spread_pct = spread_calc.last_spread_pct(coin).unwrap_or(0.0);
-
-                        // ForexCache에서 환율 조회
-                        let exit_usd_krw = self.forex_cache.get_cached_rate().unwrap_or(0.0);
-
-                        match position_mgr.close_position(
-                            coin,
-                            now,
-                            upbit_usdt,
-                            bybit_price,
-                            exit_usd_krw,
-                            spread_pct,
-                            f64::NAN,
-                            self.config.upbit_taker_fee,
-                            self.config.bybit_taker_fee,
-                            false,
-                        ) {
-                            Ok(closed) => {
-                                info!(
-                                    coin = coin.as_str(),
-                                    net_pnl = %closed.net_pnl,
-                                    "TTL 만료 강제 청산 완료"
-                                );
-                                if let Some(ref mut w) = session_writer
-                                    && let Err(e) = w.append_trade(&closed)
-                                {
-                                    warn!(coin = coin.as_str(), error = %e, "TTL 만료 거래 CSV 기록 실패");
-                                }
-                                trades.push(closed);
-                            }
-                            Err(e) => {
-                                warn!(
-                                    coin = coin.as_str(),
-                                    error = %e,
-                                    "TTL 만료 강제 청산 실패"
-                                );
-                            }
-                        }
-
-                        // 데이터 정리
-                        spread_calc.remove_coin(coin);
-                        dropped_at.remove(coin);
-
-                        // WebSocket 구독 해제
-                        let upbit_market = format!("KRW-{coin}");
-                        let bybit_market = format!("{coin}USDT");
-                        self.upbit.unsubscribe_markets(&[&upbit_market]).await.ok();
-                        self.bybit.unsubscribe_markets(&[&bybit_market]).await.ok();
-                    }
+                    // TTL 체크는 minute_timer 브랜치로 이동됨
 
                     // 추가 코인: 워밍업 후 구독
                     for coin in &diff.to_add {
@@ -584,6 +553,18 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                                         .ok();
                                     spread_calc.remove_coin(coin);
                                     continue;
+                                }
+
+                                // 오더북 프리페치
+                                let upbit_ob_market = format!("KRW-{coin}");
+                                let bybit_ob_market = format!("{coin}USDT");
+                                if let Ok(ob) = self.upbit.get_orderbook(&upbit_ob_market, Some(15)).await {
+                                    ob_cache.update(orderbook::Exchange::Upbit, coin, ob);
+                                    counters.orderbook_fetch_count += 1;
+                                }
+                                if let Ok(ob) = self.bybit.get_orderbook(&bybit_ob_market, Some(25)).await {
+                                    ob_cache.update(orderbook::Exchange::Bybit, coin, ob);
+                                    counters.orderbook_fetch_count += 1;
                                 }
 
                                 info!(coin = coin.as_str(), "코인 추가 완료");
@@ -640,6 +621,7 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                 usd_krw_start,
                 usd_krw_end,
                 total_event_count,
+                &counters,
             );
 
             if let Err(e) = writer.finalize(&trades, &minute_records, &summary) {
@@ -812,8 +794,10 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
     }
 
     /// MarketEvent를 처리합니다.
+    ///
+    /// 오더북 REST 조회가 필요하므로 async입니다.
     #[allow(clippy::too_many_arguments)]
-    fn handle_event(
+    async fn handle_event(
         config: &ZScoreConfig,
         event: &MarketEvent,
         candle_builder: &mut MinuteCandleBuilder,
@@ -824,6 +808,10 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
         forex_cache: &ForexCache,
         session_writer: &mut Option<SessionWriter>,
         minute_records: &mut Vec<MinuteRecord>,
+        ob_cache: &mut orderbook::OrderBookCache,
+        counters: &mut MonitoringCounters,
+        upbit_client: &U,
+        bybit_client: &B,
     ) -> Result<(), StrategyError> {
         let (event_ts, event_market, event_type) = match event {
             MarketEvent::Trade {
@@ -875,6 +863,12 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
             }
         }
 
+        // 이벤트 소스 판별: Trade -> Upbit, BestQuote -> Bybit
+        let source_exchange = match event {
+            MarketEvent::Trade { .. } => orderbook::Exchange::Upbit,
+            MarketEvent::BestQuote { .. } => orderbook::Exchange::Bybit,
+        };
+
         // 틱 시그널 평가: 해당 코인 추출 후 check_tick_signal 호출
         let coin = match event {
             MarketEvent::Trade { market, .. } => market.strip_prefix("KRW-").map(|s| s.to_string()),
@@ -894,7 +888,13 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                 trades,
                 forex_cache,
                 session_writer,
+                ob_cache,
+                counters,
+                upbit_client,
+                bybit_client,
+                source_exchange,
             )
+            .await
         {
             warn!(coin = coin.as_str(), error = %e, "틱 시그널 평가 실패");
         }
@@ -903,8 +903,10 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
     }
 
     /// 틱 수신 시 즉시 시그널을 평가합니다.
+    ///
+    /// 오더북 기반 진입/청산 사이징을 포함하므로 async입니다.
     #[allow(clippy::too_many_arguments)]
-    fn check_tick_signal(
+    async fn check_tick_signal(
         coin: &str,
         config: &ZScoreConfig,
         candle_builder: &MinuteCandleBuilder,
@@ -913,6 +915,11 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
         trades: &mut Vec<ClosedPosition>,
         forex_cache: &ForexCache,
         session_writer: &mut Option<SessionWriter>,
+        ob_cache: &mut orderbook::OrderBookCache,
+        counters: &mut MonitoringCounters,
+        upbit_client: &U,
+        bybit_client: &B,
+        source_exchange: orderbook::Exchange,
     ) -> Result<(), StrategyError> {
         // 1. 양쪽 last_trade가 모두 있어야 함
         let upbit_krw = match candle_builder.upbit_last_trade.get(coin) {
@@ -968,94 +975,406 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
             "틱 시그널 평가 입력"
         );
 
-        // 4. 시그널 평가
-        let sig =
-            signal::evaluate_tick_signal(coin, current_spread, mean, stddev, position_mgr, config)?;
+        // 3a. computing flag 체크 + 오더북 REST 조회
+        let other_exchange = match source_exchange {
+            orderbook::Exchange::Upbit => orderbook::Exchange::Bybit,
+            orderbook::Exchange::Bybit => orderbook::Exchange::Upbit,
+        };
 
-        // 5. 시그널 처리
-        match sig {
-            Some(Signal::Enter {
-                coin: c,
-                z_score,
-                spread_pct,
-                expected_profit_pct,
-            }) => {
-                let size_usdt = config.total_capital_usdt * config.position_ratio;
-                let upbit_price = Decimal::try_from(upbit_usd).unwrap_or(Decimal::ZERO);
-                let bybit_price_dec = bybit_usd;
+        if ob_cache.is_computing(source_exchange, coin) {
+            counters.dropped_tick_count += 1;
+            return Ok(());
+        }
 
-                let liq_price = position::calculate_liquidation_price(
-                    bybit_price_dec,
-                    config.leverage,
-                    config.bybit_mmr,
-                    config.bybit_taker_fee,
-                );
+        ob_cache.set_computing(source_exchange, coin, true);
 
-                let pos = VirtualPosition {
-                    coin: c.clone(),
-                    entry_time: Utc::now(),
-                    upbit_entry_price: upbit_price,
-                    bybit_entry_price: bybit_price_dec,
-                    bybit_liquidation_price: liq_price,
-                    entry_usd_krw: usd_krw,
-                    entry_spread_pct: spread_pct,
-                    entry_z_score: z_score,
-                    size_usdt,
-                };
+        // 소스 거래소 오더북 REST 조회
+        let market = match source_exchange {
+            orderbook::Exchange::Upbit => format!("KRW-{coin}"),
+            orderbook::Exchange::Bybit => format!("{coin}USDT"),
+        };
+        let depth = match source_exchange {
+            orderbook::Exchange::Upbit => Some(15),
+            orderbook::Exchange::Bybit => Some(25),
+        };
 
-                info!(
-                    coin = c.as_str(),
-                    z_score = z_score,
-                    spread_pct = spread_pct,
-                    expected_profit = expected_profit_pct,
-                    "[틱] 진입 시그널"
-                );
+        let ob_result = match source_exchange {
+            orderbook::Exchange::Upbit => upbit_client.get_orderbook(&market, depth).await,
+            orderbook::Exchange::Bybit => bybit_client.get_orderbook(&market, depth).await,
+        };
 
-                if let Err(e) = position_mgr.open_position(pos) {
-                    warn!(coin = c.as_str(), error = %e, "포지션 오픈 실패");
-                }
+        match ob_result {
+            Ok(ob) => {
+                ob_cache.update(source_exchange, coin, ob);
+                counters.orderbook_fetch_count += 1;
             }
-            Some(Signal::Exit {
-                coin: c,
-                z_score,
-                spread_pct,
-            }) => {
-                info!(
-                    coin = c.as_str(),
-                    z_score = z_score,
-                    spread_pct = spread_pct,
-                    "[틱] 청산 시그널"
-                );
+            Err(e) => {
+                warn!(coin, exchange = ?source_exchange, error = %e, "오더북 조회 실패");
+                counters.orderbook_fetch_fail_count += 1;
+                ob_cache.set_computing(source_exchange, coin, false);
+                return Ok(());
+            }
+        }
 
-                let upbit_price = Decimal::try_from(upbit_usd).unwrap_or(Decimal::ZERO);
+        // 반대쪽 캐시 신선도 확인
+        if !ob_cache.is_fresh(other_exchange, coin, config.max_cache_age_sec) {
+            counters.stale_cache_skip_count += 1;
+            ob_cache.set_computing(source_exchange, coin, false);
+            return Ok(());
+        }
 
-                match position_mgr.close_position(
-                    &c,
-                    Utc::now(),
-                    upbit_price,
-                    bybit_usd,
+        // 4. 청산 시그널 평가 (exit-first)
+        let has_positions = position_mgr.has_position(coin);
+        if let Some(Signal::Exit {
+            coin: c,
+            z_score,
+            spread_pct,
+        }) =
+            signal::evaluate_exit_signal(coin, current_spread, mean, stddev, has_positions, config)?
+        {
+            info!(
+                coin = c.as_str(),
+                z_score = z_score,
+                spread_pct = spread_pct,
+                "[틱] 청산 시그널"
+            );
+
+            // 오더북 기반 청산 안전 볼륨 계산
+            let upbit_cached = ob_cache.get(orderbook::Exchange::Upbit, &c);
+            let bybit_cached = ob_cache.get(orderbook::Exchange::Bybit, &c);
+
+            if let (Some(upbit_ob), Some(bybit_ob)) = (upbit_cached, bybit_cached) {
+                let upbit_bids = orderbook::levels_to_f64(&upbit_ob.orderbook, false);
+                let bybit_asks = orderbook::levels_to_f64(&bybit_ob.orderbook, true);
+
+                let exit_safe = orderbook::calculate_exit_safe_volume(
+                    &upbit_bids,
+                    &bybit_asks,
+                    mean,
+                    config.upbit_taker_fee.to_f64().unwrap_or(0.0),
+                    config.bybit_taker_fee.to_f64().unwrap_or(0.0),
                     usd_krw,
-                    spread_pct,
-                    z_score,
-                    config.upbit_taker_fee,
-                    config.bybit_taker_fee,
-                    false,
-                ) {
-                    Ok(closed) => {
-                        info!(coin = c.as_str(), net_pnl = %closed.net_pnl, "[틱] 포지션 청산 완료");
-                        if let Some(w) = session_writer
-                            && let Err(e) = w.append_trade(&closed)
-                        {
-                            warn!(coin = c.as_str(), error = %e, "거래 내역 CSV 기록 실패");
-                        }
-                        trades.push(closed);
+                );
+
+                // 해당 코인의 포지션을 수익률 내림차순 정렬
+                let positions: Vec<(u64, Decimal, f64)> = position_mgr
+                    .open_positions
+                    .get(c.as_str())
+                    .map(|ps| {
+                        ps.iter()
+                            .map(|p| {
+                                let profit_rate = (spread_pct - p.entry_spread_pct)
+                                    / p.size_usdt.to_f64().unwrap_or(1.0);
+                                (p.id, p.size_usdt, profit_rate)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut sorted = positions;
+                sorted.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+                let mut remaining_safe_usdt =
+                    exit_safe.map(|sv| sv.safe_volume_usdt).unwrap_or(0.0);
+
+                let upbit_price = Decimal::try_from(upbit_usd).unwrap_or(Decimal::ZERO);
+
+                for (pid, size, _) in &sorted {
+                    if remaining_safe_usdt <= 0.0 {
+                        break;
                     }
-                    Err(e) => {
-                        warn!(coin = c.as_str(), error = %e, "포지션 청산 실패");
+                    let size_f64 = size.to_f64().unwrap_or(0.0);
+
+                    if remaining_safe_usdt >= size_f64 {
+                        // 전량 청산
+                        remaining_safe_usdt -= size_f64;
+                        match position_mgr.close_position(
+                            &c,
+                            *pid,
+                            Utc::now(),
+                            upbit_price,
+                            bybit_usd,
+                            usd_krw,
+                            spread_pct,
+                            z_score,
+                            config.upbit_taker_fee,
+                            config.bybit_taker_fee,
+                            false,
+                        ) {
+                            Ok(closed) => {
+                                if let Some(w) = session_writer
+                                    && let Err(e) = w.append_trade(&closed)
+                                {
+                                    warn!(error = %e, "CSV 기록 실패");
+                                }
+                                trades.push(closed);
+                            }
+                            Err(e) => warn!(error = %e, "청산 실패"),
+                        }
+                    } else {
+                        // 부분 청산
+                        let partial =
+                            Decimal::try_from(remaining_safe_usdt).unwrap_or(Decimal::ZERO);
+                        remaining_safe_usdt = 0.0;
+                        match position_mgr.close_partial(
+                            &c,
+                            *pid,
+                            partial,
+                            upbit_price,
+                            bybit_usd,
+                            usd_krw,
+                            spread_pct,
+                            z_score,
+                            config.upbit_taker_fee,
+                            config.bybit_taker_fee,
+                            false,
+                        ) {
+                            Ok((closed, _rem)) => {
+                                counters.partial_close_count += 1;
+                                if let Some(w) = session_writer
+                                    && let Err(e) = w.append_trade(&closed)
+                                {
+                                    warn!(error = %e, "CSV 기록 실패");
+                                }
+                                trades.push(closed);
+                            }
+                            Err(e) => warn!(error = %e, "부분 청산 실패"),
+                        }
                     }
                 }
             }
-            None => {}
+        }
+
+        // 5. 진입 시그널 평가
+        let max_coin_capital = config.total_capital_usdt * config.max_position_ratio;
+        let coin_used = position_mgr.coin_used_capital(coin);
+
+        if let Some(Signal::Enter {
+            coin: c,
+            z_score,
+            spread_pct,
+            expected_profit_pct,
+        }) = signal::evaluate_entry_signal(
+            coin,
+            current_spread,
+            mean,
+            stddev,
+            coin_used,
+            max_coin_capital,
+            position_mgr.open_count(),
+            position_mgr.last_entry_at(coin),
+            config,
+        )? {
+            // 오더북 기반 진입 안전 볼륨 계산
+            let upbit_cached = ob_cache.get(orderbook::Exchange::Upbit, &c);
+            let bybit_cached = ob_cache.get(orderbook::Exchange::Bybit, &c);
+
+            if let (Some(upbit_ob), Some(bybit_ob)) = (upbit_cached, bybit_cached) {
+                let upbit_asks = orderbook::levels_to_f64(&upbit_ob.orderbook, true);
+                let bybit_bids = orderbook::levels_to_f64(&bybit_ob.orderbook, false);
+
+                let entry_safe = orderbook::calculate_entry_safe_volume(
+                    &upbit_asks,
+                    &bybit_bids,
+                    mean,
+                    config.upbit_taker_fee.to_f64().unwrap_or(0.0),
+                    config.bybit_taker_fee.to_f64().unwrap_or(0.0),
+                    usd_krw,
+                );
+
+                match entry_safe {
+                    Some(sv) => {
+                        // safe_volume_ratio 동적 결정 (1h 거래대금 기반)
+                        let volume_1h = config.min_volume_1h_usdt.to_f64().unwrap_or(50_000.0);
+                        let ratio = orderbook::safe_volume_ratio_from_volume(volume_1h);
+
+                        let max_coin_cap = (config.total_capital_usdt * config.max_position_ratio)
+                            .to_f64()
+                            .unwrap_or(0.0);
+                        let used = position_mgr.coin_used_capital(&c).to_f64().unwrap_or(0.0);
+                        let remaining_cap = max_coin_cap - used;
+
+                        let size_usdt_f64 = (sv.safe_volume_usdt * ratio).min(remaining_cap);
+
+                        if size_usdt_f64 <= 5.0 {
+                            // 최소 주문 크기 미달
+                            counters.entry_rejected_slippage_count += 1;
+                            debug!(
+                                coin = c.as_str(),
+                                size_usdt = size_usdt_f64,
+                                "진입 거부: 안전 볼륨 최소 주문 크기 미달"
+                            );
+                        } else {
+                            let size_usdt =
+                                Decimal::try_from(size_usdt_f64).unwrap_or(Decimal::ZERO);
+                            let upbit_price = Decimal::try_from(upbit_usd).unwrap_or(Decimal::ZERO);
+                            let bybit_price_dec = bybit_usd;
+
+                            let liq_price = position::calculate_liquidation_price(
+                                bybit_price_dec,
+                                config.leverage,
+                                config.bybit_mmr,
+                                config.bybit_taker_fee,
+                            );
+
+                            let pos = VirtualPosition {
+                                id: 0, // PositionManager::open_position()에서 자동 할당
+                                coin: c.clone(),
+                                entry_time: Utc::now(),
+                                upbit_entry_price: upbit_price,
+                                bybit_entry_price: bybit_price_dec,
+                                bybit_liquidation_price: liq_price,
+                                entry_usd_krw: usd_krw,
+                                entry_spread_pct: spread_pct,
+                                entry_z_score: z_score,
+                                size_usdt,
+                            };
+
+                            info!(
+                                coin = c.as_str(),
+                                z_score = z_score,
+                                spread_pct = spread_pct,
+                                expected_profit = expected_profit_pct,
+                                size_usdt = %size_usdt,
+                                "[틱] 진입 시그널 (오더북 기반 사이징)"
+                            );
+
+                            if let Err(e) = position_mgr.open_position(pos) {
+                                warn!(coin = c.as_str(), error = %e, "포지션 오픈 실패");
+                            }
+                        }
+                    }
+                    None => {
+                        counters.entry_rejected_slippage_count += 1;
+                        debug!(coin = c.as_str(), "진입 거부: 오더북 안전 볼륨 없음");
+                    }
+                }
+            } else {
+                counters.stale_cache_skip_count += 1;
+                debug!(coin = c.as_str(), "진입 거부: 오더북 캐시 없음");
+            }
+        }
+
+        ob_cache.set_computing(source_exchange, coin, false);
+
+        Ok(())
+    }
+
+    /// TTL 만료 포지션을 체크하고 청산합니다.
+    ///
+    /// 탈락 코인 중 TTL이 만료된 포지션을 grace period에 따라 분할/전량 청산합니다.
+    /// - 1단계 (TTL ~ TTL+grace): 전량 청산 시도
+    /// - 2단계 (TTL+grace 초과): 슬리피지 무시 전량 강제 청산
+    #[allow(clippy::too_many_arguments)]
+    fn check_ttl_positions(
+        config: &ZScoreConfig,
+        position_mgr: &mut PositionManager,
+        trades: &mut Vec<ClosedPosition>,
+        spread_calc: &mut SpreadCalculator,
+        counters: &mut MonitoringCounters,
+        dropped_at: &HashMap<String, DateTime<Utc>>,
+        forex_cache: &ForexCache,
+        session_writer: &mut Option<SessionWriter>,
+    ) -> Result<(), StrategyError> {
+        let ttl = chrono::Duration::hours(config.position_ttl_hours as i64);
+        let grace = chrono::Duration::hours(config.grace_period_hours as i64);
+        let now = Utc::now();
+        let usd_krw = forex_cache.get_cached_rate().unwrap_or(0.0);
+
+        // 모든 열린 포지션의 코인 수집
+        let coins_with_positions: Vec<String> =
+            position_mgr.open_positions.keys().cloned().collect();
+
+        for coin in &coins_with_positions {
+            // 탈락 코인이 아니면 TTL 미적용 (dropped_at에 없는 코인은 현재 활성 코인)
+            let Some(drop_time) = dropped_at.get(coin) else {
+                continue;
+            };
+            let elapsed = now - *drop_time;
+
+            if elapsed <= ttl {
+                continue; // TTL 아직 미초과
+            }
+
+            let positions: Vec<(u64, Decimal)> = position_mgr
+                .open_positions
+                .get(coin.as_str())
+                .map(|ps| ps.iter().map(|p| (p.id, p.size_usdt)).collect())
+                .unwrap_or_default();
+
+            if positions.is_empty() {
+                continue;
+            }
+
+            let upbit_usdt = spread_calc
+                .upbit_window(coin)
+                .and_then(|w| w.last())
+                .map(|f| Decimal::try_from(f).unwrap_or(Decimal::ZERO))
+                .unwrap_or(Decimal::ZERO);
+            let bybit_price = spread_calc
+                .bybit_window(coin)
+                .and_then(|w| w.last())
+                .map(|f| Decimal::try_from(f).unwrap_or(Decimal::ZERO))
+                .unwrap_or(Decimal::ZERO);
+            let spread_pct = spread_calc.last_spread_pct(coin).unwrap_or(0.0);
+
+            if elapsed > ttl + grace {
+                // 2단계: 전량 강제 청산 (슬리피지 무시)
+                warn!(coin = coin.as_str(), "2단계 강제 청산: grace period 초과");
+                for (pid, _size) in &positions {
+                    counters.forced_liquidation_count += 1;
+                    match position_mgr.close_position(
+                        coin,
+                        *pid,
+                        now,
+                        upbit_usdt,
+                        bybit_price,
+                        usd_krw,
+                        spread_pct,
+                        f64::NAN,
+                        config.upbit_taker_fee,
+                        config.bybit_taker_fee,
+                        true,
+                    ) {
+                        Ok(closed) => {
+                            if let Some(w) = session_writer
+                                && let Err(e) = w.append_trade(&closed)
+                            {
+                                warn!(error = %e, "강제 청산 CSV 기록 실패");
+                            }
+                            trades.push(closed);
+                        }
+                        Err(e) => warn!(error = %e, "2단계 강제 청산 실패"),
+                    }
+                }
+            } else {
+                // 1단계: 전량 청산 시도 (safe volume 기반 분할은 향후 개선)
+                warn!(coin = coin.as_str(), "1단계 TTL 분할 청산 시도");
+                for (pid, _size) in &positions {
+                    match position_mgr.close_position(
+                        coin,
+                        *pid,
+                        now,
+                        upbit_usdt,
+                        bybit_price,
+                        usd_krw,
+                        spread_pct,
+                        f64::NAN,
+                        config.upbit_taker_fee,
+                        config.bybit_taker_fee,
+                        false,
+                    ) {
+                        Ok(closed) => {
+                            if let Some(w) = session_writer
+                                && let Err(e) = w.append_trade(&closed)
+                            {
+                                warn!(error = %e, "TTL 청산 CSV 기록 실패");
+                            }
+                            trades.push(closed);
+                        }
+                        Err(e) => warn!(error = %e, "1단계 TTL 청산 실패"),
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -1115,39 +1434,48 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                     w.last()
                         .map(|f| Decimal::try_from(f).unwrap_or(Decimal::ZERO))
                 })
-            }) && position_mgr.check_liquidation(coin, bybit_price)
-            {
-                let upbit_usdt = spread_calc
-                    .upbit_window(coin)
-                    .and_then(|w| w.last())
-                    .map(|f| Decimal::try_from(f).unwrap_or(Decimal::ZERO))
-                    .unwrap_or(Decimal::ZERO);
-                let spread_pct = spread_calc.last_spread_pct(coin).unwrap_or(0.0);
+            }) {
+                let liquidated_ids = position_mgr.check_liquidation(coin, bybit_price);
+                if !liquidated_ids.is_empty() {
+                    let upbit_usdt = spread_calc
+                        .upbit_window(coin)
+                        .and_then(|w| w.last())
+                        .map(|f| Decimal::try_from(f).unwrap_or(Decimal::ZERO))
+                        .unwrap_or(Decimal::ZERO);
+                    let spread_pct = spread_calc.last_spread_pct(coin).unwrap_or(0.0);
 
-                warn!(coin = coin.as_str(), "Bybit 강제 청산 발생");
+                    for pid in liquidated_ids {
+                        warn!(
+                            coin = coin.as_str(),
+                            position_id = pid,
+                            "Bybit 강제 청산 발생"
+                        );
 
-                match position_mgr.close_position(
-                    coin,
-                    ts,
-                    upbit_usdt,
-                    bybit_price,
-                    usd_krw,
-                    spread_pct,
-                    f64::NAN,
-                    config.upbit_taker_fee,
-                    config.bybit_taker_fee,
-                    true,
-                ) {
-                    Ok(closed) => {
-                        if let Some(w) = session_writer
-                            && let Err(e) = w.append_trade(&closed)
-                        {
-                            warn!(coin = coin.as_str(), error = %e, "강제 청산 거래 CSV 기록 실패");
+                        match position_mgr.close_position(
+                            coin,
+                            pid,
+                            ts,
+                            upbit_usdt,
+                            bybit_price,
+                            usd_krw,
+                            spread_pct,
+                            f64::NAN,
+                            config.upbit_taker_fee,
+                            config.bybit_taker_fee,
+                            true,
+                        ) {
+                            Ok(closed) => {
+                                if let Some(w) = session_writer
+                                    && let Err(e) = w.append_trade(&closed)
+                                {
+                                    warn!(coin = coin.as_str(), error = %e, "강제 청산 거래 CSV 기록 실패");
+                                }
+                                trades.push(closed);
+                            }
+                            Err(e) => {
+                                warn!(coin = coin.as_str(), error = %e, "강제 청산 처리 실패");
+                            }
                         }
-                        trades.push(closed);
-                    }
-                    Err(e) => {
-                        warn!(coin = coin.as_str(), error = %e, "강제 청산 처리 실패");
                     }
                 }
             }
@@ -1368,6 +1696,7 @@ mod tests {
         let mut pm = PositionManager::new();
         // XRP에 포지션 오픈
         pm.open_position(VirtualPosition {
+            id: 0,
             coin: "XRP".to_string(),
             entry_time: Utc::now(),
             upbit_entry_price: Decimal::new(1, 0),
@@ -1511,8 +1840,8 @@ mod tests {
         assert!(diff.to_keep_with_position.is_empty());
     }
 
-    #[test]
-    fn test_check_tick_signal_no_data() {
+    #[tokio::test]
+    async fn test_check_tick_signal_no_data() {
         use std::time::Duration;
 
         let config = ZScoreConfig::default();
@@ -1522,7 +1851,11 @@ mod tests {
         let mut trades = Vec::new();
         let forex_cache = ForexCache::new(Duration::from_secs(600));
         let mut session_writer: Option<SessionWriter> = None;
-        // 캐시 비어있음 -> 즉시 Ok(()) 반환
+        let mut ob_cache = orderbook::OrderBookCache::new();
+        let mut counters = MonitoringCounters::default();
+        let upbit_client = MockMarket;
+        let bybit_client = MockMarket;
+        // 캐시 비어있음 -> 즉시 Ok(()) 반환 (upbit_last_trade에 데이터 없음)
         let result = ZScoreMonitor::<MockMarket, MockMarket>::check_tick_signal(
             "BTC",
             &config,
@@ -1532,13 +1865,19 @@ mod tests {
             &mut trades,
             &forex_cache,
             &mut session_writer,
-        );
+            &mut ob_cache,
+            &mut counters,
+            &upbit_client,
+            &bybit_client,
+            orderbook::Exchange::Upbit,
+        )
+        .await;
         assert!(result.is_ok());
         assert!(trades.is_empty());
     }
 
-    #[test]
-    fn test_check_tick_signal_partial_data() {
+    #[tokio::test]
+    async fn test_check_tick_signal_partial_data() {
         use std::time::Duration;
 
         let config = ZScoreConfig::default();
@@ -1555,6 +1894,10 @@ mod tests {
         let forex_cache = ForexCache::new(Duration::from_secs(600));
         forex_cache.update_cache_for_test(1450.0);
         let mut session_writer: Option<SessionWriter> = None;
+        let mut ob_cache = orderbook::OrderBookCache::new();
+        let mut counters = MonitoringCounters::default();
+        let upbit_client = MockMarket;
+        let bybit_client = MockMarket;
 
         let result = ZScoreMonitor::<MockMarket, MockMarket>::check_tick_signal(
             "BTC",
@@ -1565,13 +1908,19 @@ mod tests {
             &mut trades,
             &forex_cache,
             &mut session_writer,
-        );
+            &mut ob_cache,
+            &mut counters,
+            &upbit_client,
+            &bybit_client,
+            orderbook::Exchange::Upbit,
+        )
+        .await;
         assert!(result.is_ok());
         assert!(trades.is_empty());
     }
 
-    #[test]
-    fn test_check_tick_signal_window_not_ready() {
+    #[tokio::test]
+    async fn test_check_tick_signal_window_not_ready() {
         use std::time::Duration;
 
         let config = ZScoreConfig::default();
@@ -1592,6 +1941,10 @@ mod tests {
         let forex_cache = ForexCache::new(Duration::from_secs(600));
         forex_cache.update_cache_for_test(1450.0);
         let mut session_writer: Option<SessionWriter> = None;
+        let mut ob_cache = orderbook::OrderBookCache::new();
+        let mut counters = MonitoringCounters::default();
+        let upbit_client = MockMarket;
+        let bybit_client = MockMarket;
 
         let result = ZScoreMonitor::<MockMarket, MockMarket>::check_tick_signal(
             "BTC",
@@ -1602,7 +1955,13 @@ mod tests {
             &mut trades,
             &forex_cache,
             &mut session_writer,
-        );
+            &mut ob_cache,
+            &mut counters,
+            &upbit_client,
+            &bybit_client,
+            orderbook::Exchange::Upbit,
+        )
+        .await;
         assert!(result.is_ok());
         // 윈도우 미충족이므로 시그널 없음
         assert!(trades.is_empty());

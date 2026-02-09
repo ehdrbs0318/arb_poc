@@ -3,6 +3,7 @@
 pub mod coin_selector;
 pub mod config;
 pub mod monitor;
+pub mod orderbook;
 pub mod pnl;
 pub mod position;
 pub mod signal;

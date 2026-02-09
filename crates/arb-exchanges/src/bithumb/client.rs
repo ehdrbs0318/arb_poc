@@ -322,7 +322,7 @@ impl MarketData for BithumbClient {
 
     async fn get_orderbook(&self, market: &str, depth: Option<u32>) -> ExchangeResult<OrderBook> {
         let depth_str = depth.unwrap_or(15).to_string();
-        let params = [("markets", market), ("level", &depth_str)];
+        let params = [("markets", market), ("count", &depth_str)];
 
         let orderbooks: Vec<BithumbOrderbook> =
             self.get_public("/v1/orderbook", Some(&params)).await?;

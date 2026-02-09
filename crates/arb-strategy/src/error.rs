@@ -37,13 +37,6 @@ pub enum StatisticsError {
 /// 포지션 에러.
 #[derive(Error, Debug)]
 pub enum PositionError {
-    /// 해당 코인에 대한 포지션이 이미 존재합니다.
-    #[error("Position already exists for {coin}")]
-    AlreadyExists {
-        /// 코인 심볼
-        coin: String,
-    },
-
     /// 해당 코인에 대한 포지션을 찾을 수 없습니다.
     #[error("Position not found for {coin}")]
     NotFound {

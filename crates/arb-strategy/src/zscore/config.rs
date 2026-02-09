@@ -29,9 +29,8 @@ pub struct ZScoreConfig {
     pub exit_z_threshold: f64,
     /// 총 자본금 (USDT 기준, 양 거래소 합산).
     pub total_capital_usdt: Decimal,
-    /// 포지션당 자본금 비율 (e.g., 0.1 = 총 자본의 10%).
-    /// 실제 필요 자본 = total_capital × position_ratio × 2
-    pub position_ratio: Decimal,
+    /// 코인 페어당 최대 포지션 크기 비율 = total_capital_usdt × max_position_ratio.
+    pub max_position_ratio: Decimal,
     /// Upbit taker 수수료율 (기본값: 0.0005 = 0.05%).
     pub upbit_taker_fee: Decimal,
     /// Bybit linear taker 수수료율 (기본값: 0.00055 = 0.055%).
@@ -58,6 +57,12 @@ pub struct ZScoreConfig {
     /// 포지션 TTL (시간 단위, 기본값: 24).
     /// 해당 시간 이후 자동 청산합니다.
     pub position_ttl_hours: u64,
+    /// TTL 초과 후 분할 청산 유예 기간 (시간).
+    pub grace_period_hours: u64,
+    /// 같은 코인에 대한 재진입 최소 간격 (초).
+    pub entry_cooldown_sec: u64,
+    /// 오더북 캐시 최대 유효 시간 (초).
+    pub max_cache_age_sec: u64,
     /// 세션 출력 설정.
     pub output: crate::output::writer::OutputConfig,
 }
@@ -71,9 +76,9 @@ impl Default for ZScoreConfig {
             entry_z_threshold: 2.0,
             exit_z_threshold: 0.5,
             total_capital_usdt: Decimal::new(10000, 0),
-            position_ratio: Decimal::new(1, 1),   // 0.1
-            upbit_taker_fee: Decimal::new(5, 4),  // 0.0005
-            bybit_taker_fee: Decimal::new(55, 5), // 0.00055
+            max_position_ratio: Decimal::new(2, 1), // 0.2
+            upbit_taker_fee: Decimal::new(5, 4),    // 0.0005
+            bybit_taker_fee: Decimal::new(55, 5),   // 0.00055
             leverage: 1,
             bybit_mmr: Decimal::new(5, 3), // 0.005
             min_stddev_threshold: 0.01,
@@ -81,9 +86,12 @@ impl Default for ZScoreConfig {
             auto_select: false,
             max_coins: 5,
             reselect_interval_min: 10,
-            min_volume_1h_usdt: Decimal::new(1_000_000, 0),
+            min_volume_1h_usdt: Decimal::new(50_000, 0),
             blacklist: vec![],
             position_ttl_hours: 24,
+            grace_period_hours: 4,
+            entry_cooldown_sec: 10,
+            max_cache_age_sec: 5,
             output: crate::output::writer::OutputConfig::default(),
         }
     }
@@ -122,9 +130,9 @@ impl ZScoreConfig {
                 "entry_z_threshold must be greater than exit_z_threshold".to_string(),
             ));
         }
-        if self.position_ratio <= Decimal::ZERO || self.position_ratio > Decimal::new(5, 1) {
+        if self.max_position_ratio <= Decimal::ZERO || self.max_position_ratio > Decimal::ONE {
             return Err(StrategyError::Config(
-                "position_ratio must be in (0, 0.5]".to_string(),
+                "max_position_ratio must be in (0, 1.0]".to_string(),
             ));
         }
         if self.min_stddev_threshold <= 0.0 {
@@ -132,17 +140,10 @@ impl ZScoreConfig {
                 "min_stddev_threshold must be positive".to_string(),
             ));
         }
-
-        // 다중 코인 자본 초과 경고
-        let total_ratio =
-            self.position_ratio * Decimal::from(self.coins.len() as u64) * Decimal::from(2u64);
-        if total_ratio > Decimal::ONE {
-            warn!(
-                "position_ratio({}) × 코인 수({}) × 2 = {}. 모든 코인에 동시 진입하면 자본 초과.",
-                self.position_ratio,
-                self.coins.len(),
-                total_ratio
-            );
+        if self.grace_period_hours == 0 {
+            return Err(StrategyError::Config(
+                "grace_period_hours must be greater than 0".to_string(),
+            ));
         }
 
         // 암호화폐 상관관계 집중 리스크 경고
@@ -224,7 +225,7 @@ struct RawZScoreConfig {
     entry_z_threshold: f64,
     exit_z_threshold: f64,
     total_capital_usdt: f64,
-    position_ratio: f64,
+    max_position_ratio: Option<f64>,
     upbit_taker_fee: f64,
     bybit_taker_fee: f64,
     leverage: u32,
@@ -237,6 +238,9 @@ struct RawZScoreConfig {
     min_volume_1h_usdt: Option<f64>,
     blacklist: Option<Vec<String>>,
     position_ttl_hours: Option<u64>,
+    grace_period_hours: Option<u64>,
+    entry_cooldown_sec: Option<u64>,
+    max_cache_age_sec: Option<u64>,
 }
 
 impl Default for RawZScoreConfig {
@@ -248,7 +252,7 @@ impl Default for RawZScoreConfig {
             entry_z_threshold: defaults.entry_z_threshold,
             exit_z_threshold: defaults.exit_z_threshold,
             total_capital_usdt: 10000.0,
-            position_ratio: 0.1,
+            max_position_ratio: None,
             upbit_taker_fee: 0.0005,
             bybit_taker_fee: 0.00055,
             leverage: defaults.leverage,
@@ -261,6 +265,9 @@ impl Default for RawZScoreConfig {
             min_volume_1h_usdt: None,
             blacklist: None,
             position_ttl_hours: None,
+            grace_period_hours: None,
+            entry_cooldown_sec: None,
+            max_cache_age_sec: None,
         }
     }
 }
@@ -275,7 +282,10 @@ impl From<RawZScoreConfig> for ZScoreConfig {
             exit_z_threshold: raw.exit_z_threshold,
             total_capital_usdt: Decimal::try_from(raw.total_capital_usdt)
                 .unwrap_or(Decimal::new(10000, 0)),
-            position_ratio: Decimal::try_from(raw.position_ratio).unwrap_or(Decimal::new(1, 1)),
+            max_position_ratio: raw
+                .max_position_ratio
+                .and_then(|v| Decimal::try_from(v).ok())
+                .unwrap_or(Decimal::new(2, 1)), // 0.2
             upbit_taker_fee: Decimal::try_from(raw.upbit_taker_fee).unwrap_or(Decimal::new(5, 4)),
             bybit_taker_fee: Decimal::try_from(raw.bybit_taker_fee).unwrap_or(Decimal::new(55, 5)),
             leverage: raw.leverage,
@@ -288,9 +298,12 @@ impl From<RawZScoreConfig> for ZScoreConfig {
             min_volume_1h_usdt: raw
                 .min_volume_1h_usdt
                 .and_then(|v| Decimal::try_from(v).ok())
-                .unwrap_or(Decimal::new(1_000_000, 0)),
+                .unwrap_or(Decimal::new(50_000, 0)),
             blacklist: raw.blacklist.unwrap_or_default(),
             position_ttl_hours: raw.position_ttl_hours.unwrap_or(24),
+            grace_period_hours: raw.grace_period_hours.unwrap_or(4),
+            entry_cooldown_sec: raw.entry_cooldown_sec.unwrap_or(10),
+            max_cache_age_sec: raw.max_cache_age_sec.unwrap_or(5),
             output: crate::output::writer::OutputConfig::default(),
         }
     }
@@ -326,9 +339,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_position_ratio_too_high() {
+    fn test_validate_max_position_ratio_too_high() {
         let config = ZScoreConfig {
-            position_ratio: Decimal::new(6, 1), // 0.6
+            max_position_ratio: Decimal::new(11, 1), // 1.1
             ..ZScoreConfig::default()
         };
         assert!(config.validate().is_err());
@@ -343,7 +356,7 @@ window_size = 720
 entry_z_threshold = 2.5
 exit_z_threshold = 0.3
 total_capital_usdt = 50000.0
-position_ratio = 0.05
+max_position_ratio = 0.05
 leverage = 2
 bybit_mmr = 0.005
 min_stddev_threshold = 0.02
@@ -397,7 +410,7 @@ entry_z_threshold = 3.0
         assert!(!config.auto_select);
         assert_eq!(config.max_coins, 5);
         assert_eq!(config.reselect_interval_min, 10);
-        assert_eq!(config.min_volume_1h_usdt, Decimal::new(1_000_000, 0));
+        assert_eq!(config.min_volume_1h_usdt, Decimal::new(50_000, 0));
         assert!(config.blacklist.is_empty());
         assert_eq!(config.position_ttl_hours, 24);
     }
@@ -436,7 +449,7 @@ auto_select = true
         // 나머지는 기본값
         assert_eq!(config.max_coins, 5);
         assert_eq!(config.reselect_interval_min, 10);
-        assert_eq!(config.min_volume_1h_usdt, Decimal::new(1_000_000, 0));
+        assert_eq!(config.min_volume_1h_usdt, Decimal::new(50_000, 0));
         assert!(config.blacklist.is_empty());
         assert_eq!(config.position_ttl_hours, 24);
     }
