@@ -6,6 +6,7 @@ members = [
     "crates/arb-telegram",
     "crates/arb-exchange",
     "crates/arb-exchanges",
+    "crates/arb-forex",
     "crates/arb-strategy",
 ]
 
@@ -21,6 +22,7 @@ arb-logging = { path = "crates/arb-logging" }
 arb-telegram = { path = "crates/arb-telegram" }
 arb-exchange = { path = "crates/arb-exchange" }
 arb-exchanges = { path = "crates/arb-exchanges" }
+arb-forex = { path = "crates/arb-forex" }
 arb-strategy = { path = "crates/arb-strategy" }
 
 # Async runtime
@@ -53,7 +55,7 @@ repository = "https://github.com/example/arb_poc"
 tokio = { version = "1.43", features = ["full"] }
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "gzip"] }
 
 # JSON serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -135,10 +137,6 @@ path = "examples/exchange_manager.rs"
 [[example]]
 name = "telegram"
 path = "examples/telegram.rs"
-
-[[example]]
-name = "zscore_backtest"
-path = "examples/zscore_backtest.rs"
 
 [[example]]
 name = "zscore_monitor"

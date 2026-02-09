@@ -4,7 +4,7 @@
 //! `arb-config`의 간이 파서는 중첩 섹션을 지원하지 않으므로,
 //! 전략 설정은 별도 파일(`strategy.toml`)로 분리하여 자체 로딩합니다.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use arb_exchange::CandleInterval;
 use rust_decimal::Decimal;
@@ -40,24 +40,10 @@ pub struct ZScoreConfig {
     pub leverage: u32,
     /// Bybit maintenance margin rate (기본값: 0.005 = 0.5%).
     pub bybit_mmr: Decimal,
-    /// 백테스트 기간 (분 단위, 워밍업 제외, 기본값: 8640 = 6일).
-    pub backtest_period_minutes: usize,
     /// Z-Score 계산 시 최소 stddev 임계값 (기본값: 0.01).
     pub min_stddev_threshold: f64,
-    /// 결과 CSV 출력 디렉토리 (기본값: "./output/").
-    pub output_dir: PathBuf,
     /// 최대 동시 포지션 수 (None이면 coins.len()까지 허용).
     pub max_concurrent_positions: Option<usize>,
-    /// 볼륨/슬리피지 모델 활성화 (기본값: false).
-    pub volume_filter_enabled: bool,
-    /// 최대 참여율 (캔들 거래량 대비 주문 비율, 기본값: 0.1 = 10%).
-    /// 초과 시 진입을 거부합니다.
-    pub max_participation_rate: f64,
-    /// 기본 슬리피지 (bps, 기본값: 1.0 = 0.01%).
-    pub slippage_base_bps: f64,
-    /// 슬리피지 충격 계수 (기본값: 0.001).
-    /// slippage_bps = base_bps + impact_coeff × √(participation_rate) × 10000
-    pub slippage_impact_coeff: f64,
     /// 자동 코인 선택 활성화 (기본값: false).
     /// true이면 거래량 기반으로 대상 코인을 자동 선택합니다.
     pub auto_select: bool,
@@ -88,14 +74,8 @@ impl Default for ZScoreConfig {
             bybit_taker_fee: Decimal::new(55, 5), // 0.00055
             leverage: 1,
             bybit_mmr: Decimal::new(5, 3), // 0.005
-            backtest_period_minutes: 8640,
             min_stddev_threshold: 0.01,
-            output_dir: PathBuf::from("./output/"),
             max_concurrent_positions: None,
-            volume_filter_enabled: false,
-            max_participation_rate: 0.1,
-            slippage_base_bps: 1.0,
-            slippage_impact_coeff: 0.001,
             auto_select: false,
             max_coins: 5,
             reselect_interval_min: 10,
@@ -184,11 +164,6 @@ impl ZScoreConfig {
         Ok(())
     }
 
-    /// 총 필요 데이터 수 (워밍업 + 백테스트 기간).
-    pub fn total_candles_needed(&self) -> usize {
-        self.window_size + self.backtest_period_minutes
-    }
-
     /// TOML 파일에서 설정을 로드합니다.
     ///
     /// 파일 형식은 `[zscore]` 섹션 아래에 설정값을 기술합니다.
@@ -206,24 +181,13 @@ impl ZScoreConfig {
             .map_err(|e| StrategyError::Config(format!("TOML parse error: {e}")))?;
         Ok(wrapper.zscore.into())
     }
-
-    /// TOML 문자열에서 `[sweep]` 섹션도 함께 파싱합니다.
-    pub fn from_toml_str_with_sweep(
-        s: &str,
-    ) -> Result<(Self, Option<RawSweepConfig>), StrategyError> {
-        let wrapper: TomlWrapper = toml::from_str(s)
-            .map_err(|e| StrategyError::Config(format!("TOML parse error: {e}")))?;
-        Ok((wrapper.zscore.into(), wrapper.sweep))
-    }
 }
 
-/// TOML 최상위 래퍼 (`[zscore]` 및 `[sweep]` 섹션).
+/// TOML 최상위 래퍼 (`[zscore]` 섹션).
 #[derive(Deserialize)]
 struct TomlWrapper {
     #[serde(default)]
     zscore: RawZScoreConfig,
-    #[serde(default)]
-    sweep: Option<RawSweepConfig>,
 }
 
 /// TOML 역직렬화 전용 중간 구조체.
@@ -243,14 +207,8 @@ struct RawZScoreConfig {
     bybit_taker_fee: f64,
     leverage: u32,
     bybit_mmr: f64,
-    backtest_period_minutes: usize,
     min_stddev_threshold: f64,
-    output_dir: String,
     max_concurrent_positions: Option<usize>,
-    volume_filter_enabled: bool,
-    max_participation_rate: f64,
-    slippage_base_bps: f64,
-    slippage_impact_coeff: f64,
     auto_select: Option<bool>,
     max_coins: Option<usize>,
     reselect_interval_min: Option<u64>,
@@ -273,14 +231,8 @@ impl Default for RawZScoreConfig {
             bybit_taker_fee: 0.00055,
             leverage: defaults.leverage,
             bybit_mmr: 0.005,
-            backtest_period_minutes: defaults.backtest_period_minutes,
             min_stddev_threshold: defaults.min_stddev_threshold,
-            output_dir: "./output/".to_string(),
             max_concurrent_positions: defaults.max_concurrent_positions,
-            volume_filter_enabled: defaults.volume_filter_enabled,
-            max_participation_rate: defaults.max_participation_rate,
-            slippage_base_bps: defaults.slippage_base_bps,
-            slippage_impact_coeff: defaults.slippage_impact_coeff,
             auto_select: None,
             max_coins: None,
             reselect_interval_min: None,
@@ -306,14 +258,8 @@ impl From<RawZScoreConfig> for ZScoreConfig {
             bybit_taker_fee: Decimal::try_from(raw.bybit_taker_fee).unwrap_or(Decimal::new(55, 5)),
             leverage: raw.leverage,
             bybit_mmr: Decimal::try_from(raw.bybit_mmr).unwrap_or(Decimal::new(5, 3)),
-            backtest_period_minutes: raw.backtest_period_minutes,
             min_stddev_threshold: raw.min_stddev_threshold,
-            output_dir: PathBuf::from(raw.output_dir),
             max_concurrent_positions: raw.max_concurrent_positions,
-            volume_filter_enabled: raw.volume_filter_enabled,
-            max_participation_rate: raw.max_participation_rate,
-            slippage_base_bps: raw.slippage_base_bps,
-            slippage_impact_coeff: raw.slippage_impact_coeff,
             auto_select: raw.auto_select.unwrap_or(false),
             max_coins: raw.max_coins.unwrap_or(5),
             reselect_interval_min: raw.reselect_interval_min.unwrap_or(10),
@@ -323,32 +269,6 @@ impl From<RawZScoreConfig> for ZScoreConfig {
                 .unwrap_or(Decimal::new(1_000_000, 0)),
             blacklist: raw.blacklist.unwrap_or_default(),
             position_ttl_hours: raw.position_ttl_hours.unwrap_or(24),
-        }
-    }
-}
-
-/// TOML 역직렬화 전용 sweep 설정.
-#[derive(Debug, Deserialize)]
-pub struct RawSweepConfig {
-    /// 테스트할 entry_z 값 목록.
-    pub entry_z_values: Vec<f64>,
-    /// 테스트할 exit_z 값 목록 (없으면 base_config.exit_z 사용).
-    pub exit_z_values: Option<Vec<f64>>,
-    /// 최대 조합 수 (기본 50).
-    pub max_combinations: Option<usize>,
-}
-
-impl RawSweepConfig {
-    /// `SweepConfig`로 변환합니다.
-    pub fn into_sweep_config(self, base_config: ZScoreConfig) -> crate::zscore::sweep::SweepConfig {
-        let exit_z_values = self
-            .exit_z_values
-            .unwrap_or_else(|| vec![base_config.exit_z_threshold]);
-        crate::zscore::sweep::SweepConfig {
-            base_config,
-            entry_z_values: self.entry_z_values,
-            exit_z_values,
-            max_combinations: self.max_combinations.unwrap_or(50),
         }
     }
 }
@@ -392,12 +312,6 @@ mod tests {
     }
 
     #[test]
-    fn test_total_candles_needed() {
-        let config = ZScoreConfig::default();
-        assert_eq!(config.total_candles_needed(), 1440 + 8640);
-    }
-
-    #[test]
     fn test_from_toml_str_full() {
         let toml = r#"
 [zscore]
@@ -409,9 +323,7 @@ total_capital_usdt = 50000.0
 position_ratio = 0.05
 leverage = 2
 bybit_mmr = 0.005
-backtest_period_minutes = 4320
 min_stddev_threshold = 0.02
-output_dir = "./results/"
 max_concurrent_positions = 2
 "#;
         let config = ZScoreConfig::from_toml_str(toml).unwrap();
@@ -421,9 +333,7 @@ max_concurrent_positions = 2
         assert_eq!(config.exit_z_threshold, 0.3);
         assert_eq!(config.total_capital_usdt, Decimal::new(50000, 0));
         assert_eq!(config.leverage, 2);
-        assert_eq!(config.backtest_period_minutes, 4320);
         assert_eq!(config.min_stddev_threshold, 0.02);
-        assert_eq!(config.output_dir, PathBuf::from("./results/"));
         assert_eq!(config.max_concurrent_positions, Some(2));
         assert!(config.validate().is_ok());
     }
@@ -456,64 +366,6 @@ entry_z_threshold = 3.0
     fn test_from_toml_str_invalid() {
         let toml = "invalid toml {{{}}}";
         assert!(ZScoreConfig::from_toml_str(toml).is_err());
-    }
-
-    #[test]
-    fn test_from_toml_str_with_sweep() {
-        let toml = r#"
-[zscore]
-coins = ["BTC"]
-entry_z_threshold = 2.0
-
-[sweep]
-entry_z_values = [1.5, 2.0, 2.5, 3.0]
-exit_z_values = [0.3, 0.5, 0.7]
-max_combinations = 100
-"#;
-        let (config, raw_sweep) = ZScoreConfig::from_toml_str_with_sweep(toml).unwrap();
-        assert_eq!(config.coins, vec!["BTC"]);
-        assert_eq!(config.entry_z_threshold, 2.0);
-
-        let raw_sweep = raw_sweep.expect("sweep 섹션이 파싱되어야 함");
-        assert_eq!(raw_sweep.entry_z_values, vec![1.5, 2.0, 2.5, 3.0]);
-        assert_eq!(raw_sweep.exit_z_values, Some(vec![0.3, 0.5, 0.7]));
-        assert_eq!(raw_sweep.max_combinations, Some(100));
-
-        let sweep_config = raw_sweep.into_sweep_config(config);
-        assert_eq!(sweep_config.entry_z_values.len(), 4);
-        assert_eq!(sweep_config.exit_z_values.len(), 3);
-        assert_eq!(sweep_config.max_combinations, 100);
-    }
-
-    #[test]
-    fn test_from_toml_str_with_sweep_defaults() {
-        let toml = r#"
-[zscore]
-coins = ["ETH"]
-exit_z_threshold = 0.4
-
-[sweep]
-entry_z_values = [2.0, 2.5]
-"#;
-        let (config, raw_sweep) = ZScoreConfig::from_toml_str_with_sweep(toml).unwrap();
-        let raw_sweep = raw_sweep.expect("sweep 섹션이 파싱되어야 함");
-        assert!(raw_sweep.exit_z_values.is_none());
-        assert!(raw_sweep.max_combinations.is_none());
-
-        let sweep_config = raw_sweep.into_sweep_config(config);
-        // exit_z_values가 없으면 base_config.exit_z_threshold 사용
-        assert_eq!(sweep_config.exit_z_values, vec![0.4]);
-        assert_eq!(sweep_config.max_combinations, 50);
-    }
-
-    #[test]
-    fn test_from_toml_str_without_sweep() {
-        let toml = r#"
-[zscore]
-coins = ["BTC"]
-"#;
-        let (_config, raw_sweep) = ZScoreConfig::from_toml_str_with_sweep(toml).unwrap();
-        assert!(raw_sweep.is_none());
     }
 
     #[test]

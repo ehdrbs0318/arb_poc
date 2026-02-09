@@ -121,7 +121,11 @@ mod tests {
         // 초기 토큰 1개 → 1번째 즉시, 2번째는 대기
         limiter.acquire().await;
         let elapsed = start.elapsed();
-        assert!(elapsed.as_millis() < 50, "첫 요청은 즉시 처리: {}ms", elapsed.as_millis());
+        assert!(
+            elapsed.as_millis() < 50,
+            "첫 요청은 즉시 처리: {}ms",
+            elapsed.as_millis()
+        );
 
         // 2번째 요청은 ~100ms 대기 (10 req/sec → 100ms/token)
         let start = Instant::now();

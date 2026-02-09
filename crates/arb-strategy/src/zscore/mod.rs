@@ -6,7 +6,4 @@ pub mod monitor;
 pub mod pnl;
 pub mod position;
 pub mod signal;
-pub mod simulator;
-pub mod slippage;
 pub mod spread;
-pub mod sweep;

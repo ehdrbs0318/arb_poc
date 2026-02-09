@@ -25,8 +25,12 @@
 //!
 //! `Ctrl+C`로 graceful shutdown합니다.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use arb_poc::exchange::MarketData;
 use arb_poc::exchanges::{BybitClient, UpbitClient};
+use arb_poc::forex::ForexCache;
 use arb_poc::strategy::zscore::config::ZScoreConfig;
 use arb_poc::strategy::zscore::monitor::ZScoreMonitor;
 use tokio_util::sync::CancellationToken;
@@ -83,8 +87,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cancel_clone.cancel();
     });
 
+    // ForexCache 생성 (TTL 10분)
+    let forex_cache = Arc::new(ForexCache::new(Duration::from_secs(600)));
+
     // 실시간 모니터링 실행
-    let monitor = ZScoreMonitor::new(upbit, bybit, config);
+    let monitor = ZScoreMonitor::new(upbit, bybit, config, forex_cache);
     let trades = monitor.run(cancel_token).await?;
 
     // 결과 출력

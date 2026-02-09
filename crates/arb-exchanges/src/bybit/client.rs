@@ -2,7 +2,6 @@
 //!
 //! 이 모듈은 Bybit V5 API와 상호작용하기 위한 메인 클라이언트를 제공합니다.
 
-use crate::rate_limit::RateLimiter;
 use crate::bybit::auth::{AuthHeaders, BybitCredentials, build_query_string};
 use crate::bybit::stream::BybitStreamInner;
 use crate::bybit::types::{
@@ -10,6 +9,7 @@ use crate::bybit::types::{
     BybitOrder, BybitOrderList, BybitOrderRequest, BybitOrderbookResult, BybitResponse,
     BybitTickerList, BybitWalletBalanceResult,
 };
+use crate::rate_limit::RateLimiter;
 use arb_exchange::{
     Balance, Candle, CandleInterval, ExchangeError, ExchangeResult, MarketData, Order, OrderBook,
     OrderBookLevel, OrderManagement, OrderRequest, OrderSide, OrderStatus, OrderType, PriceChange,

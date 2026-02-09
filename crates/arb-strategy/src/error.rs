@@ -89,10 +89,6 @@ pub enum StrategyError {
     #[error("Data alignment error: {0}")]
     DataAlignment(String),
 
-    /// CSV 파일 처리 에러.
-    #[error("CSV error: {0}")]
-    Csv(#[from] csv::Error),
-
     /// 포지션 관련 에러.
     #[error("Position error: {0}")]
     Position(#[from] PositionError),

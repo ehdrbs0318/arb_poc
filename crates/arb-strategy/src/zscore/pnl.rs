@@ -39,10 +39,10 @@ pub struct ClosedPosition {
     pub entry_spread_pct: f64,
     /// 청산 시 스프레드 (%).
     pub exit_spread_pct: f64,
-    /// 진입 시 USDT/KRW 환율.
-    pub entry_usdt_krw: Decimal,
-    /// 청산 시 USDT/KRW 환율.
-    pub exit_usdt_krw: Decimal,
+    /// 진입 시 USD/KRW 환율.
+    pub entry_usd_krw: f64,
+    /// 청산 시 USD/KRW 환율.
+    pub exit_usd_krw: f64,
     /// 강제 청산 여부.
     pub is_liquidated: bool,
 }
@@ -119,8 +119,8 @@ mod tests {
             exit_z_score: 0.5,
             entry_spread_pct: 0.3,
             exit_spread_pct: 0.1,
-            entry_usdt_krw: Decimal::new(1380, 0),
-            exit_usdt_krw: Decimal::new(1381, 0),
+            entry_usd_krw: 1380.0,
+            exit_usd_krw: 1381.0,
             is_liquidated: false,
         }
     }

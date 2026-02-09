@@ -2,32 +2,34 @@
 //!
 //! WebSocket 스트림에서 수신한 MarketEvent를 1분 캔들로 집계하고,
 //! Z-Score 기반 진입/청산 시그널을 실시간으로 감지합니다.
+//! 틱 수신 시 즉시 시그널을 평가하고, 분 완결 시에는 통계만 갱신합니다.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive as _;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
+use arb_exchange::{MarketData, MarketEvent, MarketStream};
+use arb_forex::ForexCache;
+
+use crate::common::candle_fetcher::fetch_all_candles;
 use crate::common::convert::truncate_to_minute;
-use crate::common::statistics;
 use crate::error::StrategyError;
-use crate::output::csv;
 use crate::zscore::coin_selector::{CoinCandidate, CoinSelector};
 use crate::zscore::config::ZScoreConfig;
 use crate::zscore::pnl::ClosedPosition;
 use crate::zscore::position::{self, PositionManager, VirtualPosition};
 use crate::zscore::signal::{self, Signal};
-use crate::zscore::simulator::{TimeseriesRecord, fetch_all_candles};
 use crate::zscore::spread::SpreadCalculator;
-use arb_exchange::{MarketData, MarketEvent, MarketStream};
 
-/// 분 완결 시 반환되는 데이터 (코인별 Upbit close, USDT/KRW, 코인별 Bybit close).
+/// 분 완결 시 반환되는 데이터 (코인별 Upbit close, 코인별 Bybit close).
 type MinuteCloses = (
     HashMap<String, Option<Decimal>>,
-    Option<Decimal>,
     HashMap<String, Option<Decimal>>,
 );
 
@@ -38,8 +40,6 @@ struct MinuteCandleBuilder {
     current_minute: Option<DateTime<Utc>>,
     /// 코인별 Upbit 마지막 체결가.
     upbit_last_trade: HashMap<String, Decimal>,
-    /// USDT/KRW 마지막 체결가.
-    usdt_krw_last_trade: Option<Decimal>,
     /// 코인별 Bybit best bid.
     bybit_last_bid: HashMap<String, Decimal>,
 }
@@ -49,7 +49,6 @@ impl MinuteCandleBuilder {
         Self {
             current_minute: None,
             upbit_last_trade: HashMap::new(),
-            usdt_krw_last_trade: None,
             bybit_last_bid: HashMap::new(),
         }
     }
@@ -73,8 +72,6 @@ impl MinuteCandleBuilder {
             bybit_closes.insert(coin.clone(), self.bybit_last_bid.remove(coin));
         }
 
-        let usdt_krw = self.usdt_krw_last_trade.take();
-
         // 코인별 close 유무 요약 로그 (Vec 할당 비용을 debug 활성 시에만 부담)
         if tracing::enabled!(tracing::Level::DEBUG) {
             let coins_with_upbit: Vec<&str> = coins
@@ -90,30 +87,32 @@ impl MinuteCandleBuilder {
 
             debug!(
                 minute = ?self.current_minute,
-                usdt_krw_present = usdt_krw.is_some(),
                 upbit_coins = ?coins_with_upbit,
                 bybit_coins = ?coins_with_bybit,
                 "분 캔들 완결: 코인별 close 데이터 요약"
             );
         }
 
-        (upbit_closes, usdt_krw, bybit_closes)
+        (upbit_closes, bybit_closes)
     }
 
     /// 새 분으로 전환합니다.
     fn start_new_minute(&mut self, minute: DateTime<Utc>) {
         self.current_minute = Some(truncate_to_minute(minute));
         self.upbit_last_trade.clear();
-        self.usdt_krw_last_trade = None;
         self.bybit_last_bid.clear();
     }
 
     /// Upbit Trade 이벤트를 처리합니다.
+    ///
+    /// KRW-USDT 마켓은 무시합니다 (ForexCache 사용).
     fn on_upbit_trade(&mut self, market: &str, price: Decimal) {
         trace!(market = market, price = %price, "Upbit trade 수신");
         if market.starts_with("KRW-USDT") {
-            self.usdt_krw_last_trade = Some(price);
-        } else if let Some(coin) = market.strip_prefix("KRW-") {
+            // KRW-USDT는 ForexCache에서 관리하므로 무시
+            return;
+        }
+        if let Some(coin) = market.strip_prefix("KRW-") {
             self.upbit_last_trade.insert(coin.to_string(), price);
         }
     }
@@ -160,13 +159,13 @@ fn diff_coins(
     let current_set: HashSet<&str> = current.iter().map(|s| s.as_str()).collect();
     let new_set: HashSet<&str> = new_candidates.iter().map(|c| c.coin.as_str()).collect();
 
-    // 새 목록에만 있는 코인 → 추가
+    // 새 목록에만 있는 코인 -> 추가
     let to_add: Vec<String> = new_set
         .difference(&current_set)
         .map(|s| s.to_string())
         .collect();
 
-    // 현재 목록에만 있는 코인 → 포지션 유무에 따라 제거 또는 유지
+    // 현재 목록에만 있는 코인 -> 포지션 유무에 따라 제거 또는 유지
     let mut to_remove = Vec::new();
     let mut to_keep_with_position = Vec::new();
 
@@ -190,15 +189,17 @@ pub struct ZScoreMonitor<U: MarketData + MarketStream, B: MarketData + MarketStr
     upbit: U,
     bybit: B,
     config: ZScoreConfig,
+    forex_cache: Arc<ForexCache>,
 }
 
 impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U, B> {
     /// 새 ZScoreMonitor를 생성합니다.
-    pub fn new(upbit: U, bybit: B, config: ZScoreConfig) -> Self {
+    pub fn new(upbit: U, bybit: B, config: ZScoreConfig, forex_cache: Arc<ForexCache>) -> Self {
         Self {
             upbit,
             bybit,
             config,
+            forex_cache,
         }
     }
 
@@ -213,15 +214,49 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
     ) -> Result<Vec<ClosedPosition>, StrategyError> {
         self.config.validate()?;
 
+        // 환율 초기 로드
+        self.forex_cache.refresh_if_expired().await.map_err(|e| {
+            StrategyError::DataAlignment(format!("Initial forex refresh failed: {e}"))
+        })?;
+        info!(
+            usd_krw = self.forex_cache.get_cached_rate().unwrap_or(0.0),
+            "USD/KRW 환율 초기화 완료"
+        );
+
+        // 환율 갱신 task (10분 간격, cancel_token으로 종료)
+        let forex_for_refresh = Arc::clone(&self.forex_cache);
+        let forex_cancel = cancel_token.clone();
+        let _forex_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(600));
+            loop {
+                tokio::select! {
+                    _ = forex_cancel.cancelled() => {
+                        debug!("환율 갱신 task 종료");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        if let Err(e) = forex_for_refresh.refresh_if_expired().await {
+                            warn!(error = %e, "USD/KRW 환율 갱신 실패, 캐시 값 유지");
+                        }
+                    }
+                }
+            }
+        });
+
         // 1. 코인 목록 결정
         let mut current_coins: Vec<String> = if self.config.auto_select {
             info!("자동 코인 선택 활성화: 초기 코인 선택 중...");
             let selector = CoinSelector::new(&self.upbit, &self.bybit);
+            let usd_krw_for_select = self
+                .forex_cache
+                .get_cached_rate()
+                .unwrap_or(0.0);
             let candidates = selector
                 .select(
                     self.config.max_coins,
                     self.config.min_volume_1h_usdt,
                     &self.config.blacklist,
+                    usd_krw_for_select,
                 )
                 .await?;
 
@@ -244,13 +279,8 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
 
         info!("워밍업 완료. WebSocket 연결 중...");
 
-        // 3. WebSocket 구독
-        let upbit_markets: Vec<String> = {
-            let mut markets: Vec<String> =
-                current_coins.iter().map(|c| format!("KRW-{c}")).collect();
-            markets.push("KRW-USDT".to_string());
-            markets
-        };
+        // 3. WebSocket 구독 (KRW-USDT 제거)
+        let upbit_markets: Vec<String> = current_coins.iter().map(|c| format!("KRW-{c}")).collect();
         let bybit_markets: Vec<String> = current_coins.iter().map(|c| format!("{c}USDT")).collect();
 
         info!(
@@ -271,8 +301,7 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
         let mut position_mgr = PositionManager::new();
         let mut candle_builder = MinuteCandleBuilder::new();
         let mut minute_timer = tokio::time::interval(Duration::from_secs(60));
-        let mut timeseries_records: Vec<TimeseriesRecord> = Vec::new();
-        let mut trades_for_csv: Vec<ClosedPosition> = Vec::new();
+        let mut trades: Vec<ClosedPosition> = Vec::new();
 
         // heartbeat 관련 상태
         let mut total_event_count: u64 = 0;
@@ -301,9 +330,9 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                         &mut candle_builder,
                         &mut spread_calc,
                         &mut position_mgr,
-                        &mut timeseries_records,
-                        &mut trades_for_csv,
+                        &mut trades,
                         &current_coins,
+                        &self.forex_cache,
                     )?;
                 }
                 Some(event) = bybit_rx.recv() => {
@@ -314,9 +343,9 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                         &mut candle_builder,
                         &mut spread_calc,
                         &mut position_mgr,
-                        &mut timeseries_records,
-                        &mut trades_for_csv,
+                        &mut trades,
                         &current_coins,
+                        &self.forex_cache,
                     )?;
                 }
                 _ = minute_timer.tick() => {
@@ -328,10 +357,10 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                             &mut candle_builder,
                             &mut spread_calc,
                             &mut position_mgr,
-                            &mut timeseries_records,
-                            &mut trades_for_csv,
+                            &mut trades,
                             now,
                             &current_coins,
+                            &self.forex_cache,
                         )?;
                     }
                 }
@@ -339,11 +368,16 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                     // 자동 코인 재선택
                     info!("코인 재선택 시작...");
                     let selector = CoinSelector::new(&self.upbit, &self.bybit);
+                    let usd_krw_for_reselect = self
+                        .forex_cache
+                        .get_cached_rate()
+                        .unwrap_or(0.0);
                     let new_candidates = match selector
                         .select(
                             self.config.max_coins,
                             self.config.min_volume_1h_usdt,
                             &self.config.blacklist,
+                            usd_krw_for_reselect,
                         )
                         .await
                     {
@@ -429,19 +463,17 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                             .and_then(|w| w.last())
                             .map(|f| Decimal::try_from(f).unwrap_or(Decimal::ZERO))
                             .unwrap_or(Decimal::ZERO);
-                        let usdt_krw_val = spread_calc
-                            .usdt_krw_window()
-                            .last()
-                            .map(|f| Decimal::try_from(f).unwrap_or(Decimal::ZERO))
-                            .unwrap_or(Decimal::ZERO);
                         let spread_pct = spread_calc.last_spread_pct(coin).unwrap_or(0.0);
+
+                        // ForexCache에서 환율 조회
+                        let exit_usd_krw = self.forex_cache.get_cached_rate().unwrap_or(0.0);
 
                         match position_mgr.close_position(
                             coin,
                             now,
                             upbit_usdt,
                             bybit_price,
-                            usdt_krw_val,
+                            exit_usd_krw,
                             spread_pct,
                             f64::NAN,
                             self.config.upbit_taker_fee,
@@ -454,7 +486,7 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                                     net_pnl = %closed.net_pnl,
                                     "TTL 만료 강제 청산 완료"
                                 );
-                                trades_for_csv.push(closed);
+                                trades.push(closed);
                             }
                             Err(e) => {
                                 warn!(
@@ -496,7 +528,7 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                                         error = %e,
                                         "Upbit 구독 추가 실패"
                                     );
-                                    // 워밍업은 했지만 구독 실패 → 데이터 정리
+                                    // 워밍업은 했지만 구독 실패 -> 데이터 정리
                                     spread_calc.remove_coin(coin);
                                     continue;
                                 }
@@ -510,7 +542,7 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                                         error = %e,
                                         "Bybit 구독 추가 실패"
                                     );
-                                    // Upbit는 구독 성공했지만 Bybit 실패 → 롤백
+                                    // Upbit는 구독 성공했지만 Bybit 실패 -> 롤백
                                     self.upbit
                                         .unsubscribe_markets(&[&upbit_market])
                                         .await
@@ -547,9 +579,9 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                     info!(
                         total_events = total_event_count,
                         open_positions = position_mgr.open_count(),
-                        total_trades = trades_for_csv.len(),
-                        timeseries_records = timeseries_records.len(),
+                        total_trades = trades.len(),
                         coins = ?current_coins,
+                        usd_krw = self.forex_cache.get_cached_rate().unwrap_or(0.0),
                         "[heartbeat] 실시간 모니터 상태"
                     );
                 }
@@ -560,19 +592,9 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
         self.upbit.unsubscribe().await.ok();
         self.bybit.unsubscribe().await.ok();
 
-        // CSV 저장
-        if !trades_for_csv.is_empty() {
-            debug!(count = trades_for_csv.len(), dir = %self.config.output_dir.display(), "CSV 저장: 거래 내역");
-            csv::write_trades_csv(&self.config.output_dir, &trades_for_csv)?;
-        }
-        if !timeseries_records.is_empty() {
-            debug!(count = timeseries_records.len(), dir = %self.config.output_dir.display(), "CSV 저장: 시계열 기록");
-            csv::write_timeseries_csv(&self.config.output_dir, &timeseries_records)?;
-        }
+        info!(trades = trades.len(), "실시간 모니터링 종료");
 
-        info!(trades = trades_for_csv.len(), "실시간 모니터링 종료");
-
-        Ok(trades_for_csv)
+        Ok(trades)
     }
 
     /// REST API로 전체 코인의 워밍업 데이터를 로드합니다.
@@ -590,6 +612,7 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
     /// 단일 코인의 워밍업 데이터를 REST API로 로드합니다.
     ///
     /// SpreadCalculator에 해당 코인이 없으면 `add_coin`으로 추가합니다.
+    /// 환율은 ForexCache의 일봉 데이터를 사용합니다.
     async fn warmup_single_coin(
         &self,
         coin: &str,
@@ -632,22 +655,20 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
         )
         .await?;
 
-        let usdt_krw_candles = fetch_all_candles(
-            &self.upbit,
-            "KRW-USDT",
-            self.config.candle_interval,
-            window_size,
-            end_time,
-            200,
-            Duration::from_millis(100),
-        )
-        .await?;
+        // ForexCache에서 일봉 환율 조회
+        let warmup_days = (window_size as i64 / (24 * 60)) + 2; // 여유 2일
+        let from = end_time - chrono::Duration::days(warmup_days.max(2));
+        let daily_rates = self
+            .forex_cache
+            .get_daily_rates(from, end_time)
+            .await
+            .map_err(|e| StrategyError::DataAlignment(format!("Forex warmup failed: {e}")))?;
 
         info!(
             coin = coin,
             upbit = upbit_candles.len(),
             bybit = bybit_candles.len(),
-            usdt_krw = usdt_krw_candles.len(),
+            daily_rates = daily_rates.len(),
             "워밍업 데이터 로드"
         );
 
@@ -660,18 +681,17 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
             .iter()
             .map(|c| (truncate_to_minute(c.timestamp), c.close))
             .collect();
-        let usdt_krw_map: std::collections::HashMap<DateTime<Utc>, Decimal> = usdt_krw_candles
+
+        // 일봉 환율을 날짜별 맵으로 변환
+        let daily_rate_map: std::collections::HashMap<chrono::NaiveDate, f64> = daily_rates
             .iter()
-            .map(|c| (truncate_to_minute(c.timestamp), c.close))
+            .map(|(dt, rate)| (dt.date_naive(), *rate))
             .collect();
 
-        // 3개 소스의 공통 시간 범위 계산
-        // 저유동성 코인은 1440캔들이 24시간 이상을 커버할 수 있으므로,
-        // 가장 늦은 시작 시간 이후만 처리하여 소스 간 범위 불일치를 방지합니다.
+        // 2개 소스의 공통 시간 범위 계산 (환율은 일봉이므로 제외)
         let common_start = [
             upbit_map.keys().min().copied(),
             bybit_map.keys().min().copied(),
-            usdt_krw_map.keys().min().copied(),
         ]
         .iter()
         .filter_map(|t| *t)
@@ -684,9 +704,6 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
             timestamps.insert(*ts);
         }
         for ts in bybit_map.keys() {
-            timestamps.insert(*ts);
-        }
-        for ts in usdt_krw_map.keys() {
             timestamps.insert(*ts);
         }
 
@@ -703,17 +720,26 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
             trimmed = pre_filter_count - timestamps.len(),
             upbit_candles = upbit_map.len(),
             bybit_candles = bybit_map.len(),
-            usdt_krw_candles = usdt_krw_map.len(),
+            daily_rates = daily_rate_map.len(),
             common_start = ?common_start,
             "워밍업 타임스탬프 정규화 완료"
         );
 
+        // 환율 forward-fill: 각 분봉 timestamp의 날짜에 해당하는 일봉 환율 사용
+        let mut last_usd_krw: f64 = daily_rates.last().map(|(_, r)| *r).unwrap_or(0.0);
+
         for ts in &timestamps {
+            // 해당 날짜의 일봉 환율이 있으면 갱신
+            let date = ts.date_naive();
+            if let Some(&rate) = daily_rate_map.get(&date) {
+                last_usd_krw = rate;
+            }
+
             spread_calc.update(
                 coin,
                 *ts,
                 upbit_map.get(ts).copied(),
-                usdt_krw_map.get(ts).copied(),
+                last_usd_krw,
                 bybit_map.get(ts).copied(),
             )?;
         }
@@ -735,9 +761,9 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
         candle_builder: &mut MinuteCandleBuilder,
         spread_calc: &mut SpreadCalculator,
         position_mgr: &mut PositionManager,
-        timeseries: &mut Vec<TimeseriesRecord>,
         trades: &mut Vec<ClosedPosition>,
         current_coins: &[String],
+        forex_cache: &ForexCache,
     ) -> Result<(), StrategyError> {
         let (event_ts, event_market, event_type) = match event {
             MarketEvent::Trade {
@@ -768,10 +794,10 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                     candle_builder,
                     spread_calc,
                     position_mgr,
-                    timeseries,
                     trades,
                     event_ts,
                     current_coins,
+                    forex_cache,
                 )?;
             }
             candle_builder.start_new_minute(event_ts);
@@ -787,20 +813,194 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
             }
         }
 
+        // 틱 시그널 평가: 해당 코인 추출 후 check_tick_signal 호출
+        let coin = match event {
+            MarketEvent::Trade { market, .. } => market.strip_prefix("KRW-").map(|s| s.to_string()),
+            MarketEvent::BestQuote { market, .. } => {
+                market.strip_suffix("USDT").map(|s| s.to_string())
+            }
+        };
+
+        if let Some(coin) = coin
+            && current_coins.iter().any(|c| c == &coin)
+            && let Err(e) = Self::check_tick_signal(
+                &coin,
+                config,
+                candle_builder,
+                spread_calc,
+                position_mgr,
+                trades,
+                forex_cache,
+            )
+        {
+            warn!(coin = coin.as_str(), error = %e, "틱 시그널 평가 실패");
+        }
+
         Ok(())
     }
 
-    /// 현재 분을 완결하고 시그널 평가를 수행합니다.
+    /// 틱 수신 시 즉시 시그널을 평가합니다.
+    fn check_tick_signal(
+        coin: &str,
+        config: &ZScoreConfig,
+        candle_builder: &MinuteCandleBuilder,
+        spread_calc: &SpreadCalculator,
+        position_mgr: &mut PositionManager,
+        trades: &mut Vec<ClosedPosition>,
+        forex_cache: &ForexCache,
+    ) -> Result<(), StrategyError> {
+        // 1. 양쪽 last_trade가 모두 있어야 함
+        let upbit_krw = match candle_builder.upbit_last_trade.get(coin) {
+            Some(price) => *price,
+            None => return Ok(()), // 아직 데이터 부족
+        };
+        let bybit_usd = match candle_builder.bybit_last_bid.get(coin) {
+            Some(price) => *price,
+            None => return Ok(()),
+        };
+        let usd_krw = match forex_cache.get_cached_rate() {
+            Some(rate) => rate,
+            None => return Ok(()), // 환율 캐시 미초기화
+        };
+
+        // 2. 현재 스프레드 계산
+        let upbit_krw_f64 = upbit_krw.to_f64().unwrap_or(0.0);
+        let upbit_usd = upbit_krw_f64 / usd_krw;
+        let bybit_f64 = bybit_usd.to_f64().unwrap_or(0.0);
+
+        if upbit_usd == 0.0 {
+            return Ok(());
+        }
+
+        let current_spread = (bybit_f64 - upbit_usd) / upbit_usd * 100.0;
+
+        trace!(
+            coin = coin,
+            upbit_krw = upbit_krw_f64,
+            upbit_usd = upbit_usd,
+            bybit_usd = bybit_f64,
+            usd_krw = usd_krw,
+            spread_pct = current_spread,
+            "틱 스프레드 계산"
+        );
+
+        // 3. 캐시된 mean/stddev 조회 (O(1))
+        let (mean, stddev) = match spread_calc.cached_stats(coin) {
+            Some(stats) => stats,
+            None => return Ok(()), // 윈도우 미충족
+        };
+
+        trace!(
+            coin = coin,
+            mean = mean,
+            stddev = stddev,
+            spread = current_spread,
+            z_approx = if stddev > 0.0 { (current_spread - mean) / stddev } else { 0.0 },
+            "틱 시그널 평가 입력"
+        );
+
+        // 4. 시그널 평가
+        let sig =
+            signal::evaluate_tick_signal(coin, current_spread, mean, stddev, position_mgr, config)?;
+
+        // 5. 시그널 처리
+        match sig {
+            Some(Signal::Enter {
+                coin: c,
+                z_score,
+                spread_pct,
+                expected_profit_pct,
+            }) => {
+                let size_usdt = config.total_capital_usdt * config.position_ratio;
+                let upbit_price = Decimal::try_from(upbit_usd).unwrap_or(Decimal::ZERO);
+                let bybit_price_dec = bybit_usd;
+
+                let liq_price = position::calculate_liquidation_price(
+                    bybit_price_dec,
+                    config.leverage,
+                    config.bybit_mmr,
+                    config.bybit_taker_fee,
+                );
+
+                let pos = VirtualPosition {
+                    coin: c.clone(),
+                    entry_time: Utc::now(),
+                    upbit_entry_price: upbit_price,
+                    bybit_entry_price: bybit_price_dec,
+                    bybit_liquidation_price: liq_price,
+                    entry_usd_krw: usd_krw,
+                    entry_spread_pct: spread_pct,
+                    entry_z_score: z_score,
+                    size_usdt,
+                };
+
+                info!(
+                    coin = c.as_str(),
+                    z_score = z_score,
+                    spread_pct = spread_pct,
+                    expected_profit = expected_profit_pct,
+                    "[틱] 진입 시그널"
+                );
+
+                if let Err(e) = position_mgr.open_position(pos) {
+                    warn!(coin = c.as_str(), error = %e, "포지션 오픈 실패");
+                }
+            }
+            Some(Signal::Exit {
+                coin: c,
+                z_score,
+                spread_pct,
+            }) => {
+                info!(
+                    coin = c.as_str(),
+                    z_score = z_score,
+                    spread_pct = spread_pct,
+                    "[틱] 청산 시그널"
+                );
+
+                let upbit_price = Decimal::try_from(upbit_usd).unwrap_or(Decimal::ZERO);
+
+                match position_mgr.close_position(
+                    &c,
+                    Utc::now(),
+                    upbit_price,
+                    bybit_usd,
+                    usd_krw,
+                    spread_pct,
+                    z_score,
+                    config.upbit_taker_fee,
+                    config.bybit_taker_fee,
+                    false,
+                ) {
+                    Ok(closed) => {
+                        info!(coin = c.as_str(), net_pnl = %closed.net_pnl, "[틱] 포지션 청산 완료");
+                        trades.push(closed);
+                    }
+                    Err(e) => {
+                        warn!(coin = c.as_str(), error = %e, "포지션 청산 실패");
+                    }
+                }
+            }
+            None => {}
+        }
+
+        Ok(())
+    }
+
+    /// 현재 분을 완결하고 통계를 갱신합니다.
+    ///
+    /// 시그널 평가는 틱에서 처리하므로, 여기서는 SpreadCalculator 업데이트와
+    /// Liquidation 체크만 수행합니다.
     #[allow(clippy::too_many_arguments)]
     fn finalize_and_process(
         config: &ZScoreConfig,
         candle_builder: &mut MinuteCandleBuilder,
         spread_calc: &mut SpreadCalculator,
         position_mgr: &mut PositionManager,
-        timeseries: &mut Vec<TimeseriesRecord>,
         trades: &mut Vec<ClosedPosition>,
         new_minute_ts: DateTime<Utc>,
         current_coins: &[String],
+        forex_cache: &ForexCache,
     ) -> Result<(), StrategyError> {
         let ts = candle_builder
             .current_minute
@@ -809,17 +1009,29 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
         debug!(
             timestamp = %ts,
             coins = ?current_coins,
-            "분 완결 시작: 시그널 평가 수행"
+            "분 완결 시작: 통계 갱신"
         );
 
-        let (upbit_closes, usdt_krw, bybit_closes) = candle_builder.finalize_minute(current_coins);
+        let (upbit_closes, bybit_closes) = candle_builder.finalize_minute(current_coins);
+
+        // ForexCache에서 환율 가져오기
+        let usd_krw: f64 = forex_cache.get_cached_rate().unwrap_or(0.0);
 
         for coin in current_coins {
             let upbit_close = upbit_closes.get(coin).copied().flatten();
             let bybit_close = bybit_closes.get(coin).copied().flatten();
 
+            // usd_krw가 0이면 SpreadCalculator가 에러를 반환하므로 스킵
+            if usd_krw == 0.0 {
+                trace!(
+                    coin = coin.as_str(),
+                    "USD/KRW 환율 미수신, 스프레드 계산 스킵"
+                );
+                continue;
+            }
+
             // SpreadCalculator 업데이트 (forward-fill 내장)
-            spread_calc.update(coin, ts, upbit_close, usdt_krw, bybit_close)?;
+            spread_calc.update(coin, ts, upbit_close, usd_krw, bybit_close)?;
 
             // Liquidation 체크
             if let Some(bybit_price) = bybit_close.or_else(|| {
@@ -834,11 +1046,6 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                     .and_then(|w| w.last())
                     .map(|f| Decimal::try_from(f).unwrap_or(Decimal::ZERO))
                     .unwrap_or(Decimal::ZERO);
-                let usdt_krw_val = spread_calc
-                    .usdt_krw_window()
-                    .last()
-                    .map(|f| Decimal::try_from(f).unwrap_or(Decimal::ZERO))
-                    .unwrap_or(Decimal::ZERO);
                 let spread_pct = spread_calc.last_spread_pct(coin).unwrap_or(0.0);
 
                 warn!(coin = coin.as_str(), "Bybit 강제 청산 발생");
@@ -848,7 +1055,7 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                     ts,
                     upbit_usdt,
                     bybit_price,
-                    usdt_krw_val,
+                    usd_krw,
                     spread_pct,
                     f64::NAN,
                     config.upbit_taker_fee,
@@ -864,190 +1071,27 @@ impl<U: MarketData + MarketStream, B: MarketData + MarketStream> ZScoreMonitor<U
                 }
             }
 
-            // 시그널 평가
-            let sig = signal::evaluate_signal(coin, spread_calc, position_mgr, config)?;
-
-            // 시계열 기록
-            let spread_window = spread_calc.spread_window(coin);
-            let (mean_pct, stddev_val, z_val) = if let Some(w) = spread_window {
-                if w.is_ready() {
-                    let data = w.data();
-                    let m = statistics::mean(data);
-                    let s = statistics::stddev(data, m);
-                    let z = if s >= config.min_stddev_threshold {
-                        spread_calc
-                            .last_spread_pct(coin)
-                            .map(|sp| (sp - m) / s)
-                            .unwrap_or(0.0)
-                    } else {
-                        0.0
-                    };
-                    (m, s, z)
+            // 시그널 평가는 틱에서 처리 -- 통계 로그만 출력
+            if let Some((mean, stddev)) = spread_calc.cached_stats(coin) {
+                let last_spread = spread_calc.last_spread_pct(coin).unwrap_or(0.0);
+                let z = if stddev >= config.min_stddev_threshold {
+                    (last_spread - mean) / stddev
                 } else {
-                    (0.0, 0.0, 0.0)
-                }
-            } else {
-                (0.0, 0.0, 0.0)
-            };
-
-            let signal_str = match &sig {
-                Some(Signal::Enter { .. }) => "ENTER",
-                Some(Signal::Exit { .. }) => "EXIT",
-                None => "NONE",
-            };
-
-            let position_str = if position_mgr.has_position(coin) {
-                "OPEN"
-            } else {
-                "NONE"
-            };
-
-            // 코인별 스프레드/Z-Score/시그널 결과 로그
-            debug!(
-                coin = coin.as_str(),
-                spread_pct = spread_calc.last_spread_pct(coin).unwrap_or(0.0),
-                mean = mean_pct,
-                stddev = stddev_val,
-                z_score = z_val,
-                signal = signal_str,
-                position = position_str,
-                "분 완결: 코인별 통계 및 시그널"
-            );
-
-            timeseries.push(TimeseriesRecord {
-                timestamp: ts,
-                coin: coin.clone(),
-                upbit_usdt_price: spread_calc
-                    .upbit_window(coin)
-                    .and_then(|w| w.last())
-                    .unwrap_or(0.0),
-                bybit_price: spread_calc
-                    .bybit_window(coin)
-                    .and_then(|w| w.last())
-                    .unwrap_or(0.0),
-                spread_pct: spread_calc.last_spread_pct(coin).unwrap_or(0.0),
-                mean_spread_pct: mean_pct,
-                stddev: stddev_val,
-                z_score: z_val,
-                signal: signal_str.to_string(),
-                position: position_str.to_string(),
-            });
-
-            // 시그널 처리
-            match sig {
-                Some(Signal::Enter {
-                    coin: c,
-                    z_score,
-                    spread_pct,
-                    expected_profit_pct,
-                }) => {
-                    let size_usdt = config.total_capital_usdt * config.position_ratio;
-                    let upbit_usdt = spread_calc
-                        .upbit_window(&c)
-                        .and_then(|w| w.last())
-                        .unwrap_or(0.0);
-                    let bybit_f64 = spread_calc
-                        .bybit_window(&c)
-                        .and_then(|w| w.last())
-                        .unwrap_or(0.0);
-                    let usdt_krw_val = spread_calc.usdt_krw_window().last().unwrap_or(0.0);
-
-                    let upbit_price = Decimal::try_from(upbit_usdt).unwrap_or(Decimal::ZERO);
-                    let bybit_price_dec = Decimal::try_from(bybit_f64).unwrap_or(Decimal::ZERO);
-                    let usdt_krw_dec = Decimal::try_from(usdt_krw_val).unwrap_or(Decimal::ZERO);
-
-                    let liq_price = position::calculate_liquidation_price(
-                        bybit_price_dec,
-                        config.leverage,
-                        config.bybit_mmr,
-                        config.bybit_taker_fee,
-                    );
-
-                    let pos = VirtualPosition {
-                        coin: c.clone(),
-                        entry_time: ts,
-                        upbit_entry_price: upbit_price,
-                        bybit_entry_price: bybit_price_dec,
-                        bybit_liquidation_price: liq_price,
-                        entry_usdt_krw: usdt_krw_dec,
-                        entry_spread_pct: spread_pct,
-                        entry_z_score: z_score,
-                        size_usdt,
-                    };
-
-                    info!(
-                        coin = c.as_str(),
-                        z_score = z_score,
-                        spread_pct = spread_pct,
-                        expected_profit = expected_profit_pct,
-                        "[실시간] 진입 시그널"
-                    );
-
-                    debug!(
-                        coin = c.as_str(),
-                        size_usdt = %size_usdt,
-                        upbit_usdt = upbit_usdt,
-                        bybit_price = bybit_f64,
-                        usdt_krw = usdt_krw_val,
-                        liquidation_price = %liq_price,
-                        "진입 상세: 포지션 사이즈 및 가격 정보"
-                    );
-
-                    if let Err(e) = position_mgr.open_position(pos) {
-                        warn!(coin = c.as_str(), error = %e, "포지션 오픈 실패");
-                    }
-                }
-                Some(Signal::Exit {
-                    coin: c,
-                    z_score,
-                    spread_pct,
-                }) => {
-                    let upbit_usdt = spread_calc
-                        .upbit_window(&c)
-                        .and_then(|w| w.last())
-                        .unwrap_or(0.0);
-                    let bybit_f64 = spread_calc
-                        .bybit_window(&c)
-                        .and_then(|w| w.last())
-                        .unwrap_or(0.0);
-                    let usdt_krw_val = spread_calc.usdt_krw_window().last().unwrap_or(0.0);
-
-                    info!(
-                        coin = c.as_str(),
-                        z_score = z_score,
-                        spread_pct = spread_pct,
-                        "[실시간] 청산 시그널"
-                    );
-
-                    debug!(
-                        coin = c.as_str(),
-                        upbit_usdt = upbit_usdt,
-                        bybit_price = bybit_f64,
-                        usdt_krw = usdt_krw_val,
-                        "청산 상세: 현재 가격 정보"
-                    );
-
-                    match position_mgr.close_position(
-                        &c,
-                        ts,
-                        Decimal::try_from(upbit_usdt).unwrap_or(Decimal::ZERO),
-                        Decimal::try_from(bybit_f64).unwrap_or(Decimal::ZERO),
-                        Decimal::try_from(usdt_krw_val).unwrap_or(Decimal::ZERO),
-                        spread_pct,
-                        z_score,
-                        config.upbit_taker_fee,
-                        config.bybit_taker_fee,
-                        false,
-                    ) {
-                        Ok(closed) => {
-                            trades.push(closed);
-                        }
-                        Err(e) => {
-                            warn!(coin = c.as_str(), error = %e, "포지션 청산 실패");
-                        }
-                    }
-                }
-                None => {}
+                    0.0
+                };
+                debug!(
+                    coin = coin.as_str(),
+                    spread_pct = last_spread,
+                    mean = mean,
+                    stddev = stddev,
+                    z_score = z,
+                    position = if position_mgr.has_position(coin) {
+                        "OPEN"
+                    } else {
+                        "NONE"
+                    },
+                    "분 완결: 통계 갱신 완료 (시그널은 틱에서 처리)"
+                );
             }
         }
 
@@ -1088,13 +1132,15 @@ mod tests {
     fn test_candle_builder_on_upbit_trade() {
         let mut builder = MinuteCandleBuilder::new();
         builder.on_upbit_trade("KRW-BTC", Decimal::new(138_000_000, 0));
+        // KRW-USDT는 무시됨 (ForexCache 사용)
         builder.on_upbit_trade("KRW-USDT", Decimal::new(1380, 0));
 
         assert_eq!(
             builder.upbit_last_trade.get("BTC"),
             Some(&Decimal::new(138_000_000, 0))
         );
-        assert_eq!(builder.usdt_krw_last_trade, Some(Decimal::new(1380, 0)));
+        // KRW-USDT는 저장되지 않음
+        assert!(builder.upbit_last_trade.get("USDT").is_none());
     }
 
     #[test]
@@ -1112,20 +1158,46 @@ mod tests {
     fn test_candle_builder_finalize() {
         let mut builder = MinuteCandleBuilder::new();
         builder.on_upbit_trade("KRW-BTC", Decimal::new(138_000_000, 0));
-        builder.on_upbit_trade("KRW-USDT", Decimal::new(1380, 0));
         builder.on_bybit_best_quote("BTCUSDT", Decimal::new(100_050, 0));
 
         let coins = vec!["BTC".to_string()];
-        let (upbit, usdt_krw, bybit) = builder.finalize_minute(&coins);
+        let (upbit, bybit) = builder.finalize_minute(&coins);
 
         assert_eq!(upbit.get("BTC"), Some(&Some(Decimal::new(138_000_000, 0))));
-        assert_eq!(usdt_krw, Some(Decimal::new(1380, 0)));
         assert_eq!(bybit.get("BTC"), Some(&Some(Decimal::new(100_050, 0))));
 
         // finalize 후 내부 상태 클리어 확인
         assert!(builder.upbit_last_trade.is_empty());
-        assert!(builder.usdt_krw_last_trade.is_none());
         assert!(builder.bybit_last_bid.is_empty());
+    }
+
+    #[test]
+    fn test_candle_builder_start_new_minute() {
+        let mut builder = MinuteCandleBuilder::new();
+        let ts = Utc::now();
+
+        // 데이터 추가
+        builder.on_upbit_trade("KRW-BTC", Decimal::new(138_000_000, 0));
+        builder.on_bybit_best_quote("BTCUSDT", Decimal::new(100_050, 0));
+
+        // 새 분으로 전환
+        builder.start_new_minute(ts);
+
+        // 이전 데이터가 클리어됨
+        assert!(builder.upbit_last_trade.is_empty());
+        assert!(builder.bybit_last_bid.is_empty());
+        assert!(builder.current_minute.is_some());
+    }
+
+    #[test]
+    fn test_candle_builder_krw_usdt_ignored() {
+        let mut builder = MinuteCandleBuilder::new();
+
+        // KRW-USDT 이벤트는 무시되어야 함
+        builder.on_upbit_trade("KRW-USDT", Decimal::new(1380, 0));
+
+        // upbit_last_trade에 저장되지 않음
+        assert!(builder.upbit_last_trade.is_empty());
     }
 
     // --- diff_coins 테스트 ---
@@ -1140,7 +1212,7 @@ mod tests {
             upbit_entry_price: Decimal::new(1, 0),
             bybit_entry_price: Decimal::new(1, 0),
             bybit_liquidation_price: Decimal::new(2, 0),
-            entry_usdt_krw: Decimal::new(1380, 0),
+            entry_usd_krw: 1380.0,
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
             size_usdt: Decimal::new(1000, 0),
@@ -1276,5 +1348,159 @@ mod tests {
         assert_eq!(diff.to_add.len(), 2);
         assert!(diff.to_remove.is_empty());
         assert!(diff.to_keep_with_position.is_empty());
+    }
+
+    #[test]
+    fn test_check_tick_signal_no_data() {
+        use std::time::Duration;
+
+        let config = ZScoreConfig::default();
+        let candle_builder = MinuteCandleBuilder::new();
+        let spread_calc = SpreadCalculator::new(&["BTC".to_string()], 10);
+        let mut position_mgr = PositionManager::new();
+        let mut trades = Vec::new();
+        let forex_cache = ForexCache::new(Duration::from_secs(600));
+        // 캐시 비어있음 -> 즉시 Ok(()) 반환
+        let result = ZScoreMonitor::<MockMarket, MockMarket>::check_tick_signal(
+            "BTC",
+            &config,
+            &candle_builder,
+            &spread_calc,
+            &mut position_mgr,
+            &mut trades,
+            &forex_cache,
+        );
+        assert!(result.is_ok());
+        assert!(trades.is_empty());
+    }
+
+    #[test]
+    fn test_check_tick_signal_partial_data() {
+        use std::time::Duration;
+
+        let config = ZScoreConfig::default();
+        let mut candle_builder = MinuteCandleBuilder::new();
+
+        // Upbit 데이터만 있고 Bybit 없음
+        candle_builder
+            .upbit_last_trade
+            .insert("BTC".to_string(), Decimal::new(138_000_000, 0));
+
+        let spread_calc = SpreadCalculator::new(&["BTC".to_string()], 10);
+        let mut position_mgr = PositionManager::new();
+        let mut trades = Vec::new();
+        let forex_cache = ForexCache::new(Duration::from_secs(600));
+        forex_cache.update_cache_for_test(1450.0);
+
+        let result = ZScoreMonitor::<MockMarket, MockMarket>::check_tick_signal(
+            "BTC",
+            &config,
+            &candle_builder,
+            &spread_calc,
+            &mut position_mgr,
+            &mut trades,
+            &forex_cache,
+        );
+        assert!(result.is_ok());
+        assert!(trades.is_empty());
+    }
+
+    #[test]
+    fn test_check_tick_signal_window_not_ready() {
+        use std::time::Duration;
+
+        let config = ZScoreConfig::default();
+        let mut candle_builder = MinuteCandleBuilder::new();
+
+        // 양쪽 데이터 있음
+        candle_builder
+            .upbit_last_trade
+            .insert("BTC".to_string(), Decimal::new(138_000_000, 0));
+        candle_builder
+            .bybit_last_bid
+            .insert("BTC".to_string(), Decimal::new(100_050, 0));
+
+        // SpreadCalculator 윈도우 미충족 (window_size=10, 데이터 0개)
+        let spread_calc = SpreadCalculator::new(&["BTC".to_string()], 10);
+        let mut position_mgr = PositionManager::new();
+        let mut trades = Vec::new();
+        let forex_cache = ForexCache::new(Duration::from_secs(600));
+        forex_cache.update_cache_for_test(1450.0);
+
+        let result = ZScoreMonitor::<MockMarket, MockMarket>::check_tick_signal(
+            "BTC",
+            &config,
+            &candle_builder,
+            &spread_calc,
+            &mut position_mgr,
+            &mut trades,
+            &forex_cache,
+        );
+        assert!(result.is_ok());
+        // 윈도우 미충족이므로 시그널 없음
+        assert!(trades.is_empty());
+    }
+
+    /// 테스트용 mock MarketData + MarketStream 구현.
+    struct MockMarket;
+
+    impl MarketData for MockMarket {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn get_ticker(
+            &self,
+            _markets: &[&str],
+        ) -> Result<Vec<arb_exchange::Ticker>, arb_exchange::ExchangeError> {
+            unimplemented!()
+        }
+        async fn get_all_tickers(
+            &self,
+        ) -> Result<Vec<arb_exchange::Ticker>, arb_exchange::ExchangeError> {
+            unimplemented!()
+        }
+        async fn get_orderbook(
+            &self,
+            _market: &str,
+            _depth: Option<u32>,
+        ) -> Result<arb_exchange::OrderBook, arb_exchange::ExchangeError> {
+            unimplemented!()
+        }
+        async fn get_candles(
+            &self,
+            _market: &str,
+            _interval: arb_exchange::CandleInterval,
+            _count: u32,
+        ) -> Result<Vec<arb_exchange::Candle>, arb_exchange::ExchangeError> {
+            unimplemented!()
+        }
+        async fn get_candles_before(
+            &self,
+            _market: &str,
+            _interval: arb_exchange::CandleInterval,
+            _count: u32,
+            _before: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<arb_exchange::Candle>, arb_exchange::ExchangeError> {
+            unimplemented!()
+        }
+        fn market_code(_base: &str, _quote: &str) -> String {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MarketStream for MockMarket {
+        fn stream_name(&self) -> &str {
+            "mock"
+        }
+        async fn subscribe(
+            &self,
+            _markets: &[&str],
+        ) -> Result<tokio::sync::mpsc::Receiver<MarketEvent>, arb_exchange::ExchangeError> {
+            unimplemented!()
+        }
+        async fn unsubscribe(&self) -> Result<(), arb_exchange::ExchangeError> {
+            unimplemented!()
+        }
     }
 }

@@ -5,7 +5,6 @@
 
 pub mod common;
 pub mod error;
-pub mod output;
 pub mod zscore;
 
 pub use error::{PositionError, StatisticsError, StrategyError};

@@ -62,11 +62,13 @@ impl<'a, U: MarketData, B: MarketData> CoinSelector<'a, U, B> {
     /// * `max_coins` - 최대 반환 코인 수
     /// * `min_volume_1h_usdt` - 1시간 최소 거래량 (USDT)
     /// * `blacklist` - 제외할 코인 심볼 목록
+    /// * `usd_krw` - USD/KRW 환율 (ForexCache에서 제공, Upbit KRW 볼륨 환산용)
     pub async fn select(
         &self,
         max_coins: usize,
         min_volume_1h_usdt: Decimal,
         blacklist: &[String],
+        usd_krw: f64,
     ) -> Result<Vec<CoinCandidate>, StrategyError> {
         // 1. 양쪽 거래소 전종목 Ticker 조회
         let upbit_tickers = self.upbit.get_all_tickers().await?;
@@ -109,28 +111,23 @@ impl<'a, U: MarketData, B: MarketData> CoinSelector<'a, U, B> {
         let upbit_map = build_ticker_map_upbit(&upbit_tickers);
         let bybit_map = build_ticker_map_bybit(&bybit_tickers);
 
-        // KRW → USDT 환산 환율 (Upbit KRW-USDT 티커)
-        let usdt_krw_rate: Decimal = upbit_map
-            .get("USDT")
-            .map(|t| t.trade_price)
-            .unwrap_or(Decimal::ZERO);
-        let usdt_krw_rate_f64 = usdt_krw_rate.to_f64().unwrap_or(0.0);
-
-        if usdt_krw_rate.is_zero() {
-            warn!("KRW-USDT 환율 조회 불가: Upbit 볼륨을 USDT로 환산할 수 없습니다");
+        // USD/KRW 환율 (ForexCache에서 주입)
+        if usd_krw <= 0.0 {
+            warn!("USD/KRW 환율이 유효하지 않음: Upbit 볼륨을 USD로 환산할 수 없습니다");
         } else {
-            debug!(usdt_krw_rate = %usdt_krw_rate, "KRW-USDT 환율");
+            debug!(usd_krw = usd_krw, "USD/KRW 환율");
         }
 
         // 5. 24h 거래대금 1차 필터: 양쪽 중 낮은 값 기준으로 하위 50% 제거
-        //    Upbit 거래대금은 KRW 단위이므로 USDT로 환산하여 비교합니다.
+        //    Upbit 거래대금은 KRW 단위이므로 USD/KRW 환율로 나누어 USD로 환산합니다.
+        let usd_krw_dec = Decimal::try_from(usd_krw).unwrap_or(Decimal::ONE);
         let mut volume_pairs: Vec<(&str, Decimal)> = filtered_coins
             .iter()
             .filter_map(|coin| {
                 let upbit_vol_krw = upbit_map.get(*coin).map(|t| t.acc_trade_price_24h)?;
                 let bybit_vol = bybit_map.get(*coin).map(|t| t.acc_trade_price_24h)?;
-                let upbit_vol = if !usdt_krw_rate.is_zero() {
-                    upbit_vol_krw / usdt_krw_rate
+                let upbit_vol = if usd_krw > 0.0 {
+                    upbit_vol_krw / usd_krw_dec
                 } else {
                     upbit_vol_krw
                 };
@@ -203,12 +200,12 @@ impl<'a, U: MarketData, B: MarketData> CoinSelector<'a, U, B> {
                 }
             };
 
-            // 볼륨 USDT 환산: volume(코인수량) × close_price
-            // Upbit close는 KRW 단위이므로 KRW-USDT 환율로 나누어 USDT로 환산
+            // 볼륨 USD 환산: volume(코인수량) × close_price
+            // Upbit close는 KRW 단위이므로 USD/KRW 환율로 나누어 USD로 환산
             let upbit_vol_krw = upbit_candle.volume.to_f64().unwrap_or(0.0)
                 * upbit_candle.close.to_f64().unwrap_or(0.0);
-            let upbit_vol_usdt = if usdt_krw_rate_f64 > 0.0 {
-                upbit_vol_krw / usdt_krw_rate_f64
+            let upbit_vol_usdt = if usd_krw > 0.0 {
+                upbit_vol_krw / usd_krw
             } else {
                 upbit_vol_krw
             };
@@ -559,7 +556,7 @@ mod tests {
         let selector = CoinSelector::new(&upbit, &bybit);
 
         let result = selector
-            .select(10, Decimal::ZERO, &[])
+            .select(10, Decimal::ZERO, &[], 1350.0)
             .await
             .expect("select 실패");
 
@@ -582,7 +579,7 @@ mod tests {
 
         let blacklist = vec!["BTC".to_string(), "ETH".to_string()];
         let result = selector
-            .select(10, Decimal::ZERO, &blacklist)
+            .select(10, Decimal::ZERO, &blacklist, 1350.0)
             .await
             .expect("select 실패");
 
@@ -609,7 +606,7 @@ mod tests {
         // ETH Bybit: 5000 × 3,300 = 16,500,000 USDT → min = 16,500,000
         // 임계값 10,000,000 USDT → BTC(6.7M) 제외, ETH(16.5M) 통과
         let result = selector
-            .select(10, d("10000000"), &[])
+            .select(10, d("10000000"), &[], 1350.0)
             .await
             .expect("select 실패");
 
@@ -626,7 +623,7 @@ mod tests {
         let selector = CoinSelector::new(&upbit, &bybit);
 
         let result = selector
-            .select(10, Decimal::ZERO, &[])
+            .select(10, Decimal::ZERO, &[], 1350.0)
             .await
             .expect("select 실패");
 
@@ -649,7 +646,7 @@ mod tests {
         let selector = CoinSelector::new(&upbit, &bybit);
 
         let result = selector
-            .select(2, Decimal::ZERO, &[])
+            .select(2, Decimal::ZERO, &[], 1350.0)
             .await
             .expect("select 실패");
 
@@ -683,7 +680,7 @@ mod tests {
         let selector = CoinSelector::new(&upbit, &bybit);
 
         let result = selector
-            .select(10, Decimal::ZERO, &[])
+            .select(10, Decimal::ZERO, &[], 1350.0)
             .await
             .expect("select 실패");
 
@@ -750,7 +747,7 @@ mod tests {
 
         // max_coins=10이지만 후보가 2개 이하
         let result = selector
-            .select(10, Decimal::ZERO, &[])
+            .select(10, Decimal::ZERO, &[], 1350.0)
             .await
             .expect("select 실패");
 

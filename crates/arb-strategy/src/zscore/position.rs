@@ -28,8 +28,8 @@ pub struct VirtualPosition {
     pub bybit_entry_price: Decimal,
     /// Bybit liquidation price (Isolated Margin 기준).
     pub bybit_liquidation_price: Decimal,
-    /// 진입 시 USDT/KRW 환율 (사후 분석용).
-    pub entry_usdt_krw: Decimal,
+    /// 진입 시 USD/KRW 환율 (사후 분석용).
+    pub entry_usd_krw: f64,
     /// 진입 시 스프레드 (%).
     pub entry_spread_pct: f64,
     /// 진입 시 Z-Score.
@@ -112,7 +112,7 @@ impl PositionManager {
         exit_time: DateTime<Utc>,
         exit_upbit_usdt_price: Decimal,
         exit_bybit_price: Decimal,
-        exit_usdt_krw: Decimal,
+        exit_usd_krw: f64,
         exit_spread_pct: f64,
         exit_z_score: f64,
         upbit_taker_fee: Decimal,
@@ -162,8 +162,8 @@ impl PositionManager {
             exit_z_score,
             entry_spread_pct: pos.entry_spread_pct,
             exit_spread_pct,
-            entry_usdt_krw: pos.entry_usdt_krw,
-            exit_usdt_krw,
+            entry_usd_krw: pos.entry_usd_krw,
+            exit_usd_krw,
             is_liquidated,
         };
 
@@ -234,7 +234,7 @@ mod tests {
             upbit_entry_price: Decimal::new(entry_price, 0),
             bybit_entry_price: Decimal::new(entry_price + 50, 0),
             bybit_liquidation_price: Decimal::new(entry_price * 2, 0),
-            entry_usdt_krw: Decimal::new(1380, 0),
+            entry_usd_krw: 1380.0,
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
             size_usdt: Decimal::new(size, 0),
@@ -289,7 +289,7 @@ mod tests {
                 upbit_entry_price: Decimal::new(100_000, 0),
                 bybit_entry_price: Decimal::new(100_050, 0),
                 bybit_liquidation_price: Decimal::new(199_445, 0),
-                entry_usdt_krw: Decimal::new(1380, 0),
+                entry_usd_krw: 1380.0,
                 entry_spread_pct: 0.05,
                 entry_z_score: 2.5,
                 size_usdt: Decimal::new(1000, 0),
@@ -303,7 +303,7 @@ mod tests {
                 exit_time,
                 Decimal::new(100_020, 0), // upbit 청산가
                 Decimal::new(100_020, 0), // bybit 청산가
-                Decimal::new(1381, 0),    // exit usdt_krw
+                1381.0,                   // exit usd_krw
                 0.0,                      // exit spread
                 0.3,                      // exit z_score
                 Decimal::new(5, 4),       // upbit fee 0.0005
@@ -327,7 +327,7 @@ mod tests {
             Utc::now(),
             Decimal::ZERO,
             Decimal::ZERO,
-            Decimal::ZERO,
+            0.0,
             0.0,
             0.0,
             Decimal::ZERO,
@@ -348,7 +348,7 @@ mod tests {
                 upbit_entry_price: Decimal::new(100_000, 0),
                 bybit_entry_price: Decimal::new(100_050, 0),
                 bybit_liquidation_price: Decimal::new(199_445, 0),
-                entry_usdt_krw: Decimal::new(1380, 0),
+                entry_usd_krw: 1380.0,
                 entry_spread_pct: 0.05,
                 entry_z_score: 2.5,
                 size_usdt: Decimal::new(1000, 0),

@@ -65,7 +65,11 @@ impl BithumbClient {
         Ok(Self {
             client,
             credentials: None,
-            limiter: Arc::new(RateLimiter::new("bithumb", BITHUMB_RATE_LIMIT, BITHUMB_BURST)),
+            limiter: Arc::new(RateLimiter::new(
+                "bithumb",
+                BITHUMB_RATE_LIMIT,
+                BITHUMB_BURST,
+            )),
         })
     }
 
@@ -93,7 +97,11 @@ impl BithumbClient {
         Ok(Self {
             client,
             credentials: Some(BithumbCredentials::new(access_key, secret_key)),
-            limiter: Arc::new(RateLimiter::new("bithumb", BITHUMB_RATE_LIMIT, BITHUMB_BURST)),
+            limiter: Arc::new(RateLimiter::new(
+                "bithumb",
+                BITHUMB_RATE_LIMIT,
+                BITHUMB_BURST,
+            )),
         })
     }
 

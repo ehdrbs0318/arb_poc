@@ -14,6 +14,7 @@
 //! - [`telegram`]: Telegram 알림 시스템 (from `arb-telegram`)
 //! - [`exchange`]: 거래소 추상화를 위한 공통 trait 및 타입 (from `arb-exchange`)
 //! - [`exchanges`]: 특정 거래소 구현체 (from `arb-exchanges`)
+//! - [`forex`]: USD/KRW 환율 캐시 (from `arb-forex`)
 //! - [`strategy`]: 차익거래 전략 구현 (from `arb-strategy`)
 //!
 //! ## 예제
@@ -37,6 +38,7 @@
 pub use arb_config as config;
 pub use arb_exchange as exchange;
 pub use arb_exchanges as exchanges;
+pub use arb_forex as forex;
 pub use arb_logging as logging;
 pub use arb_strategy as strategy;
 pub use arb_telegram as telegram;

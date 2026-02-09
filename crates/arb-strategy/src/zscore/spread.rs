@@ -1,6 +1,6 @@
 //! 스프레드 계산 엔진.
 //!
-//! 3-way 입력(Upbit coin/KRW, USDT/KRW, Bybit coin/USDT)을 동기화하여
+//! 2-way 입력(Upbit coin/KRW + USD/KRW 환율, Bybit coin/USDT)을 동기화하여
 //! 상대 스프레드(%)를 계산하고 롤링 윈도우에 유지합니다.
 
 use std::collections::HashMap;
@@ -85,24 +85,82 @@ impl ForwardFillState {
     }
 }
 
+/// 분봉 push 시 O(1)로 갱신되는 증분 통계 캐시.
+///
+/// 윈도우의 mean과 stddev를 running sum 방식으로 유지하여,
+/// 틱 경로에서 O(1)로 통계를 조회할 수 있습니다.
+#[derive(Debug, Clone)]
+struct IncrementalStats {
+    /// 합계 (running sum).
+    running_sum: f64,
+    /// 제곱합 (running sum of squares).
+    running_sum_sq: f64,
+    /// 현재 데이터 개수.
+    count: usize,
+}
+
+impl IncrementalStats {
+    fn new() -> Self {
+        Self {
+            running_sum: 0.0,
+            running_sum_sq: 0.0,
+            count: 0,
+        }
+    }
+
+    /// 새 값 push, 윈도우 초과 시 pop된 값 반영.
+    ///
+    /// `popped_val`이 `Some`이면 윈도우에서 제거된 값을 차감합니다.
+    fn push(&mut self, new_val: f64, popped_val: Option<f64>) {
+        // pop된 값 차감
+        if let Some(old) = popped_val {
+            self.running_sum -= old;
+            self.running_sum_sq -= old * old;
+            self.count -= 1;
+        }
+
+        // 새 값 추가
+        self.running_sum += new_val;
+        self.running_sum_sq += new_val * new_val;
+        self.count += 1;
+    }
+
+    /// 현재 mean.
+    fn mean(&self) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        self.running_sum / self.count as f64
+    }
+
+    /// 현재 population stddev.
+    fn stddev(&self) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        let n = self.count as f64;
+        let variance = (self.running_sum_sq / n) - (self.running_sum / n).powi(2);
+        // 부동소수점 오차로 음수가 될 수 있으므로 0 보정
+        if variance < 0.0 { 0.0 } else { variance.sqrt() }
+    }
+}
+
 /// 스프레드 계산기.
 ///
-/// 코인별로 Upbit(KRW), USDT/KRW, Bybit(USDT) 가격을 동기화하여
+/// 코인별로 Upbit(KRW) + USD/KRW 환율, Bybit(USDT) 가격을 동기화하여
 /// 상대 스프레드(%)를 계산합니다.
 #[derive(Debug, Clone)]
 pub struct SpreadCalculator {
-    /// 코인별 Upbit 캔들 윈도우 (coin/KRW close 가격).
+    /// 코인별 Upbit 캔들 윈도우 (USD 환산 close 가격).
     upbit_coin_windows: HashMap<String, CandleWindow>,
-    /// USDT/KRW 캔들 윈도우 (Upbit KRW-USDT close 가격).
-    usdt_krw_window: CandleWindow,
     /// 코인별 Bybit 캔들 윈도우 (coinUSDT linear close 가격).
     bybit_windows: HashMap<String, CandleWindow>,
     /// 코인별 스프레드(%) 윈도우 - Z-Score 계산의 입력.
     spread_pct_windows: HashMap<String, CandleWindow>,
+    /// 코인별 증분 통계 캐시 (스프레드 윈도우용).
+    spread_stats: HashMap<String, IncrementalStats>,
     /// 코인별 Upbit forward-fill 상태.
     upbit_ff: HashMap<String, ForwardFillState>,
-    /// USDT/KRW forward-fill 상태.
-    usdt_krw_ff: ForwardFillState,
     /// 코인별 Bybit forward-fill 상태.
     bybit_ff: HashMap<String, ForwardFillState>,
     /// 윈도우 크기.
@@ -115,6 +173,7 @@ impl SpreadCalculator {
         let mut upbit_coin_windows = HashMap::new();
         let mut bybit_windows = HashMap::new();
         let mut spread_pct_windows = HashMap::new();
+        let mut spread_stats = HashMap::new();
         let mut upbit_ff = HashMap::new();
         let mut bybit_ff = HashMap::new();
 
@@ -122,17 +181,17 @@ impl SpreadCalculator {
             upbit_coin_windows.insert(coin.clone(), CandleWindow::new(window_size));
             bybit_windows.insert(coin.clone(), CandleWindow::new(window_size));
             spread_pct_windows.insert(coin.clone(), CandleWindow::new(window_size));
+            spread_stats.insert(coin.clone(), IncrementalStats::new());
             upbit_ff.insert(coin.clone(), ForwardFillState::new());
             bybit_ff.insert(coin.clone(), ForwardFillState::new());
         }
 
         Self {
             upbit_coin_windows,
-            usdt_krw_window: CandleWindow::new(window_size),
             bybit_windows,
             spread_pct_windows,
+            spread_stats,
             upbit_ff,
-            usdt_krw_ff: ForwardFillState::new(),
             bybit_ff,
             window_size,
         }
@@ -151,6 +210,8 @@ impl SpreadCalculator {
             .insert(coin.to_string(), CandleWindow::new(self.window_size));
         self.spread_pct_windows
             .insert(coin.to_string(), CandleWindow::new(self.window_size));
+        self.spread_stats
+            .insert(coin.to_string(), IncrementalStats::new());
         self.upbit_ff
             .insert(coin.to_string(), ForwardFillState::new());
         self.bybit_ff
@@ -164,6 +225,7 @@ impl SpreadCalculator {
         self.upbit_coin_windows.remove(coin);
         self.bybit_windows.remove(coin);
         self.spread_pct_windows.remove(coin);
+        self.spread_stats.remove(coin);
         self.upbit_ff.remove(coin);
         self.bybit_ff.remove(coin);
     }
@@ -175,16 +237,25 @@ impl SpreadCalculator {
 
     /// 특정 코인의 캔들 데이터를 업데이트하고 spread_pct를 재계산합니다.
     ///
-    /// 각 입력은 `Option` - `None`이면 forward-fill (직전 값 유지).
-    /// 3개 입력이 모두 준비되었을 때만 spread_pct를 계산하고 윈도우에 push합니다.
+    /// 각 코인 입력은 `Option` - `None`이면 forward-fill (직전 값 유지).
+    /// `usd_krw`는 Yahoo Finance에서 가져온 환율로, 항상 유효한 f64 값이어야 합니다.
+    /// 2개 코인 입력이 모두 준비되었을 때만 spread_pct를 계산하고 윈도우에 push합니다.
     pub fn update(
         &mut self,
         coin: &str,
         timestamp: DateTime<Utc>,
         upbit_coin: Option<Decimal>,
-        usdt_krw: Option<Decimal>,
+        usd_krw: f64,
         bybit: Option<Decimal>,
     ) -> Result<(), StrategyError> {
+        // USD/KRW 환율 0 체크
+        if usd_krw == 0.0 {
+            warn!(coin = coin, "USD/KRW 환율 0 감지");
+            return Err(StrategyError::DataAlignment(
+                "USD/KRW rate is zero".to_string(),
+            ));
+        }
+
         // forward-fill 적용
         let upbit_ff_state = self
             .upbit_ff
@@ -192,44 +263,33 @@ impl SpreadCalculator {
             .ok_or_else(|| StrategyError::Config(format!("unknown coin: {coin}")))?;
         let upbit_val = upbit_ff_state.update(upbit_coin, &format!("upbit_{coin}"), timestamp);
 
-        let usdt_krw_val = self.usdt_krw_ff.update(usdt_krw, "usdt_krw", timestamp);
-
         let bybit_ff_state = self
             .bybit_ff
             .get_mut(coin)
             .ok_or_else(|| StrategyError::Config(format!("unknown coin: {coin}")))?;
         let bybit_val = bybit_ff_state.update(bybit, &format!("bybit_{coin}"), timestamp);
 
-        // 3개 모두 유효한 경우에만 스프레드 계산
-        if let (Some(upbit_krw_close), Some(usdt_krw_close), Some(bybit_close)) =
-            (upbit_val, usdt_krw_val, bybit_val)
-        {
-            // 0 나누기 방지
-            if usdt_krw_close.is_zero() {
-                warn!(coin = coin, "USDT/KRW 가격 0 감지");
-                return Err(StrategyError::DataAlignment(
-                    "USDT/KRW price is zero".to_string(),
-                ));
-            }
-
-            // Upbit USDT 환산가
-            let upbit_usdt_f64 = decimal_to_f64(upbit_krw_close / usdt_krw_close)?;
+        // 2개 모두 유효한 경우에만 스프레드 계산
+        if let (Some(upbit_krw_close), Some(bybit_close)) = (upbit_val, bybit_val) {
+            // Upbit USD 환산가 (2-way: KRW 가격을 USD/KRW로 나눔)
+            let upbit_krw_f64 = decimal_to_f64(upbit_krw_close)?;
+            let upbit_usd_f64 = upbit_krw_f64 / usd_krw;
             let bybit_f64 = decimal_to_f64(bybit_close)?;
 
             // 0 나누기 방지
-            if upbit_usdt_f64 == 0.0 {
-                warn!(coin = coin, "Upbit USDT 환산가 0 감지");
+            if upbit_usd_f64 == 0.0 {
+                warn!(coin = coin, "Upbit USD 환산가 0 감지");
                 return Err(StrategyError::DataAlignment(
-                    "Upbit USDT price is zero".to_string(),
+                    "Upbit USD price is zero".to_string(),
                 ));
             }
 
             // 상대 스프레드 (%)
-            let spread_pct = (bybit_f64 - upbit_usdt_f64) / upbit_usdt_f64 * 100.0;
+            let spread_pct = (bybit_f64 - upbit_usd_f64) / upbit_usd_f64 * 100.0;
 
             trace!(
                 coin = coin,
-                upbit_usdt = upbit_usdt_f64,
+                upbit_usd = upbit_usd_f64,
                 bybit = bybit_f64,
                 spread_pct = spread_pct,
                 "스프레드 계산 완료"
@@ -239,25 +299,40 @@ impl SpreadCalculator {
             self.upbit_coin_windows
                 .get_mut(coin)
                 .ok_or_else(|| StrategyError::Config(format!("unknown coin: {coin}")))?
-                .push(upbit_usdt_f64);
-
-            self.usdt_krw_window.push(decimal_to_f64(usdt_krw_close)?);
+                .push(upbit_usd_f64);
 
             self.bybit_windows
                 .get_mut(coin)
                 .ok_or_else(|| StrategyError::Config(format!("unknown coin: {coin}")))?
                 .push(bybit_f64);
 
+            // IncrementalStats 갱신: push 전에 윈도우 full이면 pop될 값을 popped_val로 전달
+            let spread_window = self
+                .spread_pct_windows
+                .get(coin)
+                .ok_or_else(|| StrategyError::Config(format!("unknown coin: {coin}")))?;
+            let popped_val = if spread_window.data().len() >= self.window_size {
+                // 윈도우가 가득 찼으므로 data[0]이 pop될 예정
+                Some(spread_window.data()[0])
+            } else {
+                None
+            };
+
+            // IncrementalStats push
+            if let Some(stats) = self.spread_stats.get_mut(coin) {
+                stats.push(spread_pct, popped_val);
+            }
+
+            // 스프레드 윈도우에 push
             self.spread_pct_windows
                 .get_mut(coin)
                 .ok_or_else(|| StrategyError::Config(format!("unknown coin: {coin}")))?
                 .push(spread_pct);
         } else {
-            // 3개 입력 중 일부 누락으로 스프레드 미계산
+            // 2개 입력 중 일부 누락으로 스프레드 미계산
             trace!(
                 coin = coin,
                 upbit_present = upbit_val.is_some(),
-                usdt_krw_present = usdt_krw_val.is_some(),
                 bybit_present = bybit_val.is_some(),
                 "스프레드 미계산: 부분 데이터 누락"
             );
@@ -271,7 +346,7 @@ impl SpreadCalculator {
         self.spread_pct_windows.get(coin)
     }
 
-    /// 특정 코인의 Upbit USDT 환산 가격 윈도우에 대한 참조를 반환합니다.
+    /// 특정 코인의 Upbit USD 환산 가격 윈도우에 대한 참조를 반환합니다.
     pub fn upbit_window(&self, coin: &str) -> Option<&CandleWindow> {
         self.upbit_coin_windows.get(coin)
     }
@@ -281,9 +356,17 @@ impl SpreadCalculator {
         self.bybit_windows.get(coin)
     }
 
-    /// USDT/KRW 환율 윈도우에 대한 참조를 반환합니다.
-    pub fn usdt_krw_window(&self) -> &CandleWindow {
-        &self.usdt_krw_window
+    /// 특정 코인의 캐시된 통계(mean, stddev)를 O(1)로 반환합니다.
+    ///
+    /// 윈도우가 준비되지 않았으면 `None` 반환.
+    pub fn cached_stats(&self, coin: &str) -> Option<(f64, f64)> {
+        // 윈도우가 준비(가득 참)되어 있는지 확인
+        let window = self.spread_pct_windows.get(coin)?;
+        if !window.is_ready() {
+            return None;
+        }
+        let stats = self.spread_stats.get(coin)?;
+        Some((stats.mean(), stats.stddev()))
     }
 
     /// 특정 코인의 최신 스프레드(%)를 반환합니다.
@@ -308,6 +391,8 @@ impl SpreadCalculator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::statistics;
+    use std::collections::VecDeque;
 
     fn dec(n: i64, scale: u32) -> Decimal {
         Decimal::new(n, scale)
@@ -329,14 +414,14 @@ mod tests {
         let mut calc = SpreadCalculator::new(&coins, 3);
         let ts = Utc::now();
 
-        // upbit_coin_krw = 138_000_000, usdt_krw = 1380, bybit = 100_050
-        // upbit_usdt = 138_000_000 / 1380 = 100_000
+        // upbit_coin_krw = 138_000_000, usd_krw = 1380.0, bybit = 100_050
+        // upbit_usd = 138_000_000 / 1380.0 = 100_000
         // spread_pct = (100_050 - 100_000) / 100_000 * 100 = 0.05%
         calc.update(
             "BTC",
             ts,
             Some(dec(138_000_000, 0)),
-            Some(dec(1380, 0)),
+            1380.0,
             Some(dec(100_050, 0)),
         )
         .unwrap();
@@ -356,18 +441,18 @@ mod tests {
             "BTC",
             ts1,
             Some(dec(138_000_000, 0)),
-            Some(dec(1380, 0)),
+            1380.0,
             Some(dec(100_050, 0)),
         )
         .unwrap();
 
-        // 두 번째: upbit만 None (forward-fill)
+        // 두 번째: upbit만 None (forward-fill), usd_krw는 항상 유효
         let ts2 = ts1 + chrono::Duration::minutes(1);
-        calc.update("BTC", ts2, None, Some(dec(1380, 0)), Some(dec(100_100, 0)))
+        calc.update("BTC", ts2, None, 1380.0, Some(dec(100_100, 0)))
             .unwrap();
 
         // forward-fill로 upbit_krw = 138_000_000 유지
-        // upbit_usdt = 100_000, bybit = 100_100
+        // upbit_usd = 100_000, bybit = 100_100
         // spread_pct = (100_100 - 100_000) / 100_000 * 100 = 0.1%
         let spread = calc.last_spread_pct("BTC").unwrap();
         assert!((spread - 0.1).abs() < 1e-6);
@@ -379,8 +464,8 @@ mod tests {
         let mut calc = SpreadCalculator::new(&coins, 10);
         let ts = Utc::now();
 
-        // 모든 값 None이면 스프레드 계산 불가 (forward-fill할 직전 값이 없음)
-        calc.update("BTC", ts, None, None, None).unwrap();
+        // 코인 값 모두 None이면 스프레드 계산 불가 (forward-fill할 직전 값이 없음)
+        calc.update("BTC", ts, None, 1380.0, None).unwrap();
         assert!(calc.last_spread_pct("BTC").is_none());
     }
 
@@ -390,8 +475,8 @@ mod tests {
         let mut calc = SpreadCalculator::new(&coins, 10);
         let ts = Utc::now();
 
-        // upbit만 제공, usdt_krw/bybit 없음 -> 스프레드 계산 불가
-        calc.update("BTC", ts, Some(dec(138_000_000, 0)), None, None)
+        // upbit만 제공, bybit 없음 -> 스프레드 계산 불가
+        calc.update("BTC", ts, Some(dec(138_000_000, 0)), 1380.0, None)
             .unwrap();
         assert!(calc.last_spread_pct("BTC").is_none());
     }
@@ -407,7 +492,7 @@ mod tests {
                 "BTC",
                 ts,
                 Some(dec(138_000_000, 0)),
-                Some(dec(1380, 0)),
+                1380.0,
                 Some(dec(100_000 + i * 10, 0)),
             )
             .unwrap();
@@ -422,18 +507,12 @@ mod tests {
         let mut calc = SpreadCalculator::new(&coins, 10);
         let ts = Utc::now();
 
-        let result = calc.update(
-            "UNKNOWN",
-            ts,
-            Some(dec(1, 0)),
-            Some(dec(1, 0)),
-            Some(dec(1, 0)),
-        );
+        let result = calc.update("UNKNOWN", ts, Some(dec(1, 0)), 1380.0, Some(dec(1, 0)));
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_zero_usdt_krw_returns_error() {
+    fn test_zero_usd_krw_returns_error() {
         let coins = vec!["BTC".to_string()];
         let mut calc = SpreadCalculator::new(&coins, 10);
         let ts = Utc::now();
@@ -442,7 +521,7 @@ mod tests {
             "BTC",
             ts,
             Some(dec(138_000_000, 0)),
-            Some(Decimal::ZERO),
+            0.0,
             Some(dec(100_000, 0)),
         );
         assert!(result.is_err());
@@ -454,15 +533,15 @@ mod tests {
         let mut calc = SpreadCalculator::new(&coins, 10);
         let ts = Utc::now();
 
-        // bybit < upbit_usdt -> 음의 스프레드
-        // upbit_usdt = 138_000_000 / 1380 = 100_000
+        // bybit < upbit_usd -> 음의 스프레드
+        // upbit_usd = 138_000_000 / 1380.0 = 100_000
         // bybit = 99_900
         // spread = (99_900 - 100_000) / 100_000 * 100 = -0.1%
         calc.update(
             "BTC",
             ts,
             Some(dec(138_000_000, 0)),
-            Some(dec(1380, 0)),
+            1380.0,
             Some(dec(99_900, 0)),
         )
         .unwrap();
@@ -481,7 +560,7 @@ mod tests {
             "BTC",
             ts,
             Some(dec(138_000_000, 0)),
-            Some(dec(1380, 0)),
+            1380.0,
             Some(dec(100_050, 0)),
         )
         .unwrap();
@@ -490,14 +569,14 @@ mod tests {
             "ETH",
             ts,
             Some(dec(4_140_000, 0)),
-            Some(dec(1380, 0)),
+            1380.0,
             Some(dec(3_010, 0)),
         )
         .unwrap();
 
-        // BTC: upbit_usdt = 100_000, bybit = 100_050, spread = 0.05%
+        // BTC: upbit_usd = 100_000, bybit = 100_050, spread = 0.05%
         assert!(calc.last_spread_pct("BTC").is_some());
-        // ETH: upbit_usdt = 3_000, bybit = 3_010, spread = (3010-3000)/3000*100 = 0.333...%
+        // ETH: upbit_usd = 3_000, bybit = 3_010, spread = (3010-3000)/3000*100 = 0.333...%
         let eth_spread = calc.last_spread_pct("ETH").unwrap();
         assert!((eth_spread - 10.0 / 3000.0 * 100.0).abs() < 1e-6);
     }
@@ -521,7 +600,7 @@ mod tests {
             "ETH",
             ts,
             Some(dec(4_140_000, 0)),
-            Some(dec(1380, 0)),
+            1380.0,
             Some(dec(3_010, 0)),
         );
         assert!(result.is_ok());
@@ -539,14 +618,14 @@ mod tests {
             "BTC",
             ts,
             Some(dec(138_000_000, 0)),
-            Some(dec(1380, 0)),
+            1380.0,
             Some(dec(100_050, 0)),
         )
         .unwrap();
 
         let spread_before = calc.last_spread_pct("BTC").unwrap();
 
-        // 이미 존재하는 코인 재추가 → 데이터가 보존되어야 함
+        // 이미 존재하는 코인 재추가 -> 데이터가 보존되어야 함
         calc.add_coin("BTC");
 
         let spread_after = calc.last_spread_pct("BTC").unwrap();
@@ -572,7 +651,7 @@ mod tests {
             "ETH",
             ts,
             Some(dec(4_140_000, 0)),
-            Some(dec(1380, 0)),
+            1380.0,
             Some(dec(3_010, 0)),
         );
         assert!(result.is_err());
@@ -586,7 +665,7 @@ mod tests {
         let coins = vec!["BTC".to_string()];
         let mut calc = SpreadCalculator::new(&coins, 10);
 
-        // 존재하지 않는 코인 제거 → 패닉 없이 무시
+        // 존재하지 않는 코인 제거 -> 패닉 없이 무시
         calc.remove_coin("XRP");
 
         // BTC 영향 없음
@@ -620,5 +699,149 @@ mod tests {
         let mut active = calc.active_coins();
         active.sort();
         assert_eq!(active, vec!["BTC", "XRP"]);
+    }
+
+    // --- IncrementalStats 테스트 ---
+
+    #[test]
+    fn test_incremental_stats_basic() {
+        // 여러 값 push 후 mean/stddev가 statistics 모듈 결과와 일치하는지 확인
+        let mut stats = IncrementalStats::new();
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let mut deque: VecDeque<f64> = VecDeque::new();
+
+        for v in &values {
+            stats.push(*v, None);
+            deque.push_back(*v);
+        }
+
+        let expected_mean = statistics::mean(&deque);
+        let expected_stddev = statistics::stddev(&deque, expected_mean);
+
+        assert!(
+            (stats.mean() - expected_mean).abs() < 1e-10,
+            "mean 불일치: got {}, expected {}",
+            stats.mean(),
+            expected_mean
+        );
+        assert!(
+            (stats.stddev() - expected_stddev).abs() < 1e-10,
+            "stddev 불일치: got {}, expected {}",
+            stats.stddev(),
+            expected_stddev
+        );
+    }
+
+    #[test]
+    fn test_incremental_stats_with_pop() {
+        // 윈도우 크기 3, 5개 값 push -> pop이 발생해도 정확한 통계 유지
+        let window_size = 3;
+        let mut stats = IncrementalStats::new();
+        let mut deque: VecDeque<f64> = VecDeque::new();
+
+        let values = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+
+        for v in &values {
+            let popped = if deque.len() >= window_size {
+                Some(deque.pop_front().unwrap())
+            } else {
+                None
+            };
+            stats.push(*v, popped);
+            deque.push_back(*v);
+        }
+
+        // 최종 윈도우: [30, 40, 50]
+        assert_eq!(deque.len(), window_size);
+        let expected_mean = statistics::mean(&deque);
+        let expected_stddev = statistics::stddev(&deque, expected_mean);
+
+        assert!(
+            (stats.mean() - expected_mean).abs() < 1e-10,
+            "mean 불일치 (pop 후): got {}, expected {}",
+            stats.mean(),
+            expected_mean
+        );
+        assert!(
+            (stats.stddev() - expected_stddev).abs() < 1e-10,
+            "stddev 불일치 (pop 후): got {}, expected {}",
+            stats.stddev(),
+            expected_stddev
+        );
+    }
+
+    #[test]
+    fn test_cached_stats() {
+        // cached_stats() 반환값이 수동 계산과 일치하는지 확인
+        let coins = vec!["BTC".to_string()];
+        let window_size = 5;
+        let mut calc = SpreadCalculator::new(&coins, window_size);
+
+        // 윈도우가 가득 차기 전에는 None
+        let ts = Utc::now();
+        for i in 0..4 {
+            calc.update(
+                "BTC",
+                ts + chrono::Duration::minutes(i),
+                Some(dec(138_000_000 + i as i64 * 100_000, 0)),
+                1380.0,
+                Some(dec(100_000 + i * 10, 0)),
+            )
+            .unwrap();
+        }
+        assert!(calc.cached_stats("BTC").is_none(), "윈도우 미충족 시 None");
+
+        // 5번째 push로 윈도우 충족
+        calc.update(
+            "BTC",
+            ts + chrono::Duration::minutes(4),
+            Some(dec(138_500_000, 0)),
+            1380.0,
+            Some(dec(100_040, 0)),
+        )
+        .unwrap();
+
+        let (cached_mean, cached_stddev) = calc.cached_stats("BTC").expect("윈도우 충족 후 Some");
+
+        // 수동 계산과 비교
+        let data = calc.spread_window("BTC").unwrap().data();
+        let manual_mean = statistics::mean(data);
+        let manual_stddev = statistics::stddev(data, manual_mean);
+
+        assert!(
+            (cached_mean - manual_mean).abs() < 1e-10,
+            "cached mean 불일치: got {}, expected {}",
+            cached_mean,
+            manual_mean
+        );
+        assert!(
+            (cached_stddev - manual_stddev).abs() < 1e-10,
+            "cached stddev 불일치: got {}, expected {}",
+            cached_stddev,
+            manual_stddev
+        );
+    }
+
+    #[test]
+    fn test_cached_stats_unknown_coin() {
+        let coins = vec!["BTC".to_string()];
+        let calc = SpreadCalculator::new(&coins, 5);
+        assert!(calc.cached_stats("UNKNOWN").is_none());
+    }
+
+    #[test]
+    fn test_incremental_stats_empty() {
+        let stats = IncrementalStats::new();
+        assert_eq!(stats.mean(), 0.0);
+        assert_eq!(stats.stddev(), 0.0);
+        assert_eq!(stats.count, 0);
+    }
+
+    #[test]
+    fn test_incremental_stats_single_value() {
+        let mut stats = IncrementalStats::new();
+        stats.push(42.0, None);
+        assert!((stats.mean() - 42.0).abs() < 1e-10);
+        assert!((stats.stddev() - 0.0).abs() < 1e-10);
     }
 }
