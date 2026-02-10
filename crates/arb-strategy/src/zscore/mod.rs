@@ -2,6 +2,7 @@
 
 pub mod coin_selector;
 pub mod config;
+pub mod instrument;
 pub mod monitor;
 pub mod orderbook;
 pub mod pnl;

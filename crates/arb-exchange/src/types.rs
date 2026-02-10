@@ -413,6 +413,24 @@ impl Balance {
     }
 }
 
+/// 거래 규격 API 응답 (거래소 중립).
+///
+/// API 응답을 파싱할 때 Decimal로 즉시 변환합니다.
+/// 사용 시점마다 재파싱이 불필요하며, 파싱 실패를 초기에 잡을 수 있습니다.
+#[derive(Debug, Clone)]
+pub struct InstrumentInfoResponse {
+    /// 가격 최소 단위.
+    pub tick_size: Decimal,
+    /// 수량 최소 단위.
+    pub qty_step: Decimal,
+    /// 최소 주문 수량.
+    pub min_order_qty: Decimal,
+    /// 최대 주문 수량.
+    pub max_order_qty: Decimal,
+    /// 최소 주문 금액 (USDT).
+    pub min_notional: Decimal,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,5 +511,53 @@ mod tests {
         assert_eq!(CandleInterval::Minute1.as_minutes(), 1);
         assert_eq!(CandleInterval::Minute60.as_minutes(), 60);
         assert_eq!(CandleInterval::Day.as_minutes(), 1440);
+    }
+
+    #[test]
+    fn test_instrument_info_response_create() {
+        let info = InstrumentInfoResponse {
+            tick_size: Decimal::new(1, 2),     // 0.01
+            qty_step: Decimal::new(1, 3),      // 0.001
+            min_order_qty: Decimal::new(1, 3), // 0.001
+            max_order_qty: Decimal::from(100),
+            min_notional: Decimal::from(5),
+        };
+        assert_eq!(info.tick_size, Decimal::new(1, 2));
+        assert_eq!(info.qty_step, Decimal::new(1, 3));
+        assert_eq!(info.min_order_qty, Decimal::new(1, 3));
+        assert_eq!(info.max_order_qty, Decimal::from(100));
+        assert_eq!(info.min_notional, Decimal::from(5));
+    }
+
+    #[test]
+    fn test_instrument_info_response_clone() {
+        let info = InstrumentInfoResponse {
+            tick_size: Decimal::new(5, 1), // 0.5
+            qty_step: Decimal::new(1, 0),  // 1
+            min_order_qty: Decimal::from(10),
+            max_order_qty: Decimal::from(10000),
+            min_notional: Decimal::from(1),
+        };
+        let cloned = info.clone();
+        assert_eq!(cloned.tick_size, info.tick_size);
+        assert_eq!(cloned.qty_step, info.qty_step);
+        assert_eq!(cloned.min_order_qty, info.min_order_qty);
+        assert_eq!(cloned.max_order_qty, info.max_order_qty);
+        assert_eq!(cloned.min_notional, info.min_notional);
+    }
+
+    #[test]
+    fn test_instrument_info_response_debug() {
+        let info = InstrumentInfoResponse {
+            tick_size: Decimal::new(1, 2),
+            qty_step: Decimal::new(1, 3),
+            min_order_qty: Decimal::new(1, 3),
+            max_order_qty: Decimal::from(100),
+            min_notional: Decimal::from(5),
+        };
+        let debug_str = format!("{:?}", info);
+        assert!(debug_str.contains("InstrumentInfoResponse"));
+        assert!(debug_str.contains("tick_size"));
+        assert!(debug_str.contains("qty_step"));
     }
 }

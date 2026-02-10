@@ -5,15 +5,16 @@
 use crate::bybit::auth::{AuthHeaders, BybitCredentials, build_query_string};
 use crate::bybit::stream::BybitStreamInner;
 use crate::bybit::types::{
-    BybitCancelOrderRequest, BybitCancelOrderResult, BybitCreateOrderResult, BybitKlineList,
-    BybitOrder, BybitOrderList, BybitOrderRequest, BybitOrderbookResult, BybitResponse,
-    BybitTickerList, BybitWalletBalanceResult,
+    BybitCancelOrderRequest, BybitCancelOrderResult, BybitCreateOrderResult,
+    BybitInstrumentInfoList, BybitKlineList, BybitOrder, BybitOrderList, BybitOrderRequest,
+    BybitOrderbookResult, BybitResponse, BybitTickerList, BybitWalletBalanceResult,
 };
 use crate::rate_limit::RateLimiter;
 use arb_exchange::{
-    Balance, Candle, CandleInterval, ExchangeError, ExchangeResult, MarketData, Order, OrderBook,
-    OrderBookLevel, OrderManagement, OrderRequest, OrderSide, OrderStatus, OrderType, PriceChange,
-    StreamConfig, Ticker, TimeInForce,
+    Balance, Candle, CandleInterval, ExchangeError, ExchangeResult, InstrumentDataProvider,
+    InstrumentInfoResponse, MarketData, Order, OrderBook, OrderBookLevel, OrderManagement,
+    OrderRequest, OrderSide, OrderStatus, OrderType, PriceChange, StreamConfig, Ticker,
+    TimeInForce,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use reqwest::Client;
@@ -596,6 +597,59 @@ impl OrderManagement for BybitClient {
             .ok_or_else(|| {
                 ExchangeError::InvalidParameter(format!("Currency not found: {}", currency))
             })
+    }
+}
+
+impl InstrumentDataProvider for BybitClient {
+    async fn get_instrument_info(&self, symbol: &str) -> ExchangeResult<InstrumentInfoResponse> {
+        // category="linear" 하드코딩 (선물 계약의 instrument info).
+        // self.category는 "spot"이므로 사용하지 않음.
+        let result: BybitInstrumentInfoList = self
+            .get_public(
+                "/v5/market/instruments-info",
+                &[("category", "linear"), ("symbol", symbol)],
+            )
+            .await?;
+
+        let item = result.list.into_iter().next().ok_or_else(|| {
+            ExchangeError::ApiError(format!("No instrument info found for symbol: {}", symbol))
+        })?;
+
+        // 문자열 -> Decimal 변환
+        let tick_size = item
+            .price_filter
+            .tick_size
+            .parse::<Decimal>()
+            .map_err(|e| ExchangeError::ParseError(format!("tick_size parse: {}", e)))?;
+        let qty_step = item
+            .lot_size_filter
+            .qty_step
+            .parse::<Decimal>()
+            .map_err(|e| ExchangeError::ParseError(format!("qty_step parse: {}", e)))?;
+        let min_order_qty = item
+            .lot_size_filter
+            .min_order_qty
+            .parse::<Decimal>()
+            .map_err(|e| ExchangeError::ParseError(format!("min_order_qty parse: {}", e)))?;
+        let max_order_qty = item
+            .lot_size_filter
+            .max_order_qty
+            .parse::<Decimal>()
+            .map_err(|e| ExchangeError::ParseError(format!("max_order_qty parse: {}", e)))?;
+        let min_notional = item
+            .lot_size_filter
+            .min_notional_value
+            .unwrap_or_else(|| "5".to_string())
+            .parse::<Decimal>()
+            .map_err(|e| ExchangeError::ParseError(format!("min_notional parse: {}", e)))?;
+
+        Ok(InstrumentInfoResponse {
+            tick_size,
+            qty_step,
+            min_order_qty,
+            max_order_qty,
+            min_notional,
+        })
     }
 }
 

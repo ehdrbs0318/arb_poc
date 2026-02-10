@@ -152,7 +152,7 @@ impl SessionWriter {
         if !self.trades_header_written {
             writeln!(
                 self.trades_writer,
-                "id,coin,entry_time,exit_time,holding_minutes,size_usdt,\
+                "id,coin,entry_time,exit_time,holding_minutes,size_usdt,qty,\
                  upbit_entry_price,bybit_entry_price,upbit_exit_price,bybit_exit_price,\
                  entry_spread_pct,exit_spread_pct,entry_z_score,exit_z_score,\
                  entry_usd_krw,exit_usd_krw,upbit_pnl,bybit_pnl,\
@@ -163,13 +163,14 @@ impl SessionWriter {
 
         writeln!(
             self.trades_writer,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             trade.id,
             trade.coin,
             trade.entry_time.to_rfc3339(),
             trade.exit_time.to_rfc3339(),
             trade.holding_minutes,
             trade.size_usdt,
+            trade.qty,
             trade.upbit_entry_price,
             trade.bybit_entry_price,
             trade.upbit_exit_price,
@@ -318,6 +319,7 @@ mod tests {
             entry_time: now,
             exit_time: now,
             holding_minutes: 30,
+            qty: Decimal::new(10, 3), // 0.010
             size_usdt: Decimal::new(1000, 0),
             upbit_entry_price: Decimal::new(95_000, 0),
             bybit_entry_price: Decimal::new(95_100, 0),

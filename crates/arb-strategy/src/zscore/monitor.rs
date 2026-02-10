@@ -20,7 +20,7 @@ use rust_decimal::prelude::ToPrimitive as _;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
-use arb_exchange::{MarketData, MarketEvent, MarketStream};
+use arb_exchange::{InstrumentDataProvider, MarketData, MarketEvent, MarketStream};
 use arb_forex::ForexCache;
 
 use crate::common::candle_fetcher::fetch_all_candles;
@@ -31,6 +31,7 @@ use crate::output::summary::SessionSummary;
 use crate::output::writer::{MinuteRecord, SessionWriter};
 use crate::zscore::coin_selector::{CoinCandidate, CoinSelector};
 use crate::zscore::config::ZScoreConfig;
+use crate::zscore::instrument::{self, InstrumentCache, fetch_instruments};
 use crate::zscore::orderbook;
 use crate::zscore::pnl::ClosedPosition;
 use crate::zscore::position::{self, PositionManager, VirtualPosition};
@@ -212,7 +213,7 @@ struct ReselectionResult {
 pub struct ZScoreMonitor<U, B>
 where
     U: MarketData + MarketStream + Send + Sync + 'static,
-    B: MarketData + MarketStream + Send + Sync + 'static,
+    B: MarketData + MarketStream + InstrumentDataProvider + Send + Sync + 'static,
 {
     upbit: Arc<U>,
     bybit: Arc<B>,
@@ -223,7 +224,7 @@ where
 impl<U, B> ZScoreMonitor<U, B>
 where
     U: MarketData + MarketStream + Send + Sync + 'static,
-    B: MarketData + MarketStream + Send + Sync + 'static,
+    B: MarketData + MarketStream + InstrumentDataProvider + Send + Sync + 'static,
 {
     /// 새 ZScoreMonitor를 생성합니다.
     ///
@@ -311,6 +312,10 @@ where
 
         // 시작 시점 환율 기록
         let usd_krw_start = self.forex_cache.get_cached_rate().unwrap_or(0.0);
+
+        // InstrumentCache 초기화 (Bybit instrument info 로드)
+        let instrument_cache = Arc::new(std::sync::RwLock::new(InstrumentCache::default()));
+        fetch_instruments(self.bybit.as_ref(), &instrument_cache, &current_coins).await;
 
         info!("실시간 모니터링 시작: 워밍업 데이터 로드 중...");
 
@@ -448,6 +453,7 @@ where
                         &mut minute_records,
                         &position_mgr,
                         &trades,
+                        &instrument_cache,
                     ).await;
                     // check_tick_signal을 tokio::spawn으로 분리
                     Self::maybe_spawn_tick_signal(
@@ -464,6 +470,7 @@ where
                         &session_writer,
                         &self.upbit,
                         &self.bybit,
+                        &instrument_cache,
                     ).await;
                 }
                 Some(event) = bybit_rx.recv() => {
@@ -480,6 +487,7 @@ where
                         &mut minute_records,
                         &position_mgr,
                         &trades,
+                        &instrument_cache,
                     ).await;
                     // check_tick_signal을 tokio::spawn으로 분리
                     Self::maybe_spawn_tick_signal(
@@ -496,6 +504,7 @@ where
                         &session_writer,
                         &self.upbit,
                         &self.bybit,
+                        &instrument_cache,
                     ).await;
                 }
                 _ = minute_timer.tick() => {
@@ -512,6 +521,7 @@ where
                             &self.forex_cache,
                             &session_writer,
                             &mut minute_records,
+                            &instrument_cache,
                         ).await
                     {
                         warn!(error = %e, "finalize_and_process 실패");
@@ -527,6 +537,7 @@ where
                         &dropped_at,
                         &self.forex_cache,
                         &session_writer,
+                        &instrument_cache,
                     ).await {
                         warn!(error = %e, "check_ttl_positions 실패");
                     }
@@ -549,12 +560,23 @@ where
                     );
                 }
                 Some(result) = reselect_rx.recv() => {
-                    current_coins = result.new_coins;
+                    current_coins = result.new_coins.clone();
                     for (coin, ts) in result.dropped_at_updates {
                         dropped_at.entry(coin).or_insert(ts);
                     }
                     for coin in &result.removed_coins {
                         dropped_at.remove(coin);
+                    }
+                    // 새 코인에 대한 InstrumentInfo 로드
+                    let new_coins_to_fetch: Vec<String> = {
+                        let cache = instrument_cache.read().unwrap_or_else(|e| e.into_inner());
+                        result.new_coins.iter()
+                            .filter(|c| cache.get(c).is_none())
+                            .cloned()
+                            .collect()
+                    };
+                    if !new_coins_to_fetch.is_empty() {
+                        fetch_instruments(self.bybit.as_ref(), &instrument_cache, &new_coins_to_fetch).await;
                     }
                     reselecting = false;
                     info!(coins = ?current_coins, "코인 목록 업데이트 완료");
@@ -934,6 +956,7 @@ where
         minute_records: &mut Vec<MinuteRecord>,
         position_mgr: &Arc<tokio::sync::Mutex<PositionManager>>,
         trades: &Arc<tokio::sync::Mutex<Vec<ClosedPosition>>>,
+        instrument_cache: &Arc<std::sync::RwLock<InstrumentCache>>,
     ) {
         let event_ts = match event {
             MarketEvent::Trade { timestamp, .. } => *timestamp,
@@ -959,6 +982,7 @@ where
                     forex_cache,
                     session_writer,
                     minute_records,
+                    instrument_cache,
                 )
                 .await
                 {
@@ -998,6 +1022,7 @@ where
         session_writer: &Arc<tokio::sync::Mutex<Option<SessionWriter>>>,
         upbit_client: &Arc<U>,
         bybit_client: &Arc<B>,
+        instrument_cache: &Arc<std::sync::RwLock<InstrumentCache>>,
     ) {
         // 1. 이벤트에서 코인 및 소스 거래소 추출
         let (coin, source_exchange) = match event {
@@ -1090,6 +1115,7 @@ where
         let session_writer = Arc::clone(session_writer);
         let upbit_client = Arc::clone(upbit_client);
         let bybit_client = Arc::clone(bybit_client);
+        let instrument_cache = Arc::clone(instrument_cache);
 
         tokio::spawn(async move {
             let result = Self::spawned_check_tick_signal(
@@ -1109,6 +1135,7 @@ where
                 session_writer,
                 upbit_client,
                 bybit_client,
+                instrument_cache,
             )
             .await;
 
@@ -1153,6 +1180,7 @@ where
         session_writer: Arc<tokio::sync::Mutex<Option<SessionWriter>>>,
         upbit_client: Arc<U>,
         bybit_client: Arc<B>,
+        instrument_cache: Arc<std::sync::RwLock<InstrumentCache>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let other_exchange = match source_exchange {
             orderbook::Exchange::Upbit => orderbook::Exchange::Bybit,
@@ -1202,6 +1230,12 @@ where
         let upbit_usd = upbit_f64 / usd_krw;
         let upbit_usd_dec = Decimal::try_from(upbit_usd).unwrap_or(Decimal::ZERO);
 
+        // 청산/진입 공통: InstrumentInfo 조회
+        let inst_info = {
+            let cache = instrument_cache.read().unwrap_or_else(|e| e.into_inner());
+            cache.get(&coin).cloned()
+        };
+
         // 4. 청산 시그널 평가 (exit-first)
         {
             let pm = position_mgr.lock().await;
@@ -1220,10 +1254,32 @@ where
                 has_positions,
                 &config,
             )? {
+                // 청산 가격 라운딩
+                let (exit_upbit_usd, exit_bybit) = if let Some(ref inst) = inst_info {
+                    // Upbit 매도: floor (더 싸게 팔음 = 불리한 방향)
+                    let exit_upbit_krw = instrument::floor_to_step(
+                        upbit_price,
+                        instrument::upbit_tick_size(upbit_price),
+                    );
+                    let exit_upbit_usd_val =
+                        Decimal::try_from(exit_upbit_krw.to_f64().unwrap_or(0.0) / usd_krw)
+                            .unwrap_or(upbit_usd_dec);
+
+                    // Bybit close (매수): ceil (더 비싸게 삼 = 불리한 방향)
+                    let exit_bybit_val =
+                        instrument::round_price_conservative(bybit_price, inst.tick_size, true);
+                    (exit_upbit_usd_val, exit_bybit_val)
+                } else {
+                    counters.lock().unwrap().fallback_no_rounding_count += 1;
+                    (upbit_usd_dec, bybit_price)
+                };
+
                 info!(
                     coin = c.as_str(),
                     z_score = z_score,
                     spread_pct = sp,
+                    exit_upbit_usd = %exit_upbit_usd,
+                    exit_bybit = %exit_bybit,
                     "[틱] 청산 시그널"
                 );
 
@@ -1256,8 +1312,8 @@ where
                                 ps.iter()
                                     .map(|p| {
                                         let profit_rate = (sp - p.entry_spread_pct)
-                                            / p.size_usdt.to_f64().unwrap_or(1.0);
-                                        (p.id, p.size_usdt, profit_rate)
+                                            / p.size_usdt().to_f64().unwrap_or(1.0);
+                                        (p.id, p.size_usdt(), profit_rate)
                                     })
                                     .collect()
                             })
@@ -1285,8 +1341,8 @@ where
                                     &c,
                                     *pid,
                                     Utc::now(),
-                                    upbit_usd_dec,
-                                    bybit_price,
+                                    exit_upbit_usd,
+                                    exit_bybit,
                                     usd_krw,
                                     sp,
                                     z_score,
@@ -1298,16 +1354,19 @@ where
                                     Err(e) => warn!(error = %e, "청산 실패"),
                                 }
                             } else {
-                                // 부분 청산
-                                let partial = Decimal::try_from(remaining_safe_usdt)
-                                    .unwrap_or(Decimal::ZERO);
+                                // 부분 청산: USDT → qty 변환
+                                let partial_qty = Decimal::try_from(
+                                    remaining_safe_usdt / bybit_price.to_f64().unwrap_or(1.0),
+                                )
+                                .unwrap_or(Decimal::ZERO);
                                 remaining_safe_usdt = 0.0;
                                 match pm.close_partial(
                                     &c,
                                     *pid,
-                                    partial,
-                                    upbit_usd_dec,
-                                    bybit_price,
+                                    partial_qty,
+                                    inst_info.as_ref(),
+                                    exit_upbit_usd,
+                                    exit_bybit,
                                     usd_krw,
                                     sp,
                                     z_score,
@@ -1369,6 +1428,16 @@ where
                 last_entry,
                 &config,
             )? {
+                // InstrumentInfo 필수 체크
+                let Some(ref inst) = inst_info else {
+                    debug!(coin = c.as_str(), "진입 거부: InstrumentInfo 없음");
+                    counters
+                        .lock()
+                        .unwrap()
+                        .entry_rejected_order_constraint_count += 1;
+                    return Ok(());
+                };
+
                 // 오더북 기반 진입 안전 볼륨 계산
                 let data = ob_cache.data.read().await;
                 let upbit_cached = data.get(orderbook::Exchange::Upbit, &c);
@@ -1398,67 +1467,169 @@ where
                                 .to_f64()
                                 .unwrap_or(0.0);
                             // pm 락 → 자본 확인 + 포지션 오픈 → 즉시 해제
-                            let entry_rejected = {
+                            let entry_rejection_counter = {
                                 let mut pm = position_mgr.lock().await;
                                 let used = pm.coin_used_capital(&c).to_f64().unwrap_or(0.0);
                                 let remaining_cap = max_coin_cap - used;
 
                                 let size_usdt_f64 =
                                     (sv.safe_volume_usdt * ratio).min(remaining_cap);
+                                let size_usdt =
+                                    Decimal::try_from(size_usdt_f64).unwrap_or(Decimal::ZERO);
 
-                                if size_usdt_f64 <= 5.0 {
+                                // 1. USDT notional → qty 변환 + qty_step 라운딩
+                                let raw_qty = if bybit_price > Decimal::ZERO {
+                                    size_usdt / bybit_price
+                                } else {
+                                    Decimal::ZERO
+                                };
+                                let qty = instrument::round_qty_floor(raw_qty, inst.qty_step);
+
+                                // 2. qty == 0 → 진입 거부
+                                if qty.is_zero() {
                                     debug!(
                                         coin = c.as_str(),
-                                        size_usdt = size_usdt_f64,
-                                        "진입 거부: 안전 볼륨 최소 주문 크기 미달"
+                                        raw_qty = %raw_qty,
+                                        qty_step = %inst.qty_step,
+                                        "진입 거부: 라운딩 후 qty = 0"
                                     );
-                                    true
+                                    Some("order_constraint")
                                 } else {
-                                    let size_usdt = Decimal::try_from(size_usdt_f64)
-                                        .unwrap_or(Decimal::ZERO);
-
-                                    let liq_price = position::calculate_liquidation_price(
-                                        bybit_price,
-                                        config.leverage,
-                                        config.bybit_mmr,
-                                        config.bybit_taker_fee,
-                                    );
-
-                                    let pos = VirtualPosition {
-                                        id: 0,
-                                        coin: c.clone(),
-                                        entry_time: Utc::now(),
-                                        upbit_entry_price: upbit_usd_dec,
-                                        bybit_entry_price: bybit_price,
-                                        bybit_liquidation_price: liq_price,
-                                        entry_usd_krw: usd_krw,
-                                        entry_spread_pct: sp,
-                                        entry_z_score: z_score,
-                                        size_usdt,
-                                    };
-
-                                    info!(
-                                        coin = c.as_str(),
-                                        z_score = z_score,
-                                        spread_pct = sp,
-                                        expected_profit = expected_profit_pct,
-                                        size_usdt = %size_usdt,
-                                        "[틱] 진입 시그널 (오더북 기반 사이징)"
-                                    );
-
-                                    if let Err(e) = pm.open_position(pos) {
-                                        warn!(
+                                    // 3. 최소/최대 주문 검증
+                                    let actual_size_usdt = qty * bybit_price;
+                                    if qty < inst.min_order_qty
+                                        || qty > inst.max_order_qty
+                                        || actual_size_usdt < inst.min_notional
+                                    {
+                                        debug!(
                                             coin = c.as_str(),
-                                            error = %e,
-                                            "포지션 오픈 실패"
+                                            qty = %qty,
+                                            min_order_qty = %inst.min_order_qty,
+                                            max_order_qty = %inst.max_order_qty,
+                                            actual_size_usdt = %actual_size_usdt,
+                                            min_notional = %inst.min_notional,
+                                            "진입 거부: Bybit 주문 조건 미달"
                                         );
+                                        Some("order_constraint")
+                                    } else {
+                                        // 4. Upbit KRW 최소 주문 검증 (5100원)
+                                        let upbit_krw_notional = qty * upbit_price;
+                                        if upbit_krw_notional < Decimal::new(5100, 0) {
+                                            debug!(
+                                                coin = c.as_str(),
+                                                upbit_krw_notional = %upbit_krw_notional,
+                                                "진입 거부: Upbit KRW 최소 주문 미달"
+                                            );
+                                            Some("order_constraint")
+                                        } else {
+                                            // 5. 가격 라운딩
+                                            // Upbit 매수: ceil (더 비싸게 삼 = 불리한 방향)
+                                            let upbit_entry_krw = instrument::ceil_to_step(
+                                                upbit_price,
+                                                instrument::upbit_tick_size(upbit_price),
+                                            );
+                                            let upbit_entry_usd = Decimal::try_from(
+                                                upbit_entry_krw.to_f64().unwrap_or(0.0) / usd_krw,
+                                            )
+                                            .unwrap_or(Decimal::ZERO);
+                                            // Bybit short (매도): floor
+                                            let bybit_entry = instrument::round_price_conservative(
+                                                bybit_price,
+                                                inst.tick_size,
+                                                false,
+                                            );
+
+                                            // 6. Post-rounding PnL gate
+                                            let original_spread = sp;
+                                            let adjusted_spread = if upbit_entry_usd > Decimal::ZERO
+                                            {
+                                                let bybit_f = bybit_entry.to_f64().unwrap_or(0.0);
+                                                let upbit_f =
+                                                    upbit_entry_usd.to_f64().unwrap_or(0.0);
+                                                (bybit_f - upbit_f) / upbit_f * 100.0
+                                            } else {
+                                                0.0
+                                            };
+                                            let rounding_cost = original_spread - adjusted_spread;
+                                            let adjusted_profit =
+                                                expected_profit_pct - rounding_cost;
+                                            if adjusted_profit <= 0.0 {
+                                                debug!(
+                                                    coin = c.as_str(),
+                                                    original_profit = expected_profit_pct,
+                                                    adjusted_profit = adjusted_profit,
+                                                    rounding_cost = rounding_cost,
+                                                    "진입 거부: 라운딩 후 수익성 부족"
+                                                );
+                                                Some("rounding_pnl")
+                                            } else {
+                                                // 7. VirtualPosition 생성 (라운딩된 가격 사용)
+                                                let liq_price =
+                                                    position::calculate_liquidation_price(
+                                                        bybit_entry,
+                                                        config.leverage,
+                                                        config.bybit_mmr,
+                                                        config.bybit_taker_fee,
+                                                    );
+
+                                                let pos = VirtualPosition {
+                                                    id: 0,
+                                                    coin: c.clone(),
+                                                    entry_time: Utc::now(),
+                                                    upbit_entry_price: upbit_entry_usd,
+                                                    bybit_entry_price: bybit_entry,
+                                                    bybit_liquidation_price: liq_price,
+                                                    entry_usd_krw: usd_krw,
+                                                    entry_spread_pct: sp,
+                                                    entry_z_score: z_score,
+                                                    qty,
+                                                };
+
+                                                info!(
+                                                    coin = c.as_str(),
+                                                    z_score = z_score,
+                                                    spread_pct = sp,
+                                                    expected_profit = expected_profit_pct,
+                                                    adjusted_profit = adjusted_profit,
+                                                    qty = %qty,
+                                                    upbit_entry_krw = %upbit_entry_krw,
+                                                    upbit_entry_usd = %upbit_entry_usd,
+                                                    bybit_entry = %bybit_entry,
+                                                    "[틱] 진입 시그널 (라운딩 적용)"
+                                                );
+
+                                                if let Err(e) = pm.open_position(pos) {
+                                                    warn!(
+                                                        coin = c.as_str(),
+                                                        error = %e,
+                                                        "포지션 오픈 실패"
+                                                    );
+                                                }
+                                                None // 진입 성공
+                                            }
+                                        }
                                     }
-                                    false
                                 }
                             };
                             // pm 락 해제 후 counters 접근
-                            if entry_rejected {
-                                counters.lock().unwrap().entry_rejected_slippage_count += 1;
+                            if let Some(reason) = entry_rejection_counter {
+                                match reason {
+                                    "order_constraint" => {
+                                        counters
+                                            .lock()
+                                            .unwrap()
+                                            .entry_rejected_order_constraint_count += 1;
+                                    }
+                                    "rounding_pnl" => {
+                                        counters
+                                            .lock()
+                                            .unwrap()
+                                            .entry_rejected_rounding_pnl_count += 1;
+                                    }
+                                    _ => {
+                                        counters.lock().unwrap().entry_rejected_slippage_count += 1;
+                                    }
+                                }
                             }
                         }
                         None => {
@@ -1492,6 +1663,7 @@ where
         dropped_at: &HashMap<String, DateTime<Utc>>,
         forex_cache: &ForexCache,
         session_writer: &tokio::sync::Mutex<Option<SessionWriter>>,
+        instrument_cache: &Arc<std::sync::RwLock<InstrumentCache>>,
     ) -> Result<(), StrategyError> {
         let ttl = chrono::Duration::hours(config.position_ttl_hours as i64);
         let grace = chrono::Duration::hours(config.grace_period_hours as i64);
@@ -1519,7 +1691,7 @@ where
                 let pm = position_mgr.lock().await;
                 pm.open_positions
                     .get(coin.as_str())
-                    .map(|ps| ps.iter().map(|p| (p.id, p.size_usdt)).collect())
+                    .map(|ps| ps.iter().map(|p| (p.id, p.size_usdt())).collect())
                     .unwrap_or_default()
             };
 
@@ -1543,6 +1715,23 @@ where
                 (upbit_usdt, bybit_price_dec, spread_pct_val)
             };
 
+            // TTL 청산 가격 라운딩 (InstrumentInfo가 있으면 Bybit 가격만 라운딩)
+            // TTL 경로에서는 Upbit 가격이 이미 USD 환산 상태이므로
+            // KRW 라운딩 불가 → Upbit은 원본 사용, Bybit만 라운딩
+            let inst_info = {
+                let cache = instrument_cache.read().unwrap_or_else(|e| e.into_inner());
+                cache.get(coin).cloned()
+            };
+            let (exit_upbit_usd, exit_bybit) = if let Some(ref inst) = inst_info {
+                // Bybit close (매수): ceil
+                let exit_bybit_val =
+                    instrument::round_price_conservative(bybit_price_dec, inst.tick_size, true);
+                (upbit_usdt, exit_bybit_val)
+            } else {
+                counters.lock().unwrap().fallback_no_rounding_count += 1;
+                (upbit_usdt, bybit_price_dec)
+            };
+
             if elapsed > ttl + grace {
                 // 2단계: 전량 강제 청산 (슬리피지 무시)
                 warn!(coin = coin.as_str(), "2단계 강제 청산: grace period 초과");
@@ -1554,8 +1743,8 @@ where
                             coin,
                             *pid,
                             now,
-                            upbit_usdt,
-                            bybit_price_dec,
+                            exit_upbit_usd,
+                            exit_bybit,
                             usd_krw,
                             spread_pct_val,
                             f64::NAN,
@@ -1579,8 +1768,7 @@ where
                         warn!(error = %e, "강제 청산 CSV 기록 실패");
                     }
                 }
-                counters.lock().unwrap().forced_liquidation_count +=
-                    closed_positions.len() as u64;
+                counters.lock().unwrap().forced_liquidation_count += closed_positions.len() as u64;
             } else {
                 // 1단계: 전량 청산 시도
                 warn!(coin = coin.as_str(), "1단계 TTL 분할 청산 시도");
@@ -1592,8 +1780,8 @@ where
                             coin,
                             *pid,
                             now,
-                            upbit_usdt,
-                            bybit_price_dec,
+                            exit_upbit_usd,
+                            exit_bybit,
                             usd_krw,
                             spread_pct_val,
                             f64::NAN,
@@ -1639,6 +1827,7 @@ where
         forex_cache: &ForexCache,
         session_writer: &tokio::sync::Mutex<Option<SessionWriter>>,
         minute_records: &mut Vec<MinuteRecord>,
+        instrument_cache: &Arc<std::sync::RwLock<InstrumentCache>>,
     ) -> Result<(), StrategyError> {
         let ts = candle_builder
             .current_minute
@@ -1698,6 +1887,17 @@ where
                     (u, sp)
                 };
 
+                // Liquidation 가격 라운딩 (Bybit만, Upbit은 USD 상태이므로 원본)
+                let liq_inst = {
+                    let cache = instrument_cache.read().unwrap_or_else(|e| e.into_inner());
+                    cache.get(coin).cloned()
+                };
+                let exit_bybit_liq = if let Some(ref inst) = liq_inst {
+                    instrument::round_price_conservative(bybit_price, inst.tick_size, true)
+                } else {
+                    bybit_price
+                };
+
                 let mut pm = position_mgr.lock().await;
                 let liquidated_ids = pm.check_liquidation(coin, bybit_price);
                 if !liquidated_ids.is_empty() {
@@ -1716,7 +1916,7 @@ where
                             pid,
                             ts,
                             upbit_usdt,
-                            bybit_price,
+                            exit_bybit_liq,
                             usd_krw,
                             spread_pct_val,
                             f64::NAN,
@@ -1764,7 +1964,9 @@ where
                 })
             };
 
-            if let Some((mean, stddev_val, last_spread, upbit_close_f64, bybit_close_f64)) = stats_snapshot {
+            if let Some((mean, stddev_val, last_spread, upbit_close_f64, bybit_close_f64)) =
+                stats_snapshot
+            {
                 let z = if stddev_val >= config.min_stddev_threshold {
                     (last_spread - mean) / stddev_val
                 } else {
@@ -2168,7 +2370,7 @@ mod tests {
             entry_usd_krw: 1380.0,
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
-            size_usdt: Decimal::new(1000, 0),
+            qty: Decimal::ONE,
         })
         .unwrap();
 
@@ -2316,6 +2518,7 @@ mod tests {
         orderbook::SharedObCache,
         Arc<std::sync::Mutex<MonitoringCounters>>,
         Arc<tokio::sync::Mutex<Option<SessionWriter>>>,
+        Arc<std::sync::RwLock<InstrumentCache>>,
     ) {
         let config = Arc::new(ZScoreConfig::default());
         let forex_cache = Arc::new(ForexCache::new(Duration::from_secs(600)));
@@ -2324,14 +2527,32 @@ mod tests {
         let ob_cache = orderbook::SharedObCache::new();
         let counters = Arc::new(std::sync::Mutex::new(MonitoringCounters::default()));
         let session_writer = Arc::new(tokio::sync::Mutex::new(None::<SessionWriter>));
-        (config, forex_cache, position_mgr, trades, ob_cache, counters, session_writer)
+        let instrument_cache = Arc::new(std::sync::RwLock::new(InstrumentCache::default()));
+        (
+            config,
+            forex_cache,
+            position_mgr,
+            trades,
+            ob_cache,
+            counters,
+            session_writer,
+            instrument_cache,
+        )
     }
 
     #[tokio::test]
     async fn test_maybe_spawn_no_data() {
         // candle_builder에 데이터 없음 → spawn 안 됨 (즉시 리턴)
-        let (config, forex_cache, position_mgr, trades, ob_cache, counters, session_writer) =
-            make_shared_state();
+        let (
+            config,
+            forex_cache,
+            position_mgr,
+            trades,
+            ob_cache,
+            counters,
+            session_writer,
+            instrument_cache,
+        ) = make_shared_state();
         let spread_calc = Arc::new(tokio::sync::RwLock::new(SpreadCalculator::new(
             &["BTC".to_string()],
             10,
@@ -2363,11 +2584,16 @@ mod tests {
             &session_writer,
             &upbit,
             &bybit,
+            &instrument_cache,
         )
         .await;
 
         // spawn 안 됐으므로 computing flag는 false
-        assert!(!ob_cache.computing.is_computing(orderbook::Exchange::Upbit, "BTC"));
+        assert!(
+            !ob_cache
+                .computing
+                .is_computing(orderbook::Exchange::Upbit, "BTC")
+        );
         // trades에 아무것도 없음
         assert!(trades.lock().await.is_empty());
     }
@@ -2375,8 +2601,16 @@ mod tests {
     #[tokio::test]
     async fn test_maybe_spawn_partial_data() {
         // Upbit 데이터만 있고 Bybit 없음 → spawn 안 됨
-        let (config, forex_cache, position_mgr, trades, ob_cache, counters, session_writer) =
-            make_shared_state();
+        let (
+            config,
+            forex_cache,
+            position_mgr,
+            trades,
+            ob_cache,
+            counters,
+            session_writer,
+            instrument_cache,
+        ) = make_shared_state();
         forex_cache.update_cache_for_test(1450.0);
 
         let spread_calc = Arc::new(tokio::sync::RwLock::new(SpreadCalculator::new(
@@ -2413,18 +2647,31 @@ mod tests {
             &session_writer,
             &upbit,
             &bybit,
+            &instrument_cache,
         )
         .await;
 
         // bybit_last_bid에 BTC 없으므로 즉시 리턴
-        assert!(!ob_cache.computing.is_computing(orderbook::Exchange::Upbit, "BTC"));
+        assert!(
+            !ob_cache
+                .computing
+                .is_computing(orderbook::Exchange::Upbit, "BTC")
+        );
     }
 
     #[tokio::test]
     async fn test_maybe_spawn_window_not_ready() {
         // 양쪽 데이터 있지만 SpreadCalculator 윈도우 미충족 → spawn 안 됨
-        let (config, forex_cache, position_mgr, trades, ob_cache, counters, session_writer) =
-            make_shared_state();
+        let (
+            config,
+            forex_cache,
+            position_mgr,
+            trades,
+            ob_cache,
+            counters,
+            session_writer,
+            instrument_cache,
+        ) = make_shared_state();
         forex_cache.update_cache_for_test(1450.0);
 
         let spread_calc = Arc::new(tokio::sync::RwLock::new(SpreadCalculator::new(
@@ -2463,18 +2710,31 @@ mod tests {
             &session_writer,
             &upbit,
             &bybit,
+            &instrument_cache,
         )
         .await;
 
         // cached_stats가 None이므로 spawn 전에 리턴
-        assert!(!ob_cache.computing.is_computing(orderbook::Exchange::Upbit, "BTC"));
+        assert!(
+            !ob_cache
+                .computing
+                .is_computing(orderbook::Exchange::Upbit, "BTC")
+        );
     }
 
     #[tokio::test]
     async fn test_maybe_spawn_coin_not_in_list() {
         // 이벤트 코인이 current_coins에 없음 → spawn 안 됨
-        let (config, forex_cache, position_mgr, trades, ob_cache, counters, session_writer) =
-            make_shared_state();
+        let (
+            config,
+            forex_cache,
+            position_mgr,
+            trades,
+            ob_cache,
+            counters,
+            session_writer,
+            instrument_cache,
+        ) = make_shared_state();
         let spread_calc = Arc::new(tokio::sync::RwLock::new(SpreadCalculator::new(
             &["BTC".to_string()],
             10,
@@ -2505,17 +2765,30 @@ mod tests {
             &session_writer,
             &upbit,
             &bybit,
+            &instrument_cache,
         )
         .await;
 
-        assert!(!ob_cache.computing.is_computing(orderbook::Exchange::Upbit, "ETH"));
+        assert!(
+            !ob_cache
+                .computing
+                .is_computing(orderbook::Exchange::Upbit, "ETH")
+        );
     }
 
     #[tokio::test]
     async fn test_computing_flag_prevents_duplicate_spawn() {
         // computing flag가 이미 설정된 경우 → dropped_tick_count 증가
-        let (config, forex_cache, position_mgr, trades, ob_cache, counters, session_writer) =
-            make_shared_state();
+        let (
+            config,
+            forex_cache,
+            position_mgr,
+            trades,
+            ob_cache,
+            counters,
+            session_writer,
+            instrument_cache,
+        ) = make_shared_state();
         forex_cache.update_cache_for_test(1450.0);
 
         // SpreadCalculator에 데이터를 충분히 넣어 cached_stats가 Some을 반환하도록
@@ -2546,7 +2819,11 @@ mod tests {
         let coins = vec!["BTC".to_string()];
 
         // computing flag를 먼저 설정
-        assert!(!ob_cache.computing.try_set_computing(orderbook::Exchange::Upbit, "BTC"));
+        assert!(
+            !ob_cache
+                .computing
+                .try_set_computing(orderbook::Exchange::Upbit, "BTC")
+        );
 
         let event = MarketEvent::Trade {
             timestamp: Utc::now(),
@@ -2569,6 +2846,7 @@ mod tests {
             &session_writer,
             &upbit,
             &bybit,
+            &instrument_cache,
         )
         .await;
 
@@ -2577,7 +2855,9 @@ mod tests {
         assert_eq!(c.dropped_tick_count, 1);
 
         // flag 정리
-        ob_cache.computing.clear_computing(orderbook::Exchange::Upbit, "BTC");
+        ob_cache
+            .computing
+            .clear_computing(orderbook::Exchange::Upbit, "BTC");
     }
 
     /// 테스트용 mock MarketData + MarketStream 구현.
@@ -2639,6 +2919,15 @@ mod tests {
             unimplemented!()
         }
         async fn unsubscribe(&self) -> Result<(), arb_exchange::ExchangeError> {
+            unimplemented!()
+        }
+    }
+
+    impl InstrumentDataProvider for MockMarket {
+        async fn get_instrument_info(
+            &self,
+            _symbol: &str,
+        ) -> Result<arb_exchange::InstrumentInfoResponse, arb_exchange::ExchangeError> {
             unimplemented!()
         }
     }

@@ -59,6 +59,14 @@ pub enum ExchangeError {
     #[error("Operation not supported: {0}")]
     Unsupported(String),
 
+    /// API 응답 에러 (비즈니스 로직 실패).
+    #[error("API error: {0}")]
+    ApiError(String),
+
+    /// 데이터 파싱 에러 (문자열 → 숫자 변환 등).
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
     /// 거래소의 알 수 없는 에러.
     #[error("Unknown error: {code} - {message}")]
     UnknownError { code: String, message: String },
@@ -103,6 +111,25 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Operation not supported: subscribe_markets not implemented"
+        );
+    }
+
+    #[test]
+    fn test_api_error_display() {
+        let err =
+            ExchangeError::ApiError("No instrument info found for symbol: INVALID".to_string());
+        assert_eq!(
+            err.to_string(),
+            "API error: No instrument info found for symbol: INVALID"
+        );
+    }
+
+    #[test]
+    fn test_parse_error_display() {
+        let err = ExchangeError::ParseError("tick_size parse: invalid decimal".to_string());
+        assert_eq!(
+            err.to_string(),
+            "Parse error: tick_size parse: invalid decimal"
         );
     }
 }

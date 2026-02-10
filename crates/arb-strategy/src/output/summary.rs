@@ -30,6 +30,14 @@ pub struct MonitoringCounters {
     pub partial_close_count: u64,
     /// 강제 청산 횟수.
     pub forced_liquidation_count: u64,
+    /// 최소/최대 주문 조건 미달로 진입 거부된 횟수.
+    pub entry_rejected_order_constraint_count: u64,
+    /// 라운딩 후 수익성 부족으로 진입 거부된 횟수.
+    pub entry_rejected_rounding_pnl_count: u64,
+    /// InstrumentInfo 미존재로 라운딩 없이 청산 진행한 횟수.
+    pub fallback_no_rounding_count: u64,
+    /// 잔여 qty < min_order_qty로 전량 전환 시 safe volume 초과한 청산 횟수.
+    pub safe_volume_exceeded_close_count: u64,
 }
 
 /// 일별 PnL 기록.
@@ -119,6 +127,14 @@ pub struct SessionSummary {
     pub partial_close_count: u64,
     /// 강제 청산 (카운터 기반) 횟수.
     pub forced_liquidation_count: u64,
+    /// 주문 조건 미달 진입 거부 횟수.
+    pub entry_rejected_order_constraint_count: u64,
+    /// 라운딩 후 수익성 부족 진입 거부 횟수.
+    pub entry_rejected_rounding_pnl_count: u64,
+    /// 라운딩 미적용 청산 (InstrumentInfo 없음) 횟수.
+    pub fallback_no_rounding_count: u64,
+    /// safe volume 초과 전량 청산 횟수.
+    pub safe_volume_exceeded_close_count: u64,
 }
 
 impl SessionSummary {
@@ -249,6 +265,10 @@ impl SessionSummary {
             entry_rejected_slippage_count: counters.entry_rejected_slippage_count,
             partial_close_count: counters.partial_close_count,
             forced_liquidation_count: counters.forced_liquidation_count,
+            entry_rejected_order_constraint_count: counters.entry_rejected_order_constraint_count,
+            entry_rejected_rounding_pnl_count: counters.entry_rejected_rounding_pnl_count,
+            fallback_no_rounding_count: counters.fallback_no_rounding_count,
+            safe_volume_exceeded_close_count: counters.safe_volume_exceeded_close_count,
         }
     }
 
@@ -345,6 +365,22 @@ impl SessionSummary {
         s.push_str(&format!(
             "강제 청산 (카운터): {}건\n",
             format_number(self.forced_liquidation_count)
+        ));
+        s.push_str(&format!(
+            "주문 조건 미달 진입 거부: {}건\n",
+            format_number(self.entry_rejected_order_constraint_count)
+        ));
+        s.push_str(&format!(
+            "라운딩 PnL 진입 거부: {}건\n",
+            format_number(self.entry_rejected_rounding_pnl_count)
+        ));
+        s.push_str(&format!(
+            "라운딩 미적용 청산: {}건\n",
+            format_number(self.fallback_no_rounding_count)
+        ));
+        s.push_str(&format!(
+            "safe volume 초과 청산: {}건\n",
+            format_number(self.safe_volume_exceeded_close_count)
         ));
 
         s
@@ -454,6 +490,7 @@ mod tests {
             entry_time: exit_time - chrono::Duration::minutes(holding_minutes as i64),
             exit_time,
             holding_minutes,
+            qty: Decimal::new(10, 3), // 0.010
             size_usdt: Decimal::new(1000, 0),
             upbit_entry_price: Decimal::new(95_000, 0),
             bybit_entry_price: Decimal::new(95_100, 0),

@@ -20,6 +20,9 @@ pub struct ClosedPosition {
     pub exit_time: DateTime<Utc>,
     /// 보유 시간 (분).
     pub holding_minutes: u64,
+    /// 청산 수량 (양 leg 동일).
+    #[serde(with = "rust_decimal::serde::str")]
+    pub qty: Decimal,
     /// 포지션 크기 (USDT, 단일 leg 기준).
     #[serde(with = "rust_decimal::serde::str")]
     pub size_usdt: Decimal,
@@ -131,6 +134,7 @@ mod tests {
             entry_time: Utc::now(),
             exit_time: Utc::now(),
             holding_minutes: 30,
+            qty: Decimal::new(10, 3), // 0.010
             size_usdt: Decimal::new(1000, 0),
             upbit_entry_price: Decimal::new(95_000, 0),
             bybit_entry_price: Decimal::new(95_100, 0),

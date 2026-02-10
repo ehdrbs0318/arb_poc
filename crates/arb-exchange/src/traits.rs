@@ -3,7 +3,9 @@
 //! 이 모듈은 모든 거래소 구현체가 구현해야 하는 trait을 정의합니다.
 
 use crate::error::ExchangeResult;
-use crate::types::{Balance, Candle, CandleInterval, Order, OrderBook, OrderRequest, Ticker};
+use crate::types::{
+    Balance, Candle, CandleInterval, InstrumentInfoResponse, Order, OrderBook, OrderRequest, Ticker,
+};
 use chrono::{DateTime, Utc};
 use std::future::Future;
 
@@ -150,6 +152,25 @@ pub trait Exchange: MarketData + OrderManagement {
     fn is_authenticated(&self) -> bool;
 }
 
+/// 거래 규격(instrument info) 조회 trait.
+///
+/// Bybit 등 instrument info API를 제공하는 거래소만 구현합니다.
+pub trait InstrumentDataProvider: Send + Sync {
+    /// 심볼의 거래 규격을 조회합니다.
+    ///
+    /// # 인자
+    ///
+    /// * `symbol` - 거래소 형식의 심볼 (예: "BTCUSDT")
+    ///
+    /// # 반환값
+    ///
+    /// 해당 심볼의 가격/수량 규격 정보를 반환합니다.
+    fn get_instrument_info(
+        &self,
+        symbol: &str,
+    ) -> impl Future<Output = ExchangeResult<InstrumentInfoResponse>> + Send;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,4 +178,5 @@ mod tests {
     // trait이 사용 사례에 충분히 object-safe한지 확인하는 컴파일 타임 테스트
     fn _assert_send_sync<T: MarketData + Send + Sync>() {}
     fn _assert_order_mgmt<T: OrderManagement + Send + Sync>() {}
+    fn _assert_instrument_data<T: InstrumentDataProvider + Send + Sync>() {}
 }

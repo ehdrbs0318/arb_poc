@@ -42,7 +42,7 @@ pub use chrono;
 
 // 핵심 trait 재내보내기
 pub use error::{ExchangeError, ExchangeResult};
-pub use traits::{Exchange, MarketData, OrderManagement};
+pub use traits::{Exchange, InstrumentDataProvider, MarketData, OrderManagement};
 pub use types::*;
 
 // adapter와 manager 재내보내기

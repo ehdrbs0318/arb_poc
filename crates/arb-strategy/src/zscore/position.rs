@@ -38,8 +38,15 @@ pub struct VirtualPosition {
     pub entry_spread_pct: f64,
     /// 진입 시 Z-Score.
     pub entry_z_score: f64,
-    /// 포지션 크기 (USDT, 단일 leg 기준).
-    pub size_usdt: Decimal,
+    /// 포지션 수량 (코인 단위, 양 leg 동일).
+    pub qty: Decimal,
+}
+
+impl VirtualPosition {
+    /// USDT 기준 포지션 크기 (qty * bybit_entry_price).
+    pub fn size_usdt(&self) -> Decimal {
+        self.qty * self.bybit_entry_price
+    }
 }
 
 /// 포지션 매니저.
@@ -74,7 +81,7 @@ impl PositionManager {
         self.open_positions
             .values()
             .flat_map(|positions| positions.iter())
-            .map(|p| p.size_usdt * Decimal::from(2u64))
+            .map(|p| p.size_usdt() * Decimal::from(2u64))
             .sum()
     }
 
@@ -82,7 +89,7 @@ impl PositionManager {
     pub fn coin_used_capital(&self, coin: &str) -> Decimal {
         self.open_positions
             .get(coin)
-            .map(|positions| positions.iter().map(|p| p.size_usdt).sum())
+            .map(|positions| positions.iter().map(|p| p.size_usdt()).sum())
             .unwrap_or(Decimal::ZERO)
     }
 
@@ -112,7 +119,8 @@ impl PositionManager {
         info!(
             coin = %position.coin,
             id = position.id,
-            size_usdt = %position.size_usdt,
+            qty = %position.qty,
+            size_usdt = %position.size_usdt(),
             upbit_entry_price = %position.upbit_entry_price,
             bybit_entry_price = %position.bybit_entry_price,
             liquidation_price = %position.bybit_liquidation_price,
@@ -166,7 +174,7 @@ impl PositionManager {
 
         let closed = Self::build_closed_position(
             &pos,
-            pos.size_usdt,
+            pos.qty,
             exit_time,
             exit_upbit_usdt_price,
             exit_bybit_price,
@@ -196,8 +204,10 @@ impl PositionManager {
 
     /// 포지션을 부분 청산합니다.
     ///
-    /// `partial_size_usdt`만큼 ClosedPosition을 생성하고,
-    /// 잔여 size_usdt로 VirtualPosition을 축소합니다 (ID 동일 유지).
+    /// `partial_qty`만큼 ClosedPosition을 생성하고,
+    /// 잔여 qty로 VirtualPosition을 축소합니다 (ID 동일 유지).
+    /// `instrument_info`가 제공되면 qty_step으로 라운딩하고,
+    /// 라운딩 후 0이면 전량 청산으로 전환합니다.
     ///
     /// # 반환값
     ///
@@ -207,7 +217,8 @@ impl PositionManager {
         &mut self,
         coin: &str,
         position_id: u64,
-        partial_size_usdt: Decimal,
+        partial_qty: Decimal,
+        instrument_info: Option<&crate::zscore::instrument::InstrumentInfo>,
         exit_upbit_price: Decimal,
         exit_bybit_price: Decimal,
         exit_usd_krw: f64,
@@ -236,11 +247,32 @@ impl PositionManager {
 
         let exit_time = Utc::now();
         let pos = &positions[idx];
-        let remaining = pos.size_usdt - partial_size_usdt;
+
+        // instrument_info가 있으면 qty_step 라운딩 적용
+        let close_qty = if let Some(info) = instrument_info {
+            let rounded = crate::zscore::instrument::floor_to_step(partial_qty, info.qty_step);
+            if rounded.is_zero() {
+                // qty_step 라운딩 후 0이면 전량 청산으로 전환
+                pos.qty
+            } else {
+                let remaining = pos.qty.saturating_sub(rounded);
+                if remaining < info.min_order_qty && remaining > Decimal::ZERO {
+                    // 잔량이 min_order_qty 미만이면 전량 청산
+                    pos.qty
+                } else {
+                    rounded
+                }
+            }
+        } else {
+            // fallback: 라운딩 없이 원본 qty
+            partial_qty
+        };
+
+        let remaining_qty = pos.qty.saturating_sub(close_qty);
 
         let closed = Self::build_closed_position(
             pos,
-            partial_size_usdt,
+            close_qty,
             exit_time,
             exit_upbit_price,
             exit_bybit_price,
@@ -255,17 +287,17 @@ impl PositionManager {
         info!(
             coin = %closed.coin,
             id = closed.id,
-            partial_size_usdt = %partial_size_usdt,
-            remaining_usdt = %remaining,
+            close_qty = %close_qty,
+            remaining_qty = %remaining_qty,
             net_pnl = %closed.net_pnl,
             "부분 청산 완료"
         );
 
         self.closed_positions.push(closed.clone());
 
-        let remaining_pos = if remaining > Decimal::ZERO {
+        let remaining_pos = if remaining_qty > Decimal::ZERO {
             // 잔여 포지션 축소 (ID 동일 유지)
-            positions[idx].size_usdt = remaining;
+            positions[idx].qty = remaining_qty;
             Some(positions[idx].clone())
         } else {
             // 전량 소진 → 포지션 제거
@@ -307,10 +339,12 @@ impl PositionManager {
     }
 
     /// ClosedPosition을 생성하는 내부 헬퍼.
+    ///
+    /// `close_qty`는 코인 수량 기반이며, 양 leg 동일 수량으로 계산합니다.
     #[allow(clippy::too_many_arguments)]
     fn build_closed_position(
         pos: &VirtualPosition,
-        close_size_usdt: Decimal,
+        close_qty: Decimal,
         exit_time: DateTime<Utc>,
         exit_upbit_usdt_price: Decimal,
         exit_bybit_price: Decimal,
@@ -323,19 +357,18 @@ impl PositionManager {
     ) -> ClosedPosition {
         let holding_minutes = (exit_time - pos.entry_time).num_minutes().unsigned_abs();
 
-        // USDT notional matching (close_size 기준)
-        let upbit_qty = close_size_usdt / pos.upbit_entry_price;
-        let bybit_qty = close_size_usdt / pos.bybit_entry_price;
+        let qty = close_qty; // 양 leg 동일 수량
 
         // Upbit 현물 PnL
-        let upbit_pnl = (exit_upbit_usdt_price - pos.upbit_entry_price) * upbit_qty;
+        let upbit_pnl = (exit_upbit_usdt_price - pos.upbit_entry_price) * qty;
 
         // Bybit short PnL
-        let bybit_pnl = (pos.bybit_entry_price - exit_bybit_price) * bybit_qty;
+        let bybit_pnl = (pos.bybit_entry_price - exit_bybit_price) * qty;
 
-        // 수수료 (진입 + 청산)
-        let upbit_fees = close_size_usdt * upbit_taker_fee * Decimal::from(2u64);
-        let bybit_fees = close_size_usdt * bybit_taker_fee * Decimal::from(2u64);
+        // 수수료: 진입/청산 각각의 가격에 수수료를 개별 적용
+        let upbit_fees =
+            (pos.upbit_entry_price * qty + exit_upbit_usdt_price * qty) * upbit_taker_fee;
+        let bybit_fees = (pos.bybit_entry_price * qty + exit_bybit_price * qty) * bybit_taker_fee;
         let total_fees = upbit_fees + bybit_fees;
 
         // 순 PnL
@@ -347,7 +380,8 @@ impl PositionManager {
             entry_time: pos.entry_time,
             exit_time,
             holding_minutes,
-            size_usdt: close_size_usdt,
+            qty: close_qty,
+            size_usdt: close_qty * pos.bybit_entry_price,
             upbit_entry_price: pos.upbit_entry_price,
             bybit_entry_price: pos.bybit_entry_price,
             upbit_exit_price: exit_upbit_usdt_price,
@@ -392,7 +426,7 @@ pub fn calculate_liquidation_price(
 mod tests {
     use super::*;
 
-    fn make_position(coin: &str, size: i64, entry_price: i64) -> VirtualPosition {
+    fn make_position(coin: &str, qty: i64, entry_price: i64) -> VirtualPosition {
         VirtualPosition {
             id: 0, // open_position()에서 자동 할당
             coin: coin.to_string(),
@@ -403,7 +437,7 @@ mod tests {
             entry_usd_krw: 1380.0,
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
-            size_usdt: Decimal::new(size, 0),
+            qty: Decimal::new(qty, 0),
         }
     }
 
@@ -418,24 +452,25 @@ mod tests {
     #[test]
     fn test_open_position() {
         let mut pm = PositionManager::new();
-        let pos = make_position("BTC", 1000, 100_000);
+        // qty=1, bybit_entry_price=100_050 → size_usdt()=100_050 → used_capital=200_100
+        let pos = make_position("BTC", 1, 100_000);
         pm.open_position(pos).unwrap();
         assert!(pm.has_position("BTC"));
         assert_eq!(pm.open_count(), 1);
-        assert_eq!(pm.used_capital(), Decimal::new(2000, 0));
+        assert_eq!(pm.used_capital(), Decimal::new(200_100, 0));
     }
 
     #[test]
     fn test_open_multiple_positions() {
         // 같은 코인에 복수 포지션 추가 가능
         let mut pm = PositionManager::new();
-        pm.open_position(make_position("BTC", 1000, 100_000))
-            .unwrap();
-        pm.open_position(make_position("BTC", 500, 100_000))
-            .unwrap();
+        // qty=1, bybit_entry=100050 → size_usdt=100050
+        pm.open_position(make_position("BTC", 1, 100_000)).unwrap();
+        // qty=2, bybit_entry=100050 → size_usdt=200100
+        pm.open_position(make_position("BTC", 2, 100_000)).unwrap();
         assert_eq!(pm.open_count(), 2);
-        // used_capital = (1000 + 500) × 2 = 3000
-        assert_eq!(pm.used_capital(), Decimal::new(3000, 0));
+        // used_capital = (100050 + 200100) × 2 = 600300
+        assert_eq!(pm.used_capital(), Decimal::new(600_300, 0));
         // ID가 다르게 할당됨
         let positions = pm.open_positions.get("BTC").unwrap();
         assert_eq!(positions[0].id, 0);
@@ -445,16 +480,17 @@ mod tests {
     #[test]
     fn test_coin_used_capital() {
         let mut pm = PositionManager::new();
-        pm.open_position(make_position("BTC", 1000, 100_000))
-            .unwrap();
-        pm.open_position(make_position("BTC", 500, 100_000))
-            .unwrap();
-        pm.open_position(make_position("ETH", 300, 5_000)).unwrap();
+        // BTC qty=1, bybit_entry=100050 → size_usdt=100050
+        pm.open_position(make_position("BTC", 1, 100_000)).unwrap();
+        // BTC qty=2, bybit_entry=100050 → size_usdt=200100
+        pm.open_position(make_position("BTC", 2, 100_000)).unwrap();
+        // ETH qty=10, bybit_entry=5050 → size_usdt=50500
+        pm.open_position(make_position("ETH", 10, 5_000)).unwrap();
 
-        // BTC: 1000 + 500 = 1500
-        assert_eq!(pm.coin_used_capital("BTC"), Decimal::new(1500, 0));
-        // ETH: 300
-        assert_eq!(pm.coin_used_capital("ETH"), Decimal::new(300, 0));
+        // BTC: 100050 + 200100 = 300150
+        assert_eq!(pm.coin_used_capital("BTC"), Decimal::new(300_150, 0));
+        // ETH: 50500
+        assert_eq!(pm.coin_used_capital("ETH"), Decimal::new(50_500, 0));
         // 존재하지 않는 코인
         assert_eq!(pm.coin_used_capital("SOL"), Decimal::ZERO);
     }
@@ -473,7 +509,7 @@ mod tests {
             entry_usd_krw: 1380.0,
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
-            size_usdt: Decimal::new(1000, 0),
+            qty: Decimal::ONE,
         })
         .unwrap();
         let position_id = 0; // open_position에서 할당된 ID
@@ -526,10 +562,8 @@ mod tests {
     fn test_close_specific_position_in_vec() {
         // 같은 코인에 여러 포지션이 있을 때 특정 ID만 청산
         let mut pm = PositionManager::new();
-        pm.open_position(make_position("BTC", 1000, 100_000))
-            .unwrap();
-        pm.open_position(make_position("BTC", 500, 100_000))
-            .unwrap();
+        pm.open_position(make_position("BTC", 1, 100_000)).unwrap();
+        pm.open_position(make_position("BTC", 2, 100_000)).unwrap();
         assert_eq!(pm.open_count(), 2);
 
         // ID=0인 포지션 청산
@@ -551,15 +585,16 @@ mod tests {
         assert_eq!(closed.id, 0);
         assert_eq!(pm.open_count(), 1);
 
-        // 남은 포지션은 ID=1
+        // 남은 포지션은 ID=1, qty=2
         let remaining = pm.open_positions.get("BTC").unwrap();
         assert_eq!(remaining[0].id, 1);
-        assert_eq!(remaining[0].size_usdt, Decimal::new(500, 0));
+        assert_eq!(remaining[0].qty, Decimal::new(2, 0));
     }
 
     #[test]
     fn test_close_partial() {
         let mut pm = PositionManager::new();
+        // qty=5 코인
         pm.open_position(VirtualPosition {
             id: 0,
             coin: "BTC".to_string(),
@@ -570,16 +605,17 @@ mod tests {
             entry_usd_krw: 1380.0,
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
-            size_usdt: Decimal::new(500, 0),
+            qty: Decimal::new(5, 0),
         })
         .unwrap();
 
-        // 200 USDT 부분 청산
+        // 2 코인 부분 청산 (instrument_info 없음)
         let (closed, remaining) = pm
             .close_partial(
                 "BTC",
                 0,
-                Decimal::new(200, 0), // partial_size_usdt
+                Decimal::new(2, 0), // partial_qty
+                None,               // instrument_info
                 Decimal::new(100_020, 0),
                 Decimal::new(100_020, 0),
                 1381.0,
@@ -591,23 +627,25 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(closed.size_usdt, Decimal::new(200, 0));
+        assert_eq!(closed.qty, Decimal::new(2, 0));
+        // size_usdt = qty(2) * bybit_entry_price(100050) = 200100
+        assert_eq!(closed.size_usdt, Decimal::new(200_100, 0));
         assert_eq!(closed.id, 0);
 
-        // 잔여 포지션이 있어야 함
+        // 잔여 포지션: qty=3
         let rem = remaining.unwrap();
-        assert_eq!(rem.size_usdt, Decimal::new(300, 0));
+        assert_eq!(rem.qty, Decimal::new(3, 0));
         assert_eq!(rem.id, 0); // ID 동일 유지
 
         // 오픈 포지션에도 반영됨
         assert!(pm.has_position("BTC"));
         let btc_positions = pm.open_positions.get("BTC").unwrap();
-        assert_eq!(btc_positions[0].size_usdt, Decimal::new(300, 0));
+        assert_eq!(btc_positions[0].qty, Decimal::new(3, 0));
     }
 
     #[test]
     fn test_close_partial_full_exhaust() {
-        // partial_size가 전량 이상이면 포지션이 제거됨
+        // partial_qty가 전량 이상이면 포지션이 제거됨
         let mut pm = PositionManager::new();
         pm.open_position(VirtualPosition {
             id: 0,
@@ -619,16 +657,17 @@ mod tests {
             entry_usd_krw: 1380.0,
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
-            size_usdt: Decimal::new(500, 0),
+            qty: Decimal::new(5, 0),
         })
         .unwrap();
 
-        // 전량(500 USDT) 부분 청산
+        // 전량(5 코인) 부분 청산
         let (closed, remaining) = pm
             .close_partial(
                 "BTC",
                 0,
-                Decimal::new(500, 0),
+                Decimal::new(5, 0), // partial_qty = 전량
+                None,               // instrument_info
                 Decimal::new(100_020, 0),
                 Decimal::new(100_020, 0),
                 1381.0,
@@ -640,7 +679,9 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(closed.size_usdt, Decimal::new(500, 0));
+        assert_eq!(closed.qty, Decimal::new(5, 0));
+        // size_usdt = 5 * 100050 = 500250
+        assert_eq!(closed.size_usdt, Decimal::new(500_250, 0));
         assert!(remaining.is_none());
         assert!(!pm.has_position("BTC"));
     }
@@ -653,7 +694,7 @@ mod tests {
         assert!(pm.last_entry_at("BTC").is_none());
 
         // 진입 후 시각이 기록됨
-        let pos = make_position("BTC", 1000, 100_000);
+        let pos = make_position("BTC", 1, 100_000);
         let entry_time = pos.entry_time;
         pm.open_position(pos).unwrap();
         assert_eq!(pm.last_entry_at("BTC"), Some(entry_time));
@@ -662,7 +703,7 @@ mod tests {
         assert!(pm.last_entry_at("ETH").is_none());
 
         // 같은 코인에 재진입 시 시각 갱신
-        let pos2 = make_position("BTC", 500, 100_000);
+        let pos2 = make_position("BTC", 2, 100_000);
         let entry_time2 = pos2.entry_time;
         pm.open_position(pos2).unwrap();
         assert_eq!(pm.last_entry_at("BTC"), Some(entry_time2));
@@ -683,7 +724,7 @@ mod tests {
             entry_usd_krw: 1380.0,
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
-            size_usdt: Decimal::new(1000, 0),
+            qty: Decimal::ONE,
         })
         .unwrap();
 
@@ -697,7 +738,7 @@ mod tests {
             entry_usd_krw: 1380.0,
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
-            size_usdt: Decimal::new(500, 0),
+            qty: Decimal::new(2, 0),
         })
         .unwrap();
 
@@ -744,8 +785,7 @@ mod tests {
     #[test]
     fn test_has_position_after_all_closed() {
         let mut pm = PositionManager::new();
-        pm.open_position(make_position("BTC", 1000, 100_000))
-            .unwrap();
+        pm.open_position(make_position("BTC", 1, 100_000)).unwrap();
         assert!(pm.has_position("BTC"));
 
         pm.close_position(
@@ -770,11 +810,9 @@ mod tests {
     #[test]
     fn test_open_count_multiple_coins() {
         let mut pm = PositionManager::new();
-        pm.open_position(make_position("BTC", 1000, 100_000))
-            .unwrap();
-        pm.open_position(make_position("BTC", 500, 100_000))
-            .unwrap();
-        pm.open_position(make_position("ETH", 300, 5_000)).unwrap();
+        pm.open_position(make_position("BTC", 1, 100_000)).unwrap();
+        pm.open_position(make_position("BTC", 2, 100_000)).unwrap();
+        pm.open_position(make_position("ETH", 10, 5_000)).unwrap();
 
         // BTC 2개 + ETH 1개 = 3개
         assert_eq!(pm.open_count(), 3);
@@ -785,5 +823,230 @@ mod tests {
         let pm = PositionManager::default();
         assert_eq!(pm.open_count(), 0);
         assert_eq!(pm.used_capital(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_close_partial_with_instrument_info_rounding() {
+        // instrument_info가 있으면 qty_step으로 라운딩
+        use crate::zscore::instrument::InstrumentInfo;
+
+        let mut pm = PositionManager::new();
+        pm.open_position(VirtualPosition {
+            id: 0,
+            coin: "ETH".to_string(),
+            entry_time: Utc::now(),
+            upbit_entry_price: Decimal::new(3000, 0),
+            bybit_entry_price: Decimal::new(3010, 0),
+            bybit_liquidation_price: Decimal::new(6000, 0),
+            entry_usd_krw: 1380.0,
+            entry_spread_pct: 0.05,
+            entry_z_score: 2.5,
+            qty: Decimal::new(10, 0), // 10 ETH
+        })
+        .unwrap();
+
+        let info = InstrumentInfo {
+            tick_size: Decimal::new(1, 2),
+            qty_step: Decimal::new(1, 1),      // 0.1
+            min_order_qty: Decimal::new(1, 1), // 0.1
+            min_notional: Decimal::new(5, 0),
+            max_order_qty: Decimal::new(1000, 0),
+        };
+
+        // partial_qty = 3.15 → floor(3.15, 0.1) = 3.1
+        let (closed, remaining) = pm
+            .close_partial(
+                "ETH",
+                0,
+                Decimal::new(315, 2), // 3.15
+                Some(&info),
+                Decimal::new(3020, 0),
+                Decimal::new(3020, 0),
+                1381.0,
+                0.0,
+                0.3,
+                Decimal::new(5, 4),
+                Decimal::new(55, 5),
+                false,
+            )
+            .unwrap();
+
+        // 라운딩 후 3.1 코인 청산
+        assert_eq!(closed.qty, Decimal::new(31, 1));
+        // 잔여: 10 - 3.1 = 6.9
+        let rem = remaining.unwrap();
+        assert_eq!(rem.qty, Decimal::new(69, 1));
+    }
+
+    #[test]
+    fn test_close_partial_instrument_info_zero_rounding_becomes_full() {
+        // partial_qty가 qty_step보다 작으면 라운딩 후 0 → 전량 청산 전환
+        use crate::zscore::instrument::InstrumentInfo;
+
+        let mut pm = PositionManager::new();
+        pm.open_position(VirtualPosition {
+            id: 0,
+            coin: "BTC".to_string(),
+            entry_time: Utc::now(),
+            upbit_entry_price: Decimal::new(50000, 0),
+            bybit_entry_price: Decimal::new(50050, 0),
+            bybit_liquidation_price: Decimal::new(100000, 0),
+            entry_usd_krw: 1380.0,
+            entry_spread_pct: 0.05,
+            entry_z_score: 2.5,
+            qty: Decimal::new(1, 3), // 0.001 BTC
+        })
+        .unwrap();
+
+        let info = InstrumentInfo {
+            tick_size: Decimal::new(1, 2),
+            qty_step: Decimal::new(1, 3),      // 0.001
+            min_order_qty: Decimal::new(1, 3), // 0.001
+            min_notional: Decimal::new(5, 0),
+            max_order_qty: Decimal::new(100, 0),
+        };
+
+        // partial_qty = 0.0005 → floor(0.0005, 0.001) = 0 → 전량 청산 전환
+        let (closed, remaining) = pm
+            .close_partial(
+                "BTC",
+                0,
+                Decimal::new(5, 4), // 0.0005
+                Some(&info),
+                Decimal::new(50020, 0),
+                Decimal::new(50020, 0),
+                1381.0,
+                0.0,
+                0.3,
+                Decimal::new(5, 4),
+                Decimal::new(55, 5),
+                false,
+            )
+            .unwrap();
+
+        // 전량 청산으로 전환 (pos.qty = 0.001)
+        assert_eq!(closed.qty, Decimal::new(1, 3));
+        assert!(remaining.is_none());
+        assert!(!pm.has_position("BTC"));
+    }
+
+    #[test]
+    fn test_close_partial_remaining_below_min_order_qty() {
+        // 잔량이 min_order_qty 미만이면 전량 청산으로 전환
+        use crate::zscore::instrument::InstrumentInfo;
+
+        let mut pm = PositionManager::new();
+        pm.open_position(VirtualPosition {
+            id: 0,
+            coin: "ETH".to_string(),
+            entry_time: Utc::now(),
+            upbit_entry_price: Decimal::new(3000, 0),
+            bybit_entry_price: Decimal::new(3010, 0),
+            bybit_liquidation_price: Decimal::new(6000, 0),
+            entry_usd_krw: 1380.0,
+            entry_spread_pct: 0.05,
+            entry_z_score: 2.5,
+            qty: Decimal::new(10, 1), // 1.0 ETH
+        })
+        .unwrap();
+
+        let info = InstrumentInfo {
+            tick_size: Decimal::new(1, 2),
+            qty_step: Decimal::new(1, 1),      // 0.1
+            min_order_qty: Decimal::new(2, 1), // 0.2
+            min_notional: Decimal::new(5, 0),
+            max_order_qty: Decimal::new(1000, 0),
+        };
+
+        // partial_qty = 0.9 → floor(0.9, 0.1) = 0.9
+        // remaining = 1.0 - 0.9 = 0.1 < min_order_qty(0.2) → 전량 청산
+        let (closed, remaining) = pm
+            .close_partial(
+                "ETH",
+                0,
+                Decimal::new(9, 1), // 0.9
+                Some(&info),
+                Decimal::new(3020, 0),
+                Decimal::new(3020, 0),
+                1381.0,
+                0.0,
+                0.3,
+                Decimal::new(5, 4),
+                Decimal::new(55, 5),
+                false,
+            )
+            .unwrap();
+
+        // 전량 청산으로 전환 (pos.qty = 1.0)
+        assert_eq!(closed.qty, Decimal::new(10, 1));
+        assert!(remaining.is_none());
+        assert!(!pm.has_position("ETH"));
+    }
+
+    #[test]
+    fn test_size_usdt_derived_method() {
+        // size_usdt()가 qty * bybit_entry_price를 반환하는지 확인
+        let pos = VirtualPosition {
+            id: 0,
+            coin: "BTC".to_string(),
+            entry_time: Utc::now(),
+            upbit_entry_price: Decimal::new(100_000, 0),
+            bybit_entry_price: Decimal::new(100_050, 0),
+            bybit_liquidation_price: Decimal::new(199_445, 0),
+            entry_usd_krw: 1380.0,
+            entry_spread_pct: 0.05,
+            entry_z_score: 2.5,
+            qty: Decimal::new(3, 0), // 3 BTC
+        };
+        // 3 * 100050 = 300150
+        assert_eq!(pos.size_usdt(), Decimal::new(300_150, 0));
+    }
+
+    #[test]
+    fn test_build_closed_position_qty_based_pnl() {
+        // qty 기반 PnL 계산이 올바른지 검증
+        let mut pm = PositionManager::new();
+        let entry_time = Utc::now();
+        pm.open_position(VirtualPosition {
+            id: 0,
+            coin: "ETH".to_string(),
+            entry_time,
+            upbit_entry_price: Decimal::new(3000, 0),
+            bybit_entry_price: Decimal::new(3000, 0),
+            bybit_liquidation_price: Decimal::new(6000, 0),
+            entry_usd_krw: 1380.0,
+            entry_spread_pct: 0.05,
+            entry_z_score: 2.5,
+            qty: Decimal::new(10, 0), // 10 ETH
+        })
+        .unwrap();
+
+        let exit_time = entry_time + chrono::Duration::minutes(60);
+        let closed = pm
+            .close_position(
+                "ETH",
+                0,
+                exit_time,
+                Decimal::new(3100, 0), // Upbit 청산가 (USDT 환산)
+                Decimal::new(2900, 0), // Bybit 청산가
+                1381.0,
+                0.0,
+                0.3,
+                Decimal::ZERO, // 수수료 0으로 설정하여 PnL만 검증
+                Decimal::ZERO,
+                false,
+            )
+            .unwrap();
+
+        // qty=10
+        assert_eq!(closed.qty, Decimal::new(10, 0));
+        // upbit_pnl = (3100 - 3000) * 10 = 1000
+        assert_eq!(closed.upbit_pnl, Decimal::new(1000, 0));
+        // bybit_pnl = (3000 - 2900) * 10 = 1000
+        assert_eq!(closed.bybit_pnl, Decimal::new(1000, 0));
+        // net_pnl = 1000 + 1000 - 0 = 2000
+        assert_eq!(closed.net_pnl, Decimal::new(2000, 0));
+        // size_usdt = 10 * 3000 = 30000
+        assert_eq!(closed.size_usdt, Decimal::new(30000, 0));
     }
 }

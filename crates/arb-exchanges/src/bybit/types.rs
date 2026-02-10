@@ -416,6 +416,53 @@ pub struct BybitCancelOrderRequest {
     pub order_link_id: Option<String>,
 }
 
+/// Bybit instrument info API 응답 (instruments-info endpoint).
+#[derive(Debug, Deserialize)]
+pub struct BybitInstrumentInfoList {
+    /// 카테고리.
+    pub category: String,
+    /// instrument 목록.
+    pub list: Vec<BybitInstrumentInfoItem>,
+}
+
+/// 개별 instrument 정보.
+#[derive(Debug, Deserialize)]
+pub struct BybitInstrumentInfoItem {
+    /// 심볼 이름 (예: "BTCUSDT").
+    pub symbol: String,
+    /// 가격 필터.
+    #[serde(rename = "priceFilter")]
+    pub price_filter: BybitPriceFilter,
+    /// 수량 필터.
+    #[serde(rename = "lotSizeFilter")]
+    pub lot_size_filter: BybitLotSizeFilter,
+}
+
+/// 가격 필터 (tickSize 등).
+#[derive(Debug, Deserialize)]
+pub struct BybitPriceFilter {
+    /// 가격 최소 단위 (문자열 -> Decimal 파싱 필요).
+    #[serde(rename = "tickSize")]
+    pub tick_size: String,
+}
+
+/// 수량 필터 (qtyStep, minOrderQty 등).
+#[derive(Debug, Deserialize)]
+pub struct BybitLotSizeFilter {
+    /// 수량 최소 단위.
+    #[serde(rename = "qtyStep")]
+    pub qty_step: String,
+    /// 최소 주문 수량.
+    #[serde(rename = "minOrderQty")]
+    pub min_order_qty: String,
+    /// 최대 주문 수량.
+    #[serde(rename = "maxOrderQty")]
+    pub max_order_qty: String,
+    /// 최소 주문 금액 (USDT). 선물에만 있을 수 있으므로 Option.
+    #[serde(rename = "minNotionalValue", default)]
+    pub min_notional_value: Option<String>,
+}
+
 /// 문자열에서 Decimal로 역직렬화.
 fn deserialize_decimal_string<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
 where
@@ -597,5 +644,110 @@ mod tests {
         assert!(json.contains("\"category\":\"spot\""));
         assert!(json.contains("\"symbol\":\"BTCUSDT\""));
         assert!(!json.contains("orderLinkId"));
+    }
+
+    #[test]
+    fn test_deserialize_bybit_instrument_info() {
+        let json = r#"{
+            "category": "linear",
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "priceFilter": {
+                        "tickSize": "0.01"
+                    },
+                    "lotSizeFilter": {
+                        "qtyStep": "0.001",
+                        "minOrderQty": "0.001",
+                        "maxOrderQty": "100",
+                        "minNotionalValue": "5"
+                    }
+                }
+            ]
+        }"#;
+
+        let info: BybitInstrumentInfoList = serde_json::from_str(json).unwrap();
+        assert_eq!(info.category, "linear");
+        assert_eq!(info.list.len(), 1);
+        assert_eq!(info.list[0].symbol, "BTCUSDT");
+        assert_eq!(info.list[0].price_filter.tick_size, "0.01");
+        assert_eq!(info.list[0].lot_size_filter.qty_step, "0.001");
+        assert_eq!(info.list[0].lot_size_filter.min_order_qty, "0.001");
+        assert_eq!(info.list[0].lot_size_filter.max_order_qty, "100");
+        assert_eq!(
+            info.list[0].lot_size_filter.min_notional_value,
+            Some("5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_deserialize_bybit_instrument_info_without_min_notional() {
+        // min_notional_value가 없는 경우 (현물 등)
+        let json = r#"{
+            "category": "spot",
+            "list": [
+                {
+                    "symbol": "ETHUSDT",
+                    "priceFilter": {
+                        "tickSize": "0.01"
+                    },
+                    "lotSizeFilter": {
+                        "qtyStep": "0.01",
+                        "minOrderQty": "0.01",
+                        "maxOrderQty": "10000"
+                    }
+                }
+            ]
+        }"#;
+
+        let info: BybitInstrumentInfoList = serde_json::from_str(json).unwrap();
+        assert_eq!(info.list[0].symbol, "ETHUSDT");
+        assert!(info.list[0].lot_size_filter.min_notional_value.is_none());
+    }
+
+    #[test]
+    fn test_deserialize_bybit_instrument_info_empty_list() {
+        let json = r#"{
+            "category": "linear",
+            "list": []
+        }"#;
+
+        let info: BybitInstrumentInfoList = serde_json::from_str(json).unwrap();
+        assert_eq!(info.category, "linear");
+        assert!(info.list.is_empty());
+    }
+
+    #[test]
+    fn test_deserialize_bybit_instrument_info_multiple_items() {
+        let json = r#"{
+            "category": "linear",
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "priceFilter": {"tickSize": "0.01"},
+                    "lotSizeFilter": {
+                        "qtyStep": "0.001",
+                        "minOrderQty": "0.001",
+                        "maxOrderQty": "100",
+                        "minNotionalValue": "5"
+                    }
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "priceFilter": {"tickSize": "0.01"},
+                    "lotSizeFilter": {
+                        "qtyStep": "0.01",
+                        "minOrderQty": "0.01",
+                        "maxOrderQty": "1000",
+                        "minNotionalValue": "5"
+                    }
+                }
+            ]
+        }"#;
+
+        let info: BybitInstrumentInfoList = serde_json::from_str(json).unwrap();
+        assert_eq!(info.list.len(), 2);
+        assert_eq!(info.list[0].symbol, "BTCUSDT");
+        assert_eq!(info.list[1].symbol, "ETHUSDT");
     }
 }
