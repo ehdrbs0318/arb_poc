@@ -145,6 +145,124 @@ impl IncrementalStats {
     }
 }
 
+/// IncrementalStats / WelfordStats 공통 인터페이스.
+///
+/// **stddev 규약**: 모든 구현체는 **population stddev** (분모=n)를 반환합니다.
+trait StatsAccumulator {
+    /// 새 값 push. `popped`는 윈도우에서 제거된 값.
+    fn push(&mut self, value: f64, popped: Option<f64>);
+    /// 현재 mean.
+    fn mean(&self) -> f64;
+    /// Population stddev (분모=n).
+    fn stddev(&self) -> f64;
+    /// 윈도우 전체 데이터로 통계를 재계산합니다.
+    ///
+    /// WelfordStats: pop 발생 시 전체 재계산.
+    /// IncrementalStats: no-op.
+    fn rebuild(&mut self, _data: &[f64]) {}
+}
+
+impl StatsAccumulator for IncrementalStats {
+    fn push(&mut self, value: f64, popped: Option<f64>) {
+        IncrementalStats::push(self, value, popped);
+    }
+
+    fn mean(&self) -> f64 {
+        IncrementalStats::mean(self)
+    }
+
+    fn stddev(&self) -> f64 {
+        IncrementalStats::stddev(self)
+    }
+    // rebuild는 기본 no-op 사용
+}
+
+/// 단기 regime change 감지용 윈도우 크기 (60분).
+const SHORT_WINDOW_SIZE: usize = 60;
+
+/// Welford's online algorithm 기반 rolling statistics.
+///
+/// IncrementalStats의 naive (sum_sq - sum^2) 방식 대비
+/// catastrophic cancellation에 면역이며, 소규모 윈도우(60개)에서 특히 안정적.
+#[derive(Debug, Clone)]
+struct WelfordStats {
+    count: usize,
+    mean_val: f64,
+    m2: f64,
+}
+
+impl WelfordStats {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            mean_val: 0.0,
+            m2: 0.0,
+        }
+    }
+}
+
+impl StatsAccumulator for WelfordStats {
+    fn push(&mut self, value: f64, _popped: Option<f64>) {
+        // Welford push만 수행, pop은 rebuild에서 처리
+        self.count += 1;
+        let delta = value - self.mean_val;
+        self.mean_val += delta / self.count as f64;
+        let delta2 = value - self.mean_val;
+        self.m2 += delta * delta2;
+    }
+
+    fn mean(&self) -> f64 {
+        self.mean_val
+    }
+
+    /// Population stddev (분모=n). IncrementalStats와 동일 규약.
+    fn stddev(&self) -> f64 {
+        if self.count < 2 {
+            0.0
+        } else {
+            let variance = self.m2 / self.count as f64;
+            if variance < 0.0 { 0.0 } else { variance.sqrt() }
+        }
+    }
+
+    /// 윈도우 전체 데이터로 재계산.
+    fn rebuild(&mut self, data: &[f64]) {
+        self.count = 0;
+        self.mean_val = 0.0;
+        self.m2 = 0.0;
+        for &v in data {
+            self.count += 1;
+            let delta = v - self.mean_val;
+            self.mean_val += delta / self.count as f64;
+            let delta2 = v - self.mean_val;
+            self.m2 += delta * delta2;
+        }
+    }
+}
+
+/// 윈도우와 통계에 값을 동시에 push합니다.
+///
+/// IncrementalStats: push로 O(1) 갱신.
+/// WelfordStats: pop 발생 시 rebuild(window.data()) O(n).
+fn push_to_window_and_stats<S: StatsAccumulator>(
+    window: &mut CandleWindow,
+    stats: &mut S,
+    value: f64,
+) {
+    let had_pop = window.data().len() >= window.window_size();
+    let popped = if had_pop {
+        Some(window.data()[0])
+    } else {
+        None
+    };
+    stats.push(value, popped);
+    window.push(value);
+    if had_pop {
+        let data: Vec<f64> = window.data().iter().copied().collect();
+        stats.rebuild(&data);
+    }
+}
+
 /// 스프레드 계산기.
 ///
 /// 코인별로 Upbit(KRW) + USD/KRW 환율, Bybit(USDT) 가격을 동기화하여
@@ -159,6 +277,10 @@ pub struct SpreadCalculator {
     spread_pct_windows: HashMap<String, CandleWindow>,
     /// 코인별 증분 통계 캐시 (스프레드 윈도우용).
     spread_stats: HashMap<String, IncrementalStats>,
+    /// 코인별 단기 스프레드 윈도우 (regime change 감지용, 60분).
+    short_spread_windows: HashMap<String, CandleWindow>,
+    /// 코인별 단기 통계 (Welford's online algorithm).
+    short_spread_stats: HashMap<String, WelfordStats>,
     /// 코인별 Upbit forward-fill 상태.
     upbit_ff: HashMap<String, ForwardFillState>,
     /// 코인별 Bybit forward-fill 상태.
@@ -174,6 +296,8 @@ impl SpreadCalculator {
         let mut bybit_windows = HashMap::new();
         let mut spread_pct_windows = HashMap::new();
         let mut spread_stats = HashMap::new();
+        let mut short_spread_windows = HashMap::new();
+        let mut short_spread_stats = HashMap::new();
         let mut upbit_ff = HashMap::new();
         let mut bybit_ff = HashMap::new();
 
@@ -182,6 +306,8 @@ impl SpreadCalculator {
             bybit_windows.insert(coin.clone(), CandleWindow::new(window_size));
             spread_pct_windows.insert(coin.clone(), CandleWindow::new(window_size));
             spread_stats.insert(coin.clone(), IncrementalStats::new());
+            short_spread_windows.insert(coin.clone(), CandleWindow::new(SHORT_WINDOW_SIZE));
+            short_spread_stats.insert(coin.clone(), WelfordStats::new());
             upbit_ff.insert(coin.clone(), ForwardFillState::new());
             bybit_ff.insert(coin.clone(), ForwardFillState::new());
         }
@@ -191,6 +317,8 @@ impl SpreadCalculator {
             bybit_windows,
             spread_pct_windows,
             spread_stats,
+            short_spread_windows,
+            short_spread_stats,
             upbit_ff,
             bybit_ff,
             window_size,
@@ -212,6 +340,10 @@ impl SpreadCalculator {
             .insert(coin.to_string(), CandleWindow::new(self.window_size));
         self.spread_stats
             .insert(coin.to_string(), IncrementalStats::new());
+        self.short_spread_windows
+            .insert(coin.to_string(), CandleWindow::new(SHORT_WINDOW_SIZE));
+        self.short_spread_stats
+            .insert(coin.to_string(), WelfordStats::new());
         self.upbit_ff
             .insert(coin.to_string(), ForwardFillState::new());
         self.bybit_ff
@@ -226,6 +358,8 @@ impl SpreadCalculator {
         self.bybit_windows.remove(coin);
         self.spread_pct_windows.remove(coin);
         self.spread_stats.remove(coin);
+        self.short_spread_windows.remove(coin);
+        self.short_spread_stats.remove(coin);
         self.upbit_ff.remove(coin);
         self.bybit_ff.remove(coin);
     }
@@ -306,28 +440,26 @@ impl SpreadCalculator {
                 .ok_or_else(|| StrategyError::Config(format!("unknown coin: {coin}")))?
                 .push(bybit_f64);
 
-            // IncrementalStats 갱신: push 전에 윈도우 full이면 pop될 값을 popped_val로 전달
-            let spread_window = self
-                .spread_pct_windows
-                .get(coin)
-                .ok_or_else(|| StrategyError::Config(format!("unknown coin: {coin}")))?;
-            let popped_val = if spread_window.data().len() >= self.window_size {
-                // 윈도우가 가득 찼으므로 data[0]이 pop될 예정
-                Some(spread_window.data()[0])
-            } else {
-                None
-            };
-
-            // IncrementalStats push
-            if let Some(stats) = self.spread_stats.get_mut(coin) {
-                stats.push(spread_pct, popped_val);
+            // 장기 윈도우 + stats push
+            {
+                let spread_window = self
+                    .spread_pct_windows
+                    .get_mut(coin)
+                    .ok_or_else(|| StrategyError::Config(format!("unknown coin: {coin}")))?;
+                let stats = self
+                    .spread_stats
+                    .get_mut(coin)
+                    .ok_or_else(|| StrategyError::Config(format!("unknown coin: {coin}")))?;
+                push_to_window_and_stats(spread_window, stats, spread_pct);
             }
 
-            // 스프레드 윈도우에 push
-            self.spread_pct_windows
-                .get_mut(coin)
-                .ok_or_else(|| StrategyError::Config(format!("unknown coin: {coin}")))?
-                .push(spread_pct);
+            // 단기 윈도우 + stats push (방어적: 없으면 skip)
+            if let (Some(short_window), Some(short_stats)) = (
+                self.short_spread_windows.get_mut(coin),
+                self.short_spread_stats.get_mut(coin),
+            ) {
+                push_to_window_and_stats(short_window, short_stats, spread_pct);
+            }
         } else {
             // 2개 입력 중 일부 누락으로 스프레드 미계산
             trace!(
@@ -366,6 +498,20 @@ impl SpreadCalculator {
             return None;
         }
         let stats = self.spread_stats.get(coin)?;
+        Some((stats.mean(), stats.stddev()))
+    }
+
+    /// 단기 윈도우(60분)의 (mean, stddev)를 반환합니다.
+    ///
+    /// 윈도우 데이터가 `SHORT_WINDOW_SIZE`(60)개 미만이면 `None` 반환.
+    /// 세션 시작 후 최초 60분간은 항상 `None`을 반환하므로,
+    /// regime change 감지는 장기 stddev로 fallback됩니다.
+    pub fn cached_short_stats(&self, coin: &str) -> Option<(f64, f64)> {
+        let window = self.short_spread_windows.get(coin)?;
+        if !window.is_ready() {
+            return None;
+        }
+        let stats = self.short_spread_stats.get(coin)?;
         Some((stats.mean(), stats.stddev()))
     }
 
@@ -843,5 +989,129 @@ mod tests {
         stats.push(42.0, None);
         assert!((stats.mean() - 42.0).abs() < 1e-10);
         assert!((stats.stddev() - 0.0).abs() < 1e-10);
+    }
+
+    // --- WelfordStats 테스트 ---
+
+    #[test]
+    fn test_welford_stats_basic() {
+        let mut stats = WelfordStats::new();
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        for v in &values {
+            stats.push(*v, None);
+        }
+        let deque: VecDeque<f64> = values.into_iter().collect();
+        let expected_mean = statistics::mean(&deque);
+        let expected_stddev = statistics::stddev(&deque, expected_mean);
+        assert!((stats.mean() - expected_mean).abs() < 1e-10);
+        assert!((stats.stddev() - expected_stddev).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_welford_stats_rebuild() {
+        let data = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+        let mut stats = WelfordStats::new();
+        stats.rebuild(&data);
+
+        let mut fresh = WelfordStats::new();
+        for &v in &data {
+            fresh.push(v, None);
+        }
+        assert!((stats.mean() - fresh.mean()).abs() < 1e-10);
+        assert!((stats.stddev() - fresh.stddev()).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_welford_matches_incremental() {
+        // 두 알고리즘의 결과가 일치하는지 확인 (population stddev)
+        let mut welford = WelfordStats::new();
+        let mut incremental = IncrementalStats::new();
+        let values = vec![2.5, 3.7, 1.2, 4.8, 0.9, 3.3, 2.1];
+        for &v in &values {
+            welford.push(v, None);
+            incremental.push(v, None);
+        }
+        assert!(
+            (welford.mean() - incremental.mean()).abs() < 1e-10,
+            "mean 불일치: welford={}, incremental={}",
+            welford.mean(),
+            incremental.mean()
+        );
+        assert!(
+            (welford.stddev() - incremental.stddev()).abs() < 1e-10,
+            "stddev 불일치: welford={}, incremental={}",
+            welford.stddev(),
+            incremental.stddev()
+        );
+    }
+
+    #[test]
+    fn test_welford_rebuild_after_pop() {
+        let mut window = CandleWindow::new(3);
+        let mut stats = WelfordStats::new();
+        // 5개 값 push, 윈도우는 마지막 3개만 유지
+        for v in [10.0, 20.0, 30.0, 40.0, 50.0] {
+            push_to_window_and_stats(&mut window, &mut stats, v);
+        }
+        // 윈도우: [30, 40, 50]
+        let data: Vec<f64> = window.data().iter().copied().collect();
+        assert_eq!(data, vec![30.0, 40.0, 50.0]);
+        let expected_mean = 40.0;
+        assert!((stats.mean() - expected_mean).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cached_short_stats_not_ready() {
+        let coins = vec!["BTC".to_string()];
+        let mut calc = SpreadCalculator::new(&coins, 1440);
+        // 60개 미만이면 None
+        for i in 0..59 {
+            let ts = Utc::now() + chrono::Duration::minutes(i);
+            calc.update(
+                "BTC",
+                ts,
+                Some(dec(138_000_000 + i as i64 * 1000, 0)),
+                1380.0,
+                Some(dec(100_000 + i * 10, 0)),
+            )
+            .unwrap();
+        }
+        assert!(calc.cached_short_stats("BTC").is_none());
+    }
+
+    #[test]
+    fn test_cached_short_stats_ready() {
+        let coins = vec!["BTC".to_string()];
+        let mut calc = SpreadCalculator::new(&coins, 1440);
+        for i in 0..60 {
+            let ts = Utc::now() + chrono::Duration::minutes(i);
+            calc.update(
+                "BTC",
+                ts,
+                Some(dec(138_000_000 + i as i64 * 1000, 0)),
+                1380.0,
+                Some(dec(100_000 + i * 10, 0)),
+            )
+            .unwrap();
+        }
+        let stats = calc.cached_short_stats("BTC");
+        assert!(stats.is_some(), "60개 push 후 Some이어야 함");
+    }
+
+    #[test]
+    fn test_short_window_remove_coin() {
+        let coins = vec!["BTC".to_string()];
+        let mut calc = SpreadCalculator::new(&coins, 1440);
+        assert!(calc.short_spread_windows.contains_key("BTC"));
+        calc.remove_coin("BTC");
+        assert!(!calc.short_spread_windows.contains_key("BTC"));
+    }
+
+    #[test]
+    fn test_short_window_add_coin() {
+        let mut calc = SpreadCalculator::new(&[], 1440);
+        calc.add_coin("ETH");
+        assert!(calc.short_spread_windows.contains_key("ETH"));
+        assert!(calc.short_spread_stats.contains_key("ETH"));
     }
 }

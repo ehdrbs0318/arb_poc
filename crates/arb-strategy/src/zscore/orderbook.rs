@@ -154,6 +154,12 @@ impl ObCacheData {
             .map(|cached| cached.fetched_at.elapsed().as_secs() < max_age_sec)
             .unwrap_or(false)
     }
+
+    /// 코인 관련 캐시를 양쪽 거래소에서 제거합니다.
+    pub fn remove_coin(&mut self, coin: &str) {
+        self.upbit.remove(coin);
+        self.bybit.remove(coin);
+    }
 }
 
 impl Default for ObCacheData {
@@ -210,6 +216,12 @@ impl ComputingFlags {
         let mut flags = self.inner.lock().unwrap();
         flags.insert((exchange, coin.to_string()), false);
         debug!(exchange = ?exchange, coin = %coin, "computing flag 해제");
+    }
+
+    /// 특정 코인의 computing flag를 양쪽 거래소에서 제거합니다.
+    pub fn remove_coin(&self, coin: &str) {
+        let mut flags = self.inner.lock().unwrap();
+        flags.retain(|k, _| k.1 != coin);
     }
 
     /// computing flag 상태를 조회합니다 (테스트/디버깅용).

@@ -77,6 +77,11 @@ reselect_interval_min = 10
 # 1시간 최소 거래량 필터 (USDT, 기본값: 50000)
 min_volume_1h_usdt = 50000.0
 
+# 코인 선택 시 최대 스프레드 stddev (기본값: 0.5)
+# stddev가 이 값을 초과하면 z-score 기반 진입이 어려워 자동 제외
+# 0.0이면 필터 비활성화
+max_spread_stddev = 0.5
+
 # 제외 코인 블랙리스트 (스테이블코인은 자동 제외)
 blacklist = []
 

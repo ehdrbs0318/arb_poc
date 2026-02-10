@@ -38,6 +38,12 @@ pub struct MonitoringCounters {
     pub fallback_no_rounding_count: u64,
     /// 잔여 qty < min_order_qty로 전량 전환 시 safe volume 초과한 청산 횟수.
     pub safe_volume_exceeded_close_count: u64,
+    /// stddev 필터로 실제 분류 변경된 코인 수 (초기 선택 + 재선택 + 런타임).
+    pub coin_rejected_spread_stddev_count: u64,
+    /// regime change 감지 횟수 (cooldown으로 무시된 것 제외).
+    pub regime_change_detected_count: u64,
+    /// cooldown에 의해 억제된 regime change 횟수.
+    pub regime_change_suppressed_by_cooldown_count: u64,
 }
 
 /// 일별 PnL 기록.
@@ -135,6 +141,12 @@ pub struct SessionSummary {
     pub fallback_no_rounding_count: u64,
     /// safe volume 초과 전량 청산 횟수.
     pub safe_volume_exceeded_close_count: u64,
+    /// stddev 필터로 분류 변경된 코인 수.
+    pub coin_rejected_spread_stddev_count: u64,
+    /// regime change 감지 횟수.
+    pub regime_change_detected_count: u64,
+    /// cooldown으로 억제된 regime change 횟수.
+    pub regime_change_suppressed_by_cooldown_count: u64,
 }
 
 impl SessionSummary {
@@ -269,6 +281,10 @@ impl SessionSummary {
             entry_rejected_rounding_pnl_count: counters.entry_rejected_rounding_pnl_count,
             fallback_no_rounding_count: counters.fallback_no_rounding_count,
             safe_volume_exceeded_close_count: counters.safe_volume_exceeded_close_count,
+            coin_rejected_spread_stddev_count: counters.coin_rejected_spread_stddev_count,
+            regime_change_detected_count: counters.regime_change_detected_count,
+            regime_change_suppressed_by_cooldown_count: counters
+                .regime_change_suppressed_by_cooldown_count,
         }
     }
 
@@ -381,6 +397,18 @@ impl SessionSummary {
         s.push_str(&format!(
             "safe volume 초과 청산: {}건\n",
             format_number(self.safe_volume_exceeded_close_count)
+        ));
+        s.push_str(&format!(
+            "stddev 필터 제외: {}건\n",
+            format_number(self.coin_rejected_spread_stddev_count)
+        ));
+        s.push_str(&format!(
+            "regime change 감지: {}건\n",
+            format_number(self.regime_change_detected_count)
+        ));
+        s.push_str(&format!(
+            "regime change 억제 (cooldown): {}건\n",
+            format_number(self.regime_change_suppressed_by_cooldown_count)
         ));
 
         s

@@ -207,6 +207,91 @@ struct ReselectionResult {
     removed_coins: Vec<String>,
 }
 
+/// Regime change 감지 배수.
+/// max_spread_stddev * 이 값을 초과하면 코인 제거 대상.
+const REGIME_CHANGE_MULTIPLIER: f64 = 1.5;
+
+/// finalize_and_process의 regime change 감지 결과.
+struct RegimeChangeResult {
+    /// 포지션 없어서 즉시 제거할 코인.
+    immediate_remove: Vec<String>,
+    /// 포지션 있어서 dropped_at에 등록할 코인.
+    dropped_coins: Vec<String>,
+}
+
+/// 워밍업 후 stddev 기준으로 코인을 필터링합니다.
+///
+/// # 인자
+/// * `coin_stats` - 코인별 (mean, stddev). None이면 워밍업 실패로 제거.
+/// * `max_spread_stddev` - stddev 상한 (0.0이면 필터링 없이 stddev 오름차순 max_coins개 반환)
+/// * `max_coins` - 최대 코인 수
+///
+/// # 반환값
+/// (유지 코인, 제거 코인)
+fn filter_coins_by_stddev(
+    coin_stats: &[(String, Option<(f64, f64)>)],
+    max_spread_stddev: f64,
+    max_coins: usize,
+) -> (Vec<String>, Vec<String>) {
+    // cached_stats=None인 코인 제거
+    let mut valid: Vec<(String, f64)> = coin_stats
+        .iter()
+        .filter_map(|(coin, stats)| stats.map(|(_, stddev)| (coin.clone(), stddev)))
+        .collect();
+
+    // None인 코인을 제거 목록에 추가
+    let mut removed: Vec<String> = coin_stats
+        .iter()
+        .filter(|(_, stats)| stats.is_none())
+        .map(|(coin, _)| coin.clone())
+        .collect();
+
+    // stddev 오름차순 정렬
+    valid.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    if max_spread_stddev == 0.0 {
+        // 필터링 없이 stddev 오름차순 max_coins개만 반환
+        let kept: Vec<String> = valid.iter().take(max_coins).map(|(c, _)| c.clone()).collect();
+        let excess: Vec<String> = valid.iter().skip(max_coins).map(|(c, _)| c.clone()).collect();
+        removed.extend(excess);
+        return (kept, removed);
+    }
+
+    // stddev 필터 적용
+    let mut passed: Vec<(String, f64)> = Vec::new();
+    let mut failed: Vec<(String, f64)> = Vec::new();
+
+    for (coin, stddev) in &valid {
+        if *stddev <= max_spread_stddev {
+            passed.push((coin.clone(), *stddev));
+        } else {
+            failed.push((coin.clone(), *stddev));
+        }
+    }
+
+    if passed.is_empty() {
+        // Fallback: 전체 초과 시 stddev 오름차순 max_coins개 강제 선택
+        warn!(
+            max_spread_stddev = max_spread_stddev,
+            total_coins = valid.len(),
+            "모든 코인 stddev 초과, fallback: stddev 오름차순 {}개 강제 선택",
+            max_coins
+        );
+        let kept: Vec<String> = valid.iter().take(max_coins).map(|(c, _)| c.clone()).collect();
+        let excess: Vec<String> = valid.iter().skip(max_coins).map(|(c, _)| c.clone()).collect();
+        removed.extend(excess);
+        return (kept, removed);
+    }
+
+    // 통과한 코인에서 max_coins개 선택
+    let kept: Vec<String> = passed.iter().take(max_coins).map(|(c, _)| c.clone()).collect();
+    let excess: Vec<String> = passed.iter().skip(max_coins).map(|(c, _)| c.clone()).collect();
+    removed.extend(excess);
+    removed.extend(failed.iter().map(|(c, _)| c.clone()));
+
+    (kept, removed)
+}
+
 /// 실시간 Z-Score 모니터.
 ///
 /// `tokio::spawn`으로 REST 호출을 분리하기 위해 필드를 Arc로 래핑합니다.
@@ -290,9 +375,11 @@ where
             info!("자동 코인 선택 활성화: 초기 코인 선택 중...");
             let selector = CoinSelector::new(self.upbit.as_ref(), self.bybit.as_ref());
             let usd_krw_for_select = self.forex_cache.get_cached_rate().unwrap_or(0.0);
+            // 확대 선택: stddev 필터 + pruning 여유분 확보
+            let expanded_count = self.config.max_coins * 2;
             let candidates = selector
                 .select(
-                    self.config.max_coins,
+                    expanded_count,
                     self.config.min_volume_1h_usdt,
                     &self.config.blacklist,
                     usd_krw_for_select,
@@ -303,9 +390,12 @@ where
                 warn!("자동 선택 결과 후보 코인이 없습니다. 볼륨 조건을 확인하세요.");
             }
 
-            let coins: Vec<String> = candidates.iter().map(|c| c.coin.clone()).collect();
-            info!(coins = ?coins, "초기 코인 자동 선택 완료");
-            coins
+            let mut expanded_coins: Vec<String> =
+                candidates.iter().map(|c| c.coin.clone()).collect();
+            expanded_coins.sort();
+            expanded_coins.dedup();
+            info!(coins = ?expanded_coins, count = expanded_coins.len(), "확대 후보 코인 선택 완료");
+            expanded_coins
         } else {
             self.config.coins.clone()
         };
@@ -313,23 +403,95 @@ where
         // 시작 시점 환율 기록
         let usd_krw_start = self.forex_cache.get_cached_rate().unwrap_or(0.0);
 
-        // InstrumentCache 초기화 (Bybit instrument info 로드)
-        let instrument_cache = Arc::new(std::sync::RwLock::new(InstrumentCache::default()));
-        fetch_instruments(self.bybit.as_ref(), &instrument_cache, &current_coins).await;
-
         info!("실시간 모니터링 시작: 워밍업 데이터 로드 중...");
 
         // 2. 워밍업: REST API로 캔들 사전 로드 (로컬 변수)
-        let mut spread_calc_local = SpreadCalculator::new(&current_coins, self.config.window_size);
-        Self::warmup(
-            self.upbit.as_ref(),
-            self.bybit.as_ref(),
-            &self.config,
-            &self.forex_cache,
-            &current_coins,
-            &mut spread_calc_local,
-        )
-        .await?;
+        let mut spread_calc_local = if self.config.auto_select {
+            // auto_select: 빈 상태로 생성 (warmup_single_coin_standalone이 add_coin 호출)
+            let mut sc = SpreadCalculator::new(&[], self.config.window_size);
+            for coin in &current_coins {
+                if let Err(e) = Self::warmup_single_coin_standalone(
+                    self.upbit.as_ref(),
+                    self.bybit.as_ref(),
+                    &self.config,
+                    &self.forex_cache,
+                    coin,
+                    &mut sc,
+                )
+                .await
+                {
+                    warn!(coin = coin.as_str(), error = %e, "워밍업 실패, 해당 코인 스킵");
+                    sc.remove_coin(coin);
+                }
+            }
+            sc
+        } else {
+            // 수동 선택: 기존 warmup 유지 (실패 시 즉시 에러)
+            let mut sc = SpreadCalculator::new(&current_coins, self.config.window_size);
+            Self::warmup(
+                self.upbit.as_ref(),
+                self.bybit.as_ref(),
+                &self.config,
+                &self.forex_cache,
+                &current_coins,
+                &mut sc,
+            )
+            .await?;
+            sc
+        };
+
+        // auto_select: stddev 필터링
+        if self.config.auto_select && self.config.max_spread_stddev >= 0.0 {
+            let coin_stats: Vec<(String, Option<(f64, f64)>)> = current_coins
+                .iter()
+                .map(|c| (c.clone(), spread_calc_local.cached_stats(c)))
+                .collect();
+
+            let (kept, removed) = filter_coins_by_stddev(
+                &coin_stats,
+                self.config.max_spread_stddev,
+                self.config.max_coins,
+            );
+
+            if kept.is_empty() {
+                let all_none = coin_stats.iter().all(|(_, s)| s.is_none());
+                let msg = if all_none {
+                    "모든 후보 코인의 워밍업이 실패했습니다 (REST API 장애 가능)"
+                } else {
+                    "워밍업은 성공했지만 모든 코인의 spread stddev가 임계값을 초과합니다"
+                };
+                return Err(StrategyError::Config(msg.to_string()));
+            }
+
+            // 제거된 코인 정리
+            for coin in &removed {
+                spread_calc_local.remove_coin(coin);
+                debug!(coin = coin.as_str(), "stddev 필터: 코인 제거");
+            }
+
+            // stddev 로그
+            for coin in &kept {
+                if let Some((_, stddev)) = spread_calc_local.cached_stats(coin) {
+                    info!(
+                        coin = coin.as_str(),
+                        stddev = stddev,
+                        max_spread_stddev = self.config.max_spread_stddev,
+                        "stddev 필터 통과"
+                    );
+                }
+            }
+
+            current_coins = kept;
+            info!(
+                coins = ?current_coins,
+                removed_count = removed.len(),
+                "stddev 필터 적용 후 최종 코인 목록"
+            );
+        }
+
+        // InstrumentCache 초기화 (필터 후 코인만)
+        let instrument_cache = Arc::new(std::sync::RwLock::new(InstrumentCache::default()));
+        fetch_instruments(self.bybit.as_ref(), &instrument_cache, &current_coins).await;
 
         // 워밍업 완료 후 요약 레코드 생성 및 기록
         let mut minute_records: Vec<MinuteRecord> = Vec::new();
@@ -341,7 +503,6 @@ where
                 &self.forex_cache,
             );
             minute_records.extend(warmup_records.iter().cloned());
-            // 워밍업 기록은 Arc 래핑 후에 session_writer에 기록
         }
 
         // OrderBookCache 로컬 변수로 프리페치
@@ -433,6 +594,11 @@ where
         let (reselect_tx, mut reselect_rx) = tokio::sync::mpsc::channel::<ReselectionResult>(1);
         let mut reselecting = false;
 
+        // regime change cooldown 상태
+        let mut regime_cooldown_until: Option<DateTime<Utc>> = None;
+        let mut consecutive_regime_changes: u32 = 0;
+        const MAX_COOLDOWN_MIN: u64 = 60;
+
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => {
@@ -454,6 +620,7 @@ where
                         &position_mgr,
                         &trades,
                         &instrument_cache,
+                        &counters,
                     ).await;
                     // check_tick_signal을 tokio::spawn으로 분리
                     Self::maybe_spawn_tick_signal(
@@ -488,6 +655,7 @@ where
                         &position_mgr,
                         &trades,
                         &instrument_cache,
+                        &counters,
                     ).await;
                     // check_tick_signal을 tokio::spawn으로 분리
                     Self::maybe_spawn_tick_signal(
@@ -509,8 +677,8 @@ where
                 }
                 _ = minute_timer.tick() => {
                     let now = Utc::now();
-                    if candle_builder.is_new_minute(now)
-                        && let Err(e) = Self::finalize_and_process(
+                    if candle_builder.is_new_minute(now) {
+                        match Self::finalize_and_process(
                             &self.config,
                             &mut candle_builder,
                             &spread_calc,
@@ -522,9 +690,89 @@ where
                             &session_writer,
                             &mut minute_records,
                             &instrument_cache,
-                        ).await
-                    {
-                        warn!(error = %e, "finalize_and_process 실패");
+                            &counters,
+                        ).await {
+                            Ok(Some(regime)) => {
+                                let in_cooldown = regime_cooldown_until
+                                    .map(|until| Utc::now() < until)
+                                    .unwrap_or(false);
+                                if in_cooldown {
+                                    debug!("regime change 감지되었으나 cooldown 중, 무시");
+                                    counters.lock().unwrap()
+                                        .regime_change_suppressed_by_cooldown_count += 1;
+                                } else {
+                                    for coin in &regime.immediate_remove {
+                                        {
+                                            let mut sc = spread_calc.write().await;
+                                            sc.remove_coin(coin);
+                                        }
+                                        {
+                                            let mut data = ob_cache.data.write().await;
+                                            data.remove_coin(coin);
+                                        }
+                                        ob_cache.computing.remove_coin(coin);
+                                        let upbit_market = format!("KRW-{coin}");
+                                        let bybit_market = format!("{coin}USDT");
+                                        self.upbit.unsubscribe_markets(&[&upbit_market]).await.ok();
+                                        self.bybit.unsubscribe_markets(&[&bybit_market]).await.ok();
+                                        current_coins.retain(|c| c != coin);
+                                        info!(coin = coin.as_str(), "regime change로 코인 즉시 제거");
+                                    }
+                                    for coin in &regime.dropped_coins {
+                                        dropped_at.entry(coin.clone()).or_insert(Utc::now());
+                                    }
+                                    counters.lock().unwrap().regime_change_detected_count += 1;
+                                    if current_coins.len() < self.config.max_coins
+                                        && self.config.auto_select
+                                        && !reselecting
+                                    {
+                                        reselecting = true;
+                                        consecutive_regime_changes += 1;
+                                        let backoff_min = (self.config.reselect_interval_min)
+                                            .saturating_mul(
+                                                1u64 << (consecutive_regime_changes - 1).min(6),
+                                            )
+                                            .min(MAX_COOLDOWN_MIN);
+                                        regime_cooldown_until = Some(
+                                            Utc::now()
+                                                + chrono::Duration::minutes(backoff_min as i64),
+                                        );
+                                        info!(
+                                            consecutive = consecutive_regime_changes,
+                                            cooldown_min = backoff_min,
+                                            "regime change → 즉시 재선택 (지수적 백오프 cooldown)"
+                                        );
+                                        Self::spawn_reselection(
+                                            Arc::clone(&self.config),
+                                            Arc::clone(&self.upbit),
+                                            Arc::clone(&self.bybit),
+                                            Arc::clone(&self.forex_cache),
+                                            Arc::clone(&spread_calc),
+                                            ob_cache.clone(),
+                                            Arc::clone(&counters),
+                                            Arc::clone(&position_mgr),
+                                            current_coins.clone(),
+                                            dropped_at.clone(),
+                                            reselect_tx.clone(),
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                if consecutive_regime_changes > 0 {
+                                    let cooldown_expired = regime_cooldown_until
+                                        .map(|until| Utc::now() >= until)
+                                        .unwrap_or(true);
+                                    if cooldown_expired {
+                                        consecutive_regime_changes = 0;
+                                        regime_cooldown_until = None;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "finalize_and_process 실패");
+                            }
+                        }
                     }
 
                     // TTL 만료 포지션 체크 (모든 코인)
@@ -957,6 +1205,7 @@ where
         position_mgr: &Arc<tokio::sync::Mutex<PositionManager>>,
         trades: &Arc<tokio::sync::Mutex<Vec<ClosedPosition>>>,
         instrument_cache: &Arc<std::sync::RwLock<InstrumentCache>>,
+        counters: &Arc<std::sync::Mutex<MonitoringCounters>>,
     ) {
         let event_ts = match event {
             MarketEvent::Trade { timestamp, .. } => *timestamp,
@@ -971,6 +1220,7 @@ where
                     new_minute = %truncate_to_minute(event_ts),
                     "분 경계 변경 감지: 이전 분 완결 처리"
                 );
+                // regime change 결과는 update_candle_and_spread 경로에서 무시
                 if let Err(e) = Self::finalize_and_process(
                     config,
                     candle_builder,
@@ -983,6 +1233,7 @@ where
                     session_writer,
                     minute_records,
                     instrument_cache,
+                    counters,
                 )
                 .await
                 {
@@ -1815,6 +2066,7 @@ where
     ///
     /// 시그널 평가는 틱에서 처리하므로, 여기서는 SpreadCalculator 업데이트와
     /// Liquidation 체크만 수행합니다.
+    /// regime change 감지 시 `Some(RegimeChangeResult)` 반환.
     #[allow(clippy::too_many_arguments)]
     async fn finalize_and_process(
         config: &ZScoreConfig,
@@ -1828,7 +2080,8 @@ where
         session_writer: &tokio::sync::Mutex<Option<SessionWriter>>,
         minute_records: &mut Vec<MinuteRecord>,
         instrument_cache: &Arc<std::sync::RwLock<InstrumentCache>>,
-    ) -> Result<(), StrategyError> {
+        counters: &std::sync::Mutex<MonitoringCounters>,
+    ) -> Result<Option<RegimeChangeResult>, StrategyError> {
         let ts = candle_builder
             .current_minute
             .unwrap_or_else(|| truncate_to_minute(new_minute_ts));
@@ -2019,8 +2272,59 @@ where
             }
         }
 
+        // regime change 감지
+        let mut regime_result: Option<RegimeChangeResult> = None;
+        if config.max_spread_stddev > 0.0 && config.auto_select {
+            let regime_threshold = config.max_spread_stddev * REGIME_CHANGE_MULTIPLIER;
+
+            let stddev_snapshot: Vec<(String, f64)> = {
+                let sc = spread_calc.read().await;
+                current_coins
+                    .iter()
+                    .filter_map(|coin| {
+                        let stddev = sc
+                            .cached_short_stats(coin)
+                            .or_else(|| sc.cached_stats(coin))
+                            .map(|(_, s)| s);
+                        stddev
+                            .filter(|s| *s > regime_threshold)
+                            .map(|s| (coin.clone(), s))
+                    })
+                    .collect()
+            };
+
+            if !stddev_snapshot.is_empty() {
+                let mut immediate_remove = Vec::new();
+                let mut dropped_coins = Vec::new();
+
+                let pm = position_mgr.lock().await;
+                for (coin, stddev) in &stddev_snapshot {
+                    warn!(
+                        coin = coin.as_str(),
+                        stddev = stddev,
+                        threshold = regime_threshold,
+                        "regime change 감지: stddev 급등"
+                    );
+                    if pm.has_position(coin) {
+                        dropped_coins.push(coin.clone());
+                    } else {
+                        immediate_remove.push(coin.clone());
+                    }
+                }
+                drop(pm);
+
+                counters.lock().unwrap().coin_rejected_spread_stddev_count +=
+                    stddev_snapshot.len() as u64;
+
+                regime_result = Some(RegimeChangeResult {
+                    immediate_remove,
+                    dropped_coins,
+                });
+            }
+        }
+
         candle_builder.start_new_minute(new_minute_ts);
-        Ok(())
+        Ok(regime_result)
     }
 
     /// 재선택을 tokio::spawn으로 분리합니다.
@@ -2044,7 +2348,7 @@ where
 
             let new_candidates = match selector
                 .select(
-                    config.max_coins,
+                    config.max_coins * 2,
                     config.min_volume_1h_usdt,
                     &config.blacklist,
                     usd_krw_for_reselect,
@@ -2066,10 +2370,48 @@ where
                 }
             };
 
-            let diff = {
+            let mut diff = {
                 let pm = position_mgr.lock().await;
                 diff_coins(&current_coins_snapshot, &new_candidates, &pm)
             };
+
+            // 기존 코인 stddev 체크: spread_calc read → 값 복사 → drop (lock order 준수)
+            if config.max_spread_stddev > 0.0 {
+                let stddev_snapshot: Vec<(String, f64)> = {
+                    let sc = spread_calc.read().await;
+                    current_coins_snapshot
+                        .iter()
+                        .filter_map(|coin| {
+                            sc.cached_stats(coin)
+                                .filter(|(_, s)| *s > config.max_spread_stddev)
+                                .map(|(_, s)| (coin.clone(), s))
+                        })
+                        .collect()
+                }; // sc drop
+
+                if !stddev_snapshot.is_empty() {
+                    let pm = position_mgr.lock().await;
+                    let mut added_count = 0u64;
+                    for (coin, _stddev) in &stddev_snapshot {
+                        if pm.has_position(coin) {
+                            if !diff.to_keep_with_position.contains(coin) {
+                                diff.to_keep_with_position.push(coin.clone());
+                                added_count += 1;
+                            }
+                        } else if !diff.to_remove.contains(coin) {
+                            diff.to_remove.push(coin.clone());
+                            added_count += 1;
+                        }
+                    }
+                    drop(pm);
+                    // "stddev 초과로 실제 분류 변경된 횟수"만 카운트
+                    counters.lock().unwrap().coin_rejected_spread_stddev_count += added_count;
+                }
+
+                // 교집합 코인이 stddev 초과로 to_remove에 추가된 경우,
+                // diff.to_add에 같은 코인이 있으면 제거 (제거 후 재추가 방지)
+                diff.to_add.retain(|coin| !diff.to_remove.contains(coin));
+            }
 
             info!(
                 to_add = ?diff.to_add,
@@ -2175,6 +2517,29 @@ where
                             counters.lock().unwrap().orderbook_fetch_count += 1;
                         }
 
+                        // 새 코인 stddev 체크 (deadlock 방지: read → drop → write)
+                        if config.max_spread_stddev > 0.0 {
+                            let exceeds = {
+                                let sc = spread_calc.read().await;
+                                sc.cached_stats(coin)
+                                    .map(|(_, stddev)| stddev > config.max_spread_stddev)
+                                    .unwrap_or(false)
+                            }; // sc drop
+                            if exceeds {
+                                warn!(
+                                    coin = coin.as_str(),
+                                    max = config.max_spread_stddev,
+                                    "재선택 코인 stddev 초과, 건너뜀"
+                                );
+                                spread_calc.write().await.remove_coin(coin);
+                                counters
+                                    .lock()
+                                    .unwrap()
+                                    .coin_rejected_spread_stddev_count += 1;
+                                continue;
+                            }
+                        }
+
                         info!(coin = coin.as_str(), "코인 추가 완료");
                     }
                     Err(e) => {
@@ -2189,14 +2554,58 @@ where
                 }
             }
 
-            // current_coins 업데이트: SpreadCalculator에 실제 존재하는 코인만
+            // 최종 코인 수집 전 초과 코인 pruning
             let new_coins: Vec<String> = {
+                let sc = spread_calc.read().await;
+                let mut active: Vec<(String, f64)> = sc
+                    .active_coins()
+                    .iter()
+                    .filter_map(|coin| {
+                        sc.cached_stats(coin)
+                            .map(|(_, stddev)| (coin.to_string(), stddev))
+                    })
+                    .collect();
+                // stddev 오름차순 정렬
+                active.sort_by(|a, b| {
+                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                active.into_iter().map(|(coin, _)| coin).collect()
+            }; // sc drop
+
+            if new_coins.len() > config.max_coins {
+                let excess: Vec<String> = new_coins[config.max_coins..].to_vec();
+
+                // write lock을 한 번에 획득하여 일괄 제거 (lock 경합 최소화)
+                {
+                    let mut sc = spread_calc.write().await;
+                    for coin in &excess {
+                        sc.remove_coin(coin);
+                    }
+                }
+                {
+                    let mut data = ob_cache.data.write().await;
+                    for coin in &excess {
+                        data.remove_coin(coin);
+                    }
+                }
+
+                // WebSocket 구독 해제 + removed_coins 등록
+                for coin in &excess {
+                    let upbit_market = format!("KRW-{coin}");
+                    let bybit_market = format!("{coin}USDT");
+                    upbit.unsubscribe_markets(&[&upbit_market]).await.ok();
+                    bybit.unsubscribe_markets(&[&bybit_market]).await.ok();
+                    removed_coins.push(coin.clone());
+                }
+            }
+
+            let final_coins: Vec<String> = {
                 let sc = spread_calc.read().await;
                 sc.active_coins().iter().map(|s| s.to_string()).collect()
             };
 
             let result = ReselectionResult {
-                new_coins,
+                new_coins: final_coins,
                 dropped_at_updates,
                 removed_coins,
             };
@@ -2930,5 +3339,106 @@ mod tests {
         ) -> Result<arb_exchange::InstrumentInfoResponse, arb_exchange::ExchangeError> {
             unimplemented!()
         }
+    }
+
+    // --- filter_coins_by_stddev 테스트 ---
+
+    #[test]
+    fn test_filter_coins_by_stddev_basic() {
+        let coin_stats = vec![
+            ("BTC".to_string(), Some((0.0, 0.1))),
+            ("ETH".to_string(), Some((0.0, 0.3))),
+            ("XRP".to_string(), Some((0.0, 0.6))),
+        ];
+        let (kept, removed) = filter_coins_by_stddev(&coin_stats, 0.5, 5);
+        assert_eq!(kept, vec!["BTC", "ETH"]);
+        assert_eq!(removed, vec!["XRP"]);
+    }
+
+    #[test]
+    fn test_filter_coins_by_stddev_max_coins_limit() {
+        let coin_stats = vec![
+            ("BTC".to_string(), Some((0.0, 0.1))),
+            ("ETH".to_string(), Some((0.0, 0.2))),
+            ("XRP".to_string(), Some((0.0, 0.3))),
+        ];
+        // 전부 통과하지만 max_coins=2
+        let (kept, removed) = filter_coins_by_stddev(&coin_stats, 0.5, 2);
+        assert_eq!(kept, vec!["BTC", "ETH"]);
+        assert_eq!(removed, vec!["XRP"]);
+    }
+
+    #[test]
+    fn test_filter_coins_by_stddev_none_stats_removed() {
+        let coin_stats = vec![
+            ("BTC".to_string(), Some((0.0, 0.1))),
+            ("ETH".to_string(), None),
+            ("XRP".to_string(), Some((0.0, 0.2))),
+        ];
+        let (kept, removed) = filter_coins_by_stddev(&coin_stats, 0.5, 5);
+        assert_eq!(kept, vec!["BTC", "XRP"]);
+        assert!(removed.contains(&"ETH".to_string()));
+    }
+
+    #[test]
+    fn test_filter_coins_by_stddev_fallback_all_exceed() {
+        let coin_stats = vec![
+            ("BTC".to_string(), Some((0.0, 1.0))),
+            ("ETH".to_string(), Some((0.0, 2.0))),
+            ("XRP".to_string(), Some((0.0, 3.0))),
+        ];
+        // 전부 0.5 초과 → fallback: stddev 오름차순 2개
+        let (kept, removed) = filter_coins_by_stddev(&coin_stats, 0.5, 2);
+        assert_eq!(kept, vec!["BTC", "ETH"]);
+        assert_eq!(removed, vec!["XRP"]);
+    }
+
+    #[test]
+    fn test_filter_coins_by_stddev_zero_disables_filter() {
+        let coin_stats = vec![
+            ("BTC".to_string(), Some((0.0, 5.0))),
+            ("ETH".to_string(), Some((0.0, 0.1))),
+            ("XRP".to_string(), Some((0.0, 2.0))),
+        ];
+        // max_spread_stddev=0.0이면 필터링 없이 stddev 오름차순 max_coins개
+        let (kept, removed) = filter_coins_by_stddev(&coin_stats, 0.0, 2);
+        // stddev 오름차순: ETH(0.1), XRP(2.0), BTC(5.0)
+        assert_eq!(kept, vec!["ETH", "XRP"]);
+        assert_eq!(removed, vec!["BTC"]);
+    }
+
+    #[test]
+    fn test_filter_coins_by_stddev_all_none() {
+        let coin_stats = vec![
+            ("BTC".to_string(), None),
+            ("ETH".to_string(), None),
+        ];
+        let (kept, removed) = filter_coins_by_stddev(&coin_stats, 0.5, 5);
+        assert!(kept.is_empty());
+        assert_eq!(removed.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_coins_by_stddev_sorted_by_stddev() {
+        let coin_stats = vec![
+            ("C".to_string(), Some((0.0, 0.4))),
+            ("A".to_string(), Some((0.0, 0.1))),
+            ("B".to_string(), Some((0.0, 0.2))),
+        ];
+        let (kept, _removed) = filter_coins_by_stddev(&coin_stats, 0.5, 5);
+        // stddev 오름차순: A(0.1), B(0.2), C(0.4)
+        assert_eq!(kept, vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn test_filter_coins_by_stddev_exact_threshold() {
+        let coin_stats = vec![
+            ("BTC".to_string(), Some((0.0, 0.5))),
+            ("ETH".to_string(), Some((0.0, 0.50001))),
+        ];
+        // 0.5 이하면 통과, 0.50001은 초과
+        let (kept, removed) = filter_coins_by_stddev(&coin_stats, 0.5, 5);
+        assert_eq!(kept, vec!["BTC"]);
+        assert_eq!(removed, vec!["ETH"]);
     }
 }

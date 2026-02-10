@@ -52,6 +52,10 @@ pub struct ZScoreConfig {
     pub reselect_interval_min: u64,
     /// 자동 선택 시 최소 1시간 거래량 (USDT 기준, 기본값: 1,000,000).
     pub min_volume_1h_usdt: Decimal,
+    /// 코인 선택 시 최대 스프레드 stddev (기본값: 0.5).
+    /// 워밍업 후 계산된 stddev가 이 값을 초과하는 코인은 자동 선택에서 제외.
+    /// 0.0이면 필터 비활성화.
+    pub max_spread_stddev: f64,
     /// 자동 선택에서 제외할 코인 블랙리스트.
     pub blacklist: Vec<String>,
     /// 포지션 TTL (시간 단위, 기본값: 24).
@@ -87,6 +91,7 @@ impl Default for ZScoreConfig {
             max_coins: 5,
             reselect_interval_min: 10,
             min_volume_1h_usdt: Decimal::new(50_000, 0),
+            max_spread_stddev: 0.5,
             blacklist: vec![],
             position_ttl_hours: 24,
             grace_period_hours: 4,
@@ -139,6 +144,14 @@ impl ZScoreConfig {
             return Err(StrategyError::Config(
                 "min_stddev_threshold must be positive".to_string(),
             ));
+        }
+        if self.max_spread_stddev < 0.0 {
+            return Err(StrategyError::Config(
+                "max_spread_stddev must be non-negative".to_string(),
+            ));
+        }
+        if !self.auto_select && self.max_spread_stddev > 0.0 {
+            warn!("max_spread_stddev는 auto_select=true일 때만 적용됩니다");
         }
         if self.grace_period_hours == 0 {
             return Err(StrategyError::Config(
@@ -236,6 +249,7 @@ struct RawZScoreConfig {
     max_coins: Option<usize>,
     reselect_interval_min: Option<u64>,
     min_volume_1h_usdt: Option<f64>,
+    max_spread_stddev: Option<f64>,
     blacklist: Option<Vec<String>>,
     position_ttl_hours: Option<u64>,
     grace_period_hours: Option<u64>,
@@ -263,6 +277,7 @@ impl Default for RawZScoreConfig {
             max_coins: None,
             reselect_interval_min: None,
             min_volume_1h_usdt: None,
+            max_spread_stddev: None,
             blacklist: None,
             position_ttl_hours: None,
             grace_period_hours: None,
@@ -299,6 +314,7 @@ impl From<RawZScoreConfig> for ZScoreConfig {
                 .min_volume_1h_usdt
                 .and_then(|v| Decimal::try_from(v).ok())
                 .unwrap_or(Decimal::new(50_000, 0)),
+            max_spread_stddev: raw.max_spread_stddev.unwrap_or(0.5),
             blacklist: raw.blacklist.unwrap_or_default(),
             position_ttl_hours: raw.position_ttl_hours.unwrap_or(24),
             grace_period_hours: raw.grace_period_hours.unwrap_or(4),
@@ -486,6 +502,55 @@ auto_select = true
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("max_coins"));
+    }
+
+    // --- max_spread_stddev 테스트 ---
+
+    #[test]
+    fn test_max_spread_stddev_default() {
+        let config = ZScoreConfig::default();
+        assert_eq!(config.max_spread_stddev, 0.5);
+    }
+
+    #[test]
+    fn test_max_spread_stddev_negative_invalid() {
+        let config = ZScoreConfig {
+            max_spread_stddev: -0.1,
+            ..ZScoreConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_max_spread_stddev_zero_disables() {
+        let config = ZScoreConfig {
+            max_spread_stddev: 0.0,
+            ..ZScoreConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_max_spread_stddev_from_toml() {
+        let toml = r#"
+[zscore]
+coins = ["BTC"]
+auto_select = true
+max_spread_stddev = 0.3
+"#;
+        let config = ZScoreConfig::from_toml_str(toml).unwrap();
+        assert_eq!(config.max_spread_stddev, 0.3);
+    }
+
+    #[test]
+    fn test_max_spread_stddev_toml_default() {
+        let toml = r#"
+[zscore]
+coins = ["BTC"]
+auto_select = true
+"#;
+        let config = ZScoreConfig::from_toml_str(toml).unwrap();
+        assert_eq!(config.max_spread_stddev, 0.5);
     }
 
     // --- OutputConfig 테스트 ---
