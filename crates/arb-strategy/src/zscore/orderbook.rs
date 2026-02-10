@@ -4,6 +4,7 @@
 //! 수익성을 검증하여 최대 안전 진입/청산 볼륨을 계산합니다.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use arb_exchange::OrderBook;
@@ -98,6 +99,161 @@ impl OrderBookCache {
 }
 
 impl Default for OrderBookCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 오더북 데이터 캐시 (데이터 전용).
+///
+/// 거래소별, 코인별 오더북 스냅샷을 보관합니다.
+/// `SharedObCache`에서 `tokio::sync::RwLock`으로 감싸 사용합니다.
+#[derive(Debug)]
+pub struct ObCacheData {
+    /// Upbit 오더북 캐시.
+    upbit: HashMap<String, CachedOrderBook>,
+    /// Bybit 오더북 캐시.
+    bybit: HashMap<String, CachedOrderBook>,
+}
+
+impl ObCacheData {
+    /// 새 ObCacheData를 생성합니다.
+    pub fn new() -> Self {
+        Self {
+            upbit: HashMap::new(),
+            bybit: HashMap::new(),
+        }
+    }
+
+    /// 오더북 캐시를 갱신합니다.
+    pub fn update(&mut self, exchange: Exchange, coin: &str, ob: OrderBook) {
+        let cached = CachedOrderBook {
+            orderbook: ob,
+            fetched_at: Instant::now(),
+        };
+        let map = match exchange {
+            Exchange::Upbit => &mut self.upbit,
+            Exchange::Bybit => &mut self.bybit,
+        };
+        map.insert(coin.to_string(), cached);
+        trace!(exchange = ?exchange, coin = %coin, "오더북 캐시 갱신");
+    }
+
+    /// 캐시된 오더북을 조회합니다.
+    pub fn get(&self, exchange: Exchange, coin: &str) -> Option<&CachedOrderBook> {
+        let map = match exchange {
+            Exchange::Upbit => &self.upbit,
+            Exchange::Bybit => &self.bybit,
+        };
+        map.get(coin)
+    }
+
+    /// 캐시가 `max_age_sec` 이내인지 확인합니다.
+    pub fn is_fresh(&self, exchange: Exchange, coin: &str, max_age_sec: u64) -> bool {
+        self.get(exchange, coin)
+            .map(|cached| cached.fetched_at.elapsed().as_secs() < max_age_sec)
+            .unwrap_or(false)
+    }
+}
+
+impl Default for ObCacheData {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Computing flag 관리자 (동시성 안전).
+///
+/// `std::sync::Mutex`로 보호되며, `try_set_computing`으로 원자적
+/// check-and-set을 제공합니다. lock hold 시간이 극히 짧아
+/// async context에서도 안전하게 사용할 수 있습니다.
+#[derive(Debug)]
+pub struct ComputingFlags {
+    /// 거래소/코인별 computing flag.
+    inner: std::sync::Mutex<HashMap<(Exchange, String), bool>>,
+}
+
+impl ComputingFlags {
+    /// 새 ComputingFlags를 생성합니다.
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 원자적 check-and-set. 이미 computing 중이면 `true` 반환 (스킵해야 함).
+    ///
+    /// 단일 lock 내에서 확인과 설정을 동시에 수행하여
+    /// 코인당 최대 1개 task만 REST 호출하도록 보장합니다.
+    ///
+    /// # 반환값
+    ///
+    /// - `true`: 이미 다른 task가 computing 중 (이 task는 스킵)
+    /// - `false`: 설정 성공 (이 task가 REST 수행)
+    pub fn try_set_computing(&self, exchange: Exchange, coin: &str) -> bool {
+        let mut flags = self.inner.lock().unwrap();
+        let entry = flags.entry((exchange, coin.to_string())).or_insert(false);
+        if *entry {
+            true // 이미 computing 중
+        } else {
+            *entry = true;
+            debug!(exchange = ?exchange, coin = %coin, "computing flag 설정 (CAS)");
+            false // 설정 성공
+        }
+    }
+
+    /// computing flag를 해제합니다.
+    ///
+    /// task 완료 시 반드시 호출하여 다음 task가 실행될 수 있도록 합니다.
+    /// 에러 발생 시에도 반드시 호출해야 합니다.
+    pub fn clear_computing(&self, exchange: Exchange, coin: &str) {
+        let mut flags = self.inner.lock().unwrap();
+        flags.insert((exchange, coin.to_string()), false);
+        debug!(exchange = ?exchange, coin = %coin, "computing flag 해제");
+    }
+
+    /// computing flag 상태를 조회합니다 (테스트/디버깅용).
+    pub fn is_computing(&self, exchange: Exchange, coin: &str) -> bool {
+        let flags = self.inner.lock().unwrap();
+        flags
+            .get(&(exchange, coin.to_string()))
+            .copied()
+            .unwrap_or(false)
+    }
+}
+
+impl Default for ComputingFlags {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 공유 오더북 캐시.
+///
+/// 데이터 캐시(`ObCacheData`)와 computing flag(`ComputingFlags`)를
+/// 분리하여 lock 경합을 최소화합니다.
+///
+/// - `data`: `tokio::sync::RwLock`으로 보호 (읽기 빈번, 쓰기는 REST 완료 시만)
+/// - `computing`: `std::sync::Mutex` 기반 atomic CAS (lock hold 극히 짧음)
+#[derive(Debug, Clone)]
+pub struct SharedObCache {
+    /// 오더북 데이터 캐시 (RwLock 보호).
+    pub data: Arc<tokio::sync::RwLock<ObCacheData>>,
+    /// Computing flag (Mutex 보호, atomic CAS).
+    pub computing: Arc<ComputingFlags>,
+}
+
+impl SharedObCache {
+    /// 새 SharedObCache를 생성합니다.
+    pub fn new() -> Self {
+        Self {
+            data: Arc::new(tokio::sync::RwLock::new(ObCacheData::new())),
+            computing: Arc::new(ComputingFlags::new()),
+        }
+    }
+}
+
+impl Default for SharedObCache {
     fn default() -> Self {
         Self::new()
     }
@@ -625,5 +781,172 @@ mod tests {
         let cache = OrderBookCache::default();
         assert!(cache.get(Exchange::Upbit, "BTC").is_none());
         assert!(!cache.is_computing(Exchange::Upbit, "BTC"));
+    }
+
+    // --- ObCacheData 테스트 ---
+
+    #[test]
+    fn test_ob_cache_data_basic_operations() {
+        let mut data = ObCacheData::new();
+        let ob = make_orderbook(vec![(100, 10)], vec![(99, 10)]);
+
+        // 초기에는 비어있음
+        assert!(data.get(Exchange::Upbit, "BTC").is_none());
+        assert!(!data.is_fresh(Exchange::Upbit, "BTC", 5));
+
+        // 갱신
+        data.update(Exchange::Upbit, "BTC", ob);
+        assert!(data.get(Exchange::Upbit, "BTC").is_some());
+        assert!(data.is_fresh(Exchange::Upbit, "BTC", 5));
+
+        // 다른 거래소는 비어있음
+        assert!(data.get(Exchange::Bybit, "BTC").is_none());
+    }
+
+    #[test]
+    fn test_ob_cache_data_default() {
+        let data = ObCacheData::default();
+        assert!(data.get(Exchange::Upbit, "BTC").is_none());
+        assert!(data.get(Exchange::Bybit, "ETH").is_none());
+    }
+
+    #[test]
+    fn test_ob_cache_data_multiple_coins() {
+        let mut data = ObCacheData::new();
+        let ob1 = make_orderbook(vec![(100, 10)], vec![(99, 10)]);
+        let ob2 = make_orderbook(vec![(200, 20)], vec![(199, 20)]);
+
+        data.update(Exchange::Upbit, "BTC", ob1);
+        data.update(Exchange::Bybit, "ETH", ob2);
+
+        assert!(data.get(Exchange::Upbit, "BTC").is_some());
+        assert!(data.get(Exchange::Bybit, "ETH").is_some());
+        assert!(data.get(Exchange::Upbit, "ETH").is_none());
+        assert!(data.get(Exchange::Bybit, "BTC").is_none());
+    }
+
+    // --- ComputingFlags 테스트 ---
+
+    #[test]
+    fn test_computing_flag_try_set_atomic() {
+        let flags = ComputingFlags::new();
+
+        // 초기에는 computing 아님
+        assert!(!flags.is_computing(Exchange::Upbit, "BTC"));
+
+        // 첫 번째 try_set: false 반환 (설정 성공)
+        assert!(!flags.try_set_computing(Exchange::Upbit, "BTC"));
+        assert!(flags.is_computing(Exchange::Upbit, "BTC"));
+
+        // 두 번째 try_set: true 반환 (이미 computing 중 → 스킵)
+        assert!(flags.try_set_computing(Exchange::Upbit, "BTC"));
+
+        // 다른 거래소/코인은 독립적
+        assert!(!flags.try_set_computing(Exchange::Bybit, "BTC"));
+        assert!(!flags.try_set_computing(Exchange::Upbit, "ETH"));
+    }
+
+    #[test]
+    fn test_computing_flag_clear() {
+        let flags = ComputingFlags::new();
+
+        // 설정
+        assert!(!flags.try_set_computing(Exchange::Upbit, "BTC"));
+        assert!(flags.is_computing(Exchange::Upbit, "BTC"));
+
+        // 해제
+        flags.clear_computing(Exchange::Upbit, "BTC");
+        assert!(!flags.is_computing(Exchange::Upbit, "BTC"));
+
+        // 해제 후 다시 설정 가능
+        assert!(!flags.try_set_computing(Exchange::Upbit, "BTC"));
+        assert!(flags.is_computing(Exchange::Upbit, "BTC"));
+    }
+
+    #[test]
+    fn test_computing_flag_clear_without_set() {
+        // 설정하지 않은 상태에서 해제해도 패닉 없음
+        let flags = ComputingFlags::new();
+        flags.clear_computing(Exchange::Upbit, "BTC");
+        assert!(!flags.is_computing(Exchange::Upbit, "BTC"));
+    }
+
+    #[test]
+    fn test_computing_flags_default() {
+        let flags = ComputingFlags::default();
+        assert!(!flags.is_computing(Exchange::Upbit, "BTC"));
+    }
+
+    // --- SharedObCache 테스트 ---
+
+    #[tokio::test]
+    async fn test_shared_ob_cache_data_update_and_get() {
+        let cache = SharedObCache::new();
+        let ob = make_orderbook(vec![(100, 10)], vec![(99, 10)]);
+
+        // 초기에는 비어있음
+        {
+            let data = cache.data.read().await;
+            assert!(data.get(Exchange::Upbit, "BTC").is_none());
+        }
+
+        // write lock으로 갱신
+        {
+            let mut data = cache.data.write().await;
+            data.update(Exchange::Upbit, "BTC", ob);
+        }
+
+        // read lock으로 조회
+        {
+            let data = cache.data.read().await;
+            assert!(data.get(Exchange::Upbit, "BTC").is_some());
+            assert!(data.is_fresh(Exchange::Upbit, "BTC", 5));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shared_ob_cache_computing_and_data_independent() {
+        let cache = SharedObCache::new();
+        let ob = make_orderbook(vec![(100, 10)], vec![(99, 10)]);
+
+        // computing flag 설정은 data lock 없이 가능
+        assert!(!cache.computing.try_set_computing(Exchange::Upbit, "BTC"));
+
+        // data lock 획득은 computing flag와 독립적
+        {
+            let mut data = cache.data.write().await;
+            data.update(Exchange::Upbit, "BTC", ob);
+        }
+
+        // 양쪽 모두 독립적으로 동작
+        assert!(cache.computing.is_computing(Exchange::Upbit, "BTC"));
+        {
+            let data = cache.data.read().await;
+            assert!(data.get(Exchange::Upbit, "BTC").is_some());
+        }
+
+        cache.computing.clear_computing(Exchange::Upbit, "BTC");
+        assert!(!cache.computing.is_computing(Exchange::Upbit, "BTC"));
+    }
+
+    #[test]
+    fn test_shared_ob_cache_default() {
+        let cache = SharedObCache::default();
+        assert!(!cache.computing.is_computing(Exchange::Upbit, "BTC"));
+    }
+
+    #[test]
+    fn test_shared_ob_cache_clone() {
+        let cache = SharedObCache::new();
+
+        // clone은 Arc clone이므로 같은 데이터를 공유
+        let cache2 = cache.clone();
+
+        // 한쪽에서 computing flag 설정
+        assert!(!cache.computing.try_set_computing(Exchange::Upbit, "BTC"));
+
+        // 다른 쪽에서도 반영됨
+        assert!(cache2.computing.is_computing(Exchange::Upbit, "BTC"));
+        assert!(cache2.computing.try_set_computing(Exchange::Upbit, "BTC"));
     }
 }
