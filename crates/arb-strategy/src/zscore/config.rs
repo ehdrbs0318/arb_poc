@@ -67,6 +67,14 @@ pub struct ZScoreConfig {
     pub entry_cooldown_sec: u64,
     /// 오더북 캐시 최대 유효 시간 (초).
     pub max_cache_age_sec: u64,
+    /// 최소 기대 수익률 (%, 기본값: 0.10).
+    /// 라운딩 후 adjusted_profit가 이 값 미만이면 진입 거부.
+    /// 0.0이면 비활성화 (기존 동작과 동일).
+    pub min_expected_roi: f64,
+    /// 최소 포지션 크기 (USDT, 기본값: 100.0).
+    /// qty × bybit_price가 이 값 미만이면 진입 거부.
+    /// 0.0이면 비활성화.
+    pub min_position_usdt: Decimal,
     /// 세션 출력 설정.
     pub output: crate::output::writer::OutputConfig,
 }
@@ -97,6 +105,8 @@ impl Default for ZScoreConfig {
             grace_period_hours: 4,
             entry_cooldown_sec: 10,
             max_cache_age_sec: 5,
+            min_expected_roi: 0.10,
+            min_position_usdt: Decimal::new(100, 0),
             output: crate::output::writer::OutputConfig::default(),
         }
     }
@@ -152,6 +162,16 @@ impl ZScoreConfig {
         }
         if !self.auto_select && self.max_spread_stddev > 0.0 {
             warn!("max_spread_stddev는 auto_select=true일 때만 적용됩니다");
+        }
+        if self.min_expected_roi < 0.0 {
+            return Err(StrategyError::Config(
+                "min_expected_roi must be non-negative".to_string(),
+            ));
+        }
+        if self.min_position_usdt < Decimal::ZERO {
+            return Err(StrategyError::Config(
+                "min_position_usdt must be non-negative".to_string(),
+            ));
         }
         if self.grace_period_hours == 0 {
             return Err(StrategyError::Config(
@@ -255,6 +275,8 @@ struct RawZScoreConfig {
     grace_period_hours: Option<u64>,
     entry_cooldown_sec: Option<u64>,
     max_cache_age_sec: Option<u64>,
+    min_expected_roi: Option<f64>,
+    min_position_usdt: Option<f64>,
 }
 
 impl Default for RawZScoreConfig {
@@ -283,6 +305,8 @@ impl Default for RawZScoreConfig {
             grace_period_hours: None,
             entry_cooldown_sec: None,
             max_cache_age_sec: None,
+            min_expected_roi: None,
+            min_position_usdt: None,
         }
     }
 }
@@ -320,6 +344,11 @@ impl From<RawZScoreConfig> for ZScoreConfig {
             grace_period_hours: raw.grace_period_hours.unwrap_or(4),
             entry_cooldown_sec: raw.entry_cooldown_sec.unwrap_or(10),
             max_cache_age_sec: raw.max_cache_age_sec.unwrap_or(5),
+            min_expected_roi: raw.min_expected_roi.unwrap_or(0.10),
+            min_position_usdt: raw
+                .min_position_usdt
+                .and_then(|v| Decimal::try_from(v).ok())
+                .unwrap_or(Decimal::new(100, 0)),
             output: crate::output::writer::OutputConfig::default(),
         }
     }
@@ -589,5 +618,79 @@ coins = ["BTC"]
         let config = ZScoreConfig::from_toml_str(toml).unwrap();
         assert!(config.output.enabled);
         assert_eq!(config.output.dir, "output");
+    }
+
+    // --- min_expected_roi / min_position_usdt 테스트 (spec/0010) ---
+
+    #[test]
+    fn test_min_expected_roi_default() {
+        let config = ZScoreConfig::default();
+        assert_eq!(config.min_expected_roi, 0.10);
+    }
+
+    #[test]
+    fn test_min_position_usdt_default() {
+        let config = ZScoreConfig::default();
+        assert_eq!(config.min_position_usdt, Decimal::new(100, 0));
+    }
+
+    #[test]
+    fn test_min_expected_roi_negative_invalid() {
+        let config = ZScoreConfig {
+            min_expected_roi: -0.01,
+            ..ZScoreConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_min_position_usdt_negative_invalid() {
+        let config = ZScoreConfig {
+            min_position_usdt: Decimal::new(-1, 0),
+            ..ZScoreConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_min_expected_roi_zero_disables() {
+        let config = ZScoreConfig {
+            min_expected_roi: 0.0,
+            ..ZScoreConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_min_position_usdt_zero_disables() {
+        let config = ZScoreConfig {
+            min_position_usdt: Decimal::ZERO,
+            ..ZScoreConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_min_filters_from_toml() {
+        let toml = r#"
+[zscore]
+coins = ["BTC"]
+min_expected_roi = 0.20
+min_position_usdt = 500.0
+"#;
+        let config = ZScoreConfig::from_toml_str(toml).unwrap();
+        assert_eq!(config.min_expected_roi, 0.20);
+        assert_eq!(config.min_position_usdt, Decimal::new(500, 0));
+    }
+
+    #[test]
+    fn test_min_filters_toml_default_when_omitted() {
+        let toml = r#"
+[zscore]
+coins = ["BTC"]
+"#;
+        let config = ZScoreConfig::from_toml_str(toml).unwrap();
+        assert_eq!(config.min_expected_roi, 0.10);
+        assert_eq!(config.min_position_usdt, Decimal::new(100, 0));
     }
 }

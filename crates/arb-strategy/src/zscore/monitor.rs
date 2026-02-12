@@ -251,8 +251,16 @@ fn filter_coins_by_stddev(
 
     if max_spread_stddev == 0.0 {
         // 필터링 없이 stddev 오름차순 max_coins개만 반환
-        let kept: Vec<String> = valid.iter().take(max_coins).map(|(c, _)| c.clone()).collect();
-        let excess: Vec<String> = valid.iter().skip(max_coins).map(|(c, _)| c.clone()).collect();
+        let kept: Vec<String> = valid
+            .iter()
+            .take(max_coins)
+            .map(|(c, _)| c.clone())
+            .collect();
+        let excess: Vec<String> = valid
+            .iter()
+            .skip(max_coins)
+            .map(|(c, _)| c.clone())
+            .collect();
         removed.extend(excess);
         return (kept, removed);
     }
@@ -277,15 +285,31 @@ fn filter_coins_by_stddev(
             "모든 코인 stddev 초과, fallback: stddev 오름차순 {}개 강제 선택",
             max_coins
         );
-        let kept: Vec<String> = valid.iter().take(max_coins).map(|(c, _)| c.clone()).collect();
-        let excess: Vec<String> = valid.iter().skip(max_coins).map(|(c, _)| c.clone()).collect();
+        let kept: Vec<String> = valid
+            .iter()
+            .take(max_coins)
+            .map(|(c, _)| c.clone())
+            .collect();
+        let excess: Vec<String> = valid
+            .iter()
+            .skip(max_coins)
+            .map(|(c, _)| c.clone())
+            .collect();
         removed.extend(excess);
         return (kept, removed);
     }
 
     // 통과한 코인에서 max_coins개 선택
-    let kept: Vec<String> = passed.iter().take(max_coins).map(|(c, _)| c.clone()).collect();
-    let excess: Vec<String> = passed.iter().skip(max_coins).map(|(c, _)| c.clone()).collect();
+    let kept: Vec<String> = passed
+        .iter()
+        .take(max_coins)
+        .map(|(c, _)| c.clone())
+        .collect();
+    let excess: Vec<String> = passed
+        .iter()
+        .skip(max_coins)
+        .map(|(c, _)| c.clone())
+        .collect();
     removed.extend(excess);
     removed.extend(failed.iter().map(|(c, _)| c.clone()));
 
@@ -1813,8 +1837,30 @@ where
                                                     "진입 거부: 라운딩 후 수익성 부족"
                                                 );
                                                 Some("rounding_pnl")
+                                            } else if config.min_position_usdt > Decimal::ZERO
+                                                && (qty * bybit_entry) < config.min_position_usdt
+                                            {
+                                                // 7. 최소 포지션 크기 체크
+                                                debug!(
+                                                    coin = c.as_str(),
+                                                    rounded_size_usdt = %(qty * bybit_entry),
+                                                    min_position_usdt = %config.min_position_usdt,
+                                                    "진입 거부: 최소 포지션 크기 미달"
+                                                );
+                                                Some("min_position")
+                                            } else if config.min_expected_roi > 0.0
+                                                && adjusted_profit < config.min_expected_roi
+                                            {
+                                                // 8. 최소 기대 수익률 체크
+                                                debug!(
+                                                    coin = c.as_str(),
+                                                    adjusted_profit = adjusted_profit,
+                                                    min_expected_roi = config.min_expected_roi,
+                                                    "진입 거부: 최소 기대 수익률 미달"
+                                                );
+                                                Some("min_roi")
                                             } else {
-                                                // 7. VirtualPosition 생성 (라운딩된 가격 사용)
+                                                // 9. VirtualPosition 생성 (라운딩된 가격 사용)
                                                 let liq_price =
                                                     position::calculate_liquidation_price(
                                                         bybit_entry,
@@ -1876,6 +1922,15 @@ where
                                             .lock()
                                             .unwrap()
                                             .entry_rejected_rounding_pnl_count += 1;
+                                    }
+                                    "min_position" => {
+                                        counters
+                                            .lock()
+                                            .unwrap()
+                                            .entry_rejected_min_position_count += 1;
+                                    }
+                                    "min_roi" => {
+                                        counters.lock().unwrap().entry_rejected_min_roi_count += 1;
                                     }
                                     _ => {
                                         counters.lock().unwrap().entry_rejected_slippage_count += 1;
@@ -2532,10 +2587,7 @@ where
                                     "재선택 코인 stddev 초과, 건너뜀"
                                 );
                                 spread_calc.write().await.remove_coin(coin);
-                                counters
-                                    .lock()
-                                    .unwrap()
-                                    .coin_rejected_spread_stddev_count += 1;
+                                counters.lock().unwrap().coin_rejected_spread_stddev_count += 1;
                                 continue;
                             }
                         }
@@ -2566,9 +2618,7 @@ where
                     })
                     .collect();
                 // stddev 오름차순 정렬
-                active.sort_by(|a, b| {
-                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                active.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                 active.into_iter().map(|(coin, _)| coin).collect()
             }; // sc drop
 
@@ -3409,10 +3459,7 @@ mod tests {
 
     #[test]
     fn test_filter_coins_by_stddev_all_none() {
-        let coin_stats = vec![
-            ("BTC".to_string(), None),
-            ("ETH".to_string(), None),
-        ];
+        let coin_stats = vec![("BTC".to_string(), None), ("ETH".to_string(), None)];
         let (kept, removed) = filter_coins_by_stddev(&coin_stats, 0.5, 5);
         assert!(kept.is_empty());
         assert_eq!(removed.len(), 2);

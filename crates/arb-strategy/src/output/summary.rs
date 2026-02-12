@@ -44,6 +44,10 @@ pub struct MonitoringCounters {
     pub regime_change_detected_count: u64,
     /// cooldown에 의해 억제된 regime change 횟수.
     pub regime_change_suppressed_by_cooldown_count: u64,
+    /// 최소 포지션 크기 미달로 진입 거부된 횟수.
+    pub entry_rejected_min_position_count: u64,
+    /// 최소 기대 수익률 미달로 진입 거부된 횟수.
+    pub entry_rejected_min_roi_count: u64,
 }
 
 /// 일별 PnL 기록.
@@ -147,6 +151,10 @@ pub struct SessionSummary {
     pub regime_change_detected_count: u64,
     /// cooldown으로 억제된 regime change 횟수.
     pub regime_change_suppressed_by_cooldown_count: u64,
+    /// 최소 포지션 크기 미달 진입 거부 횟수.
+    pub entry_rejected_min_position_count: u64,
+    /// 최소 기대 수익률 미달 진입 거부 횟수.
+    pub entry_rejected_min_roi_count: u64,
 }
 
 impl SessionSummary {
@@ -285,6 +293,8 @@ impl SessionSummary {
             regime_change_detected_count: counters.regime_change_detected_count,
             regime_change_suppressed_by_cooldown_count: counters
                 .regime_change_suppressed_by_cooldown_count,
+            entry_rejected_min_position_count: counters.entry_rejected_min_position_count,
+            entry_rejected_min_roi_count: counters.entry_rejected_min_roi_count,
         }
     }
 
@@ -409,6 +419,14 @@ impl SessionSummary {
         s.push_str(&format!(
             "regime change 억제 (cooldown): {}건\n",
             format_number(self.regime_change_suppressed_by_cooldown_count)
+        ));
+        s.push_str(&format!(
+            "최소 포지션 미달 진입 거부: {}건\n",
+            format_number(self.entry_rejected_min_position_count)
+        ));
+        s.push_str(&format!(
+            "최소 ROI 미달 진입 거부: {}건\n",
+            format_number(self.entry_rejected_min_roi_count)
         ));
 
         s
