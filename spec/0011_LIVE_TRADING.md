@@ -53,7 +53,7 @@ tick event -> signal 평가 -> 9단계 진입 검증 통과
     │     upbit.place_order(IOC Limit, Buy),
     │     bybit.place_order(IOC Limit, Sell, "linear")  ★ 양쪽 IOC
     │   ))
-    ├── ★ order_id DB 동기 기록 (crash recovery용 유일한 동기 DB write)
+    ├── ★ client_order_id 사전 기록 (Opening INSERT 시), order_id는 체결 후 비동기 write
     ├── poll_until_filled(timeout=5s, backoff 200ms~2s)
     ├── 양쪽 Filled -> effective_qty = min(upbit_qty, bybit_qty)
     │   -> 초과분 즉시 청산 (adjustment_cost 기록)  ★ PnL 회계
@@ -121,7 +121,7 @@ tick event -> signal 평가 -> 9단계 진입 검증 통과
 
 **영속 상태 (DB)** -- crash recovery 전용:
 - 메모리 상태 변경 후 비동기로 DB에 반영 (fire-and-forget 또는 buffered write)
-- **예외**: order_id 기록은 주문 직후 동기 DB write (crash 시 주문 추적 필수)
+- **예외**: client_order_id는 Opening INSERT 시 사전 기록 (동기). order_id는 체결 확인 후 비동기 write. DB write 실패 시 주문은 이미 발주됨 → reconciliation에서 보정.
 - 시작 시 DB에서 메모리 상태 복원 -> 이후 메모리가 권위(authoritative)
 
 ```
@@ -129,7 +129,7 @@ tick event -> signal 평가 -> 9단계 진입 검증 통과
 시작 시:   DB 조회 -> 메모리 상태 복원 -> 이후 메모리만 참조
 ```
 
-**DB write 순서 보장**: 모든 비동기 DB write는 단일 `mpsc::channel<DbWriteRequest>` background writer task로 전송. position_id별 순서 보장. bounded(256) + try_send 실패 시 oldest 드랍 + warn. 재시도 상한 3회, 최종 실패 시 AlertService 알림.
+**DB write 순서 보장**: 모든 비동기 DB write는 단일 `mpsc::channel<DbWriteRequest>` background writer task로 전송. **전체 직렬 순서 보장** (단일 consumer, position_id별 인과 순서 자동 충족 — 현재 규모 max_concurrent=5~10에서 단일 consumer로 충분). bounded(256) + try_send 실패 시 **newest(현재 메시지) 드랍** + warn (oldest가 아님). 드랍된 write를 별도 overflow log에 기록. order_id 이후 상태 전이 드랍 시 reconciliation에서 감지+보정. 재시도 상한 3회, 최종 실패 시 AlertService 알림.
 
 ### 비동기 원칙 (spec/0007 계승)
 
@@ -206,7 +206,7 @@ minute_timer.tick() => {
 1. **양 레그 동시 발주**: `tokio::time::timeout(10s, tokio::join!(upbit, bybit))` -- 전체를 timeout으로 감쌈
    - 개별 `place_order`에도 `tokio::time::timeout(5s, ...)` 적용 (한쪽 지연 시 다른쪽 방치 방지)
 2. 한쪽 실패 시 체결된 쪽 즉시 반대 주문(비상 청산)
-3. **Client Order ID**: `format!("{coin}_{timestamp}_{seq}")` (멱등성 보장, crash 복구 시 주문 조회용)
+3. **Client Order ID**: UUID v7 사용 (session 정보 미노출, crash recovery는 DB 매핑으로 해결. 멱등성 보장, crash 복구 시 주문 조회용)
 
 **Bybit WS 체결 확인 (REST polling 병행)**: Bybit WebSocket의 execution topic을 구독하여 체결 이벤트를 실시간 수신. REST polling은 WS 이벤트 미수신 시 fallback으로 유지. WS 체결 확인이 먼저 도착하면 polling 즉시 종료하여 latency 최소화.
 
@@ -216,16 +216,23 @@ minute_timer.tick() => {
 
 **설계**:
 ```rust
+/// 양 거래소 잔고 + 예약 상태를 단일 Mutex로 보호.
+/// 단일 Mutex guard 내에서 양쪽 잔고를 동시 차감하여 원자적 예약/롤백 보장.
+struct BalanceState {
+    upbit_available_krw: Decimal,
+    bybit_available_usdt: Decimal,
+    reservations: Vec<ReservationRecord>,   // 활성 예약 목록 (TTL sweeper용)
+}
+
 pub struct BalanceTracker {
-    upbit_available_krw: Mutex<Decimal>,    // parking_lot::Mutex
-    bybit_available_usdt: Mutex<Decimal>,   // parking_lot::Mutex
+    inner: parking_lot::Mutex<BalanceState>,
 }
 
 impl BalanceTracker {
     /// 진입 전 잔고 예약. 성공 시 ReservationToken 반환.
     /// **양 거래소 원자적 예약**: 단일 Mutex guard 내에서 양쪽 잔고를 동시 차감. Bybit 부족 시 Upbit 예약도 함께 롤백.
-    /// **ReservationToken RAII**: `Drop` impl에서 미확정(commit/release 미호출) 토큰을 자동 release. 내부 `committed: bool` 플래그로 commit 후 drop 시 release 방지. panic 시 잔고 영구 차감 방지.
-    /// **ReservationToken TTL**: 생성 시각 포함, 2분 이상 미확정 시 background sweeper가 자동 release + warn 로그.
+    /// **ReservationToken RAII**: `Drop` impl에서 `try_lock()` 사용, 실패 시 sweeper 위임. 내부 `committed: bool` 플래그로 commit 후 drop 시 release 방지. panic 시 잔고 영구 차감 방지. `Arc<parking_lot::Mutex<BalanceState>>` 보유.
+    /// **ReservationToken TTL**: 생성 시각 포함, **6분** 이상 미확정 시 background sweeper가 자동 release + warn 로그 (비상 청산 5분 + 여유 1분).
     pub fn reserve(&self, upbit_krw: Decimal, bybit_usdt: Decimal) -> Option<ReservationToken>;
 
     /// 주문 성공 시 예약을 확정 (실 체결 금액으로 잔고 차감).
@@ -251,7 +258,7 @@ impl BalanceTracker {
 5. 청산 완료 -> `on_exit()` (잔고 복원)
 6. 매분 `sync_from_exchange()` -> 내부 잔고와 실잔고 불일치 시 보정 + warn 로그
 
-**lock order**: `BalanceTracker`의 Mutex는 `parking_lot::Mutex`이며, `position_mgr` lock **외부**에서 호출. reserve -> pm.lock -> commit/release 순서.
+**lock order**: `balance_tracker → position_mgr` 순서 (TOCTOU 흐름과 일치). `BalanceTracker`의 Mutex는 `parking_lot::Mutex`이며, `position_mgr` lock **외부**에서 호출. reserve -> pm.lock -> commit/release 순서.
 
 ### Kill Switch 동시성 설계
 
@@ -269,11 +276,13 @@ impl BalanceTracker {
 5.   pm.register_opening(pos)                      // 메모리 Opening 등록
 6. position_mgr.unlock()
 7. live_executor.execute_entry()                   // ★ REST 호출 (place_order + poll, spawned task 내이므로 select! 비블로킹)
-                                                   //   내부에서 order_id DB 동기 기록
+                                                   //   내부에서 order_id DB 비동기 기록 (client_order_id는 사전 기록 완료)
 8. position_mgr.lock().await -> 메모리 결과 반영 + DB 비동기 반영
 ```
 
 **★ Opening in_flight 방어**: execute_entry() 진행 중인 포지션에 `in_flight: bool` 플래그. kill switch 청산 task는 in_flight 포지션이 Open 또는 삭제로 전이될 때까지 1~2초 간격으로 재스캔 (최대 30회 = 1분).
+
+**★ Closing timeout 인수**: 재스캔에서 `state == Closing && (now - closing_started_at) > 30s`인 포지션을 kill switch가 인수. `PositionManager`에 `try_transition_to_closing(pos_id) -> bool` 메서드 추가. `VirtualPosition`에 `closing_started_at: Option<DateTime<Utc>>` 필드 추가.
 
 **Kill switch 발동 시 배타적 청산**:
 1. `is_killed.store(true, Release)` -> 신규 진입 즉시 차단
@@ -286,7 +295,7 @@ impl BalanceTracker {
 8. kill switch 청산은 **별도 task로 spawn** (deadlock 방지)
 9. kill switch 재스캔 간격: 1~2초, 최대 30회. in_flight 포지션 완료 대기.
 
-**Rolling 24h 누적 손실 한도**: 일일 리셋(KST 00:00) 경계 악용 방지. 직전 24시간 sliding window 누적 손실이 `max_rolling_24h_loss_usdt`를 초과하면 kill switch. 일일 한도와 독립 적용.
+**Rolling 24h 누적 손실 한도**: 일일 리셋(KST 00:00) 경계 악용 방지. 직전 24시간 sliding window 누적 손실이 `max_rolling_24h_loss_usdt`를 초과하면 kill switch. 일일 한도와 독립 적용. **minute_timer에서도 `cleanup_expired_losses()` 호출** (만료된 rolling_24h_losses 엔트리 정리).
 
 ---
 
@@ -311,11 +320,12 @@ impl BalanceTracker {
 ```sql
 -- 세션 메타데이터
 CREATE TABLE sessions (
-    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
-    started_at  DATETIME(3) NOT NULL,
-    ended_at    DATETIME(3),
-    config_json TEXT NOT NULL,           -- 세션 시작 시 config snapshot
-    status      VARCHAR(20) NOT NULL     -- Running, Completed, Crashed
+    id                  BIGINT AUTO_INCREMENT PRIMARY KEY,
+    parent_session_id   BIGINT UNSIGNED NULL,    -- crash recovery 시 이전 세션 참조
+    started_at          DATETIME(3) NOT NULL,
+    ended_at            DATETIME(3),
+    config_json         TEXT NOT NULL,           -- 세션 시작 시 config snapshot (민감 필드 redact)
+    status              VARCHAR(20) NOT NULL     -- Running, Completed, Crashed, GracefulStop
 );
 
 -- 포지션 상태 머신
@@ -323,7 +333,7 @@ CREATE TABLE positions (
     id                  BIGINT AUTO_INCREMENT PRIMARY KEY,
     session_id          BIGINT NOT NULL,
     coin                VARCHAR(20) NOT NULL,
-    state               VARCHAR(30) NOT NULL,  -- Opening, Open, Closing, Closed, PartiallyClosedOneLeg
+    state               VARCHAR(30) NOT NULL,  -- Opening, Open, Closing, Closed, PartiallyClosedOneLeg, PendingExchangeRecovery
     qty                 DECIMAL(20,8) NOT NULL,
     upbit_entry_price   DECIMAL(20,8),
     bybit_entry_price   DECIMAL(20,8),
@@ -364,6 +374,7 @@ CREATE TABLE trades (
     z_score             DOUBLE,
     realized_pnl        DECIMAL(20,8),
     adjustment_cost     DECIMAL(20,8),
+    exit_usd_krw        DOUBLE,                -- 청산 시점 환율 (Phase 4 이후 세금 산정용)
     executed_at         DATETIME(3) NOT NULL,
     INDEX idx_session (session_id),
     INDEX idx_position (position_id)
@@ -444,7 +455,7 @@ CREATE TABLE funding_schedules (
 | `V005__create_alerts.sql` | alerts 테이블 + 인덱스 |
 | `V006__create_funding_schedules.sql` | funding_schedules 테이블 |
 
-**Background DB Writer**: `mpsc::channel<DbWriteRequest>` bounded(256) 단일 consumer task. position_id별 write 순서 보장. 재시도 3회 상한, 최종 실패 시 AlertService 알림.
+**Background DB Writer**: `mpsc::channel<DbWriteRequest>` bounded(256) 단일 consumer task. **전체 직렬 순서 보장** (단일 consumer). try_send 실패 시 newest 드랍 + warn + overflow log. 재시도 3회 상한, 최종 실패 시 AlertService 알림.
 
 **PositionStore trait** (DB 구현체):
 ```rust
@@ -470,13 +481,25 @@ pub trait PositionStore: Send + Sync {
 - **affected_rows 처리**: `affected_rows == 0`이면 현재 state를 추가 조회. 예상된 전이(kill switch가 이미 Closing 처리)면 무시, 비예상 전이면 warn + AlertService 알림.
 - `ROLLBACK`: 트랜잭션 중 에러 시 자동 롤백 (sqlx 기본 동작)
 
+**Upbit client_order_id 사전 검증**: Upbit의 `/v1/orders/chance` API에서 client_order_id 기반 검색 지원 여부를 Phase 1-0에서 사전 검증한다. 미지원 시 Opening 상태 미체결 주문을 timestamp+coin 기반으로 매칭하는 fallback 로직을 구현한다. Client Order ID 형식은 **UUID v7** 사용 (session 정보 미노출, crash recovery는 DB 매핑으로 해결).
+
 **Crash recovery**:
 - "Opening" (order_id 없음): 주문 발주 전 크래시 -> DB에서 DELETE. **추가 안전장치**: client_order_id가 있으면 거래소 `get_open_orders()`로 해당 주문 검색 (order_id DB write 실패 + crash 시 orphan order 방지)
 - "Opening" (order_id 있음): 양쪽 order_id 각각 `get_order()` 조회. 한쪽만 체결된 경우 PartiallyClosedOneLeg 전이 후 비상 청산.
 - "Closing" (order_id 있음): exit_upbit_order_id, exit_bybit_order_id 각각 조회하여 양 레그 상태 개별 확인. Filled이면 "Closed" UPDATE, 아니면 청산 재시도
 - "PartiallyClosedOneLeg": succeeded_leg/order_id 기반 비상 청산 재시도
 
-**Session ID 연속성**: crash recovery 시 이전 세션을 `status='Crashed'`로 마감 + 새 session_id 생성. 미청산 포지션의 session_id를 새 세션으로 마이그레이션.
+**Crash recovery 8개 시나리오 체크리스트**:
+1. Opening (order_id NULL) + crash → 재시작 후 삭제
+2. Opening (order_id 한쪽만) + crash → 해당 레그 get_order 후 처리
+3. Opening (양쪽 order_id) + 한쪽만 Filled + crash → PartiallyClosedOneLeg 전이
+4. Open + crash → 정상 복원
+5. Closing (exit_order_id 양쪽) + 한쪽 Filled + crash → 비대칭 처리
+6. PartiallyClosedOneLeg + crash → 비상 청산 재시도
+7. DB write 실패 + crash → client_order_id 기반 거래소 검색
+8. Session ID 마이그레이션 → trades cross-session 집계 정합성
+
+**Session ID 연속성**: crash recovery 시 이전 세션을 `status='Crashed'`로 마감 + 새 session_id 생성. 미청산 포지션은 `parent_session_id`를 참조하는 새 세션에서 관리 (session_id 직접 마이그레이션 대신). `SessionSummary` 쿼리에서 position_id 기반 cross-session trades 집계.
 
 **DB 장애 처리**:
 - **시작 시 연결 실패**: 프로세스 시작 차단 (DB 없이 실거래 불가)
@@ -492,7 +515,12 @@ pub trait PositionStore: Send + Sync {
 
 **AlertService fallback**: 텔레그램 실패 시 `alerts` 테이블에 INSERT (기존 alerts.log 파일 대체)
 
-**Triple failure fallback**: 텔레그램 실패 + DB fallback 실패 시, stderr + `/tmp/arb_emergency.log`에 기록 + 프로세스 exit code를 non-zero로 설정 (외부 모니터링 감지용).
+**Triple failure fallback** (즉시 죽음이 아닌, 최선을 다한 후 종료):
+  1. `is_killed.store(true, Release)` — 신규 진입 차단
+  2. Kill switch 청산 시도 (활성 포지션 보호)
+  3. Graceful shutdown 시그널 전송
+  4. 타임아웃 30초 후에도 미완료 시 그때 `std::process::exit(1)` (외부 모니터링 감지용)
+  5. stderr + `/tmp/arb_emergency.log`에 기록
 
 **파일**:
 - `crates/arb-db/Cargo.toml` (신규)
@@ -524,7 +552,9 @@ pub trait PositionStore: Send + Sync {
   - **연쇄 효과**: timestamp 0 시 Bybit/Bithumb 서명 거부 -> 해당 주문 차단 (정상 fallback)
 - `.expect()` 제거 대상: `coin_selector.rs` 7곳, `spread.rs` 1곳 -> **테스트 코드(`#[cfg(test)]`) 한정이므로 프로덕션 위험 없음. 체크리스트에서 "테스트 코드" 명시**
 
-**파일**: `monitor.rs`, `orderbook.rs`, `coin_selector.rs`, `spread.rs`, `bybit/auth.rs`, `bithumb/auth.rs`
+- **API 키 Debug 마스킹 (Phase 4-3에서 승격)**: 실거래 시작 전 `#[derive(Debug)]` → 수동 Debug impl으로 API 키 마스킹 적용 필수. `BybitCredentials`, `UpbitCredentials`에 수동 `Debug` impl (키 마스킹). 향후: `secrecy::SecretString` 전환.
+
+**파일**: `monitor.rs`, `orderbook.rs`, `coin_selector.rs`, `spread.rs`, `bybit/auth.rs`, `bithumb/auth.rs`, `upbit/auth.rs`
 **규모**: M
 
 #### 1-2. 포지션 영속화 (PositionStore -- DB 기반)
@@ -538,9 +568,9 @@ pub trait PositionStore: Send + Sync {
 - 시작 시: DB에서 non-Closed 포지션 로드 -> 메모리에 복원 -> 이후 메모리만 참조
 
 **DB 기록 시점** (hot path 외부):
-- **동기 DB write (필수)**: order_id 기록 직후 (주문 발주 후, 체결 대기 전). crash 시 주문 추적에 필수.
-- **비동기 DB write**: Opening 등록, Open 전이, Closing 전이, Closed 전이. 메모리 갱신 후 fire-and-forget.
-- **DB 장애 시**: 비동기 write 실패 -> warn 로그 + 재시도 큐. 동기 write 실패 -> 주문은 이미 나간 상태이므로 메모리에는 반영하되, DB 복구 시 reconciliation으로 보정.
+- **동기 DB write (필수)**: client_order_id만 사전 기록 (Opening INSERT 시). crash 시 client_order_id로 거래소에서 주문 검색 가능.
+- **비동기 DB write**: order_id 기록 (체결 확인 후), Opening 등록, Open 전이, Closing 전이, Closed 전이. 메모리 갱신 후 fire-and-forget.
+- **DB 장애 시**: 비동기 write 실패 -> warn 로그 + 재시도 큐. order_id write 실패 -> 주문은 이미 나간 상태이므로 메모리에는 반영하되, DB 복구 시 reconciliation으로 보정.
 
 **변경**:
 - `position_store.rs` 신규 생성
@@ -549,18 +579,20 @@ pub trait PositionStore: Send + Sync {
 
 **포지션 상태 머신**:
 ```
-Opening -> Open -> Closing -> Closed
-           |
-           └─-> PartiallyClosedOneLeg (비상 상태)
+Opening → Open → Closing → Closed
+          |        |
+          |        └→ PartiallyClosedOneLeg → Closed
+          |                                    ↑
+          └→ PartiallyClosedOneLeg ──→ PendingExchangeRecovery → Closed
 ```
 
 **상태 전이 세분화** (메모리 우선 + DB shadow):
-1. **메모리**: `pm.register_opening(pos)` (즉시) -> **DB 비동기**: `INSERT positions (state='Opening', coin, qty, expected_prices)`
-2. **주문 발주 후** -> **DB 동기**: `UPDATE positions SET upbit_order_id=?, bybit_order_id=? WHERE id=? AND state='Opening'` (★ 유일한 동기 DB write)
+1. **메모리**: `pm.register_opening(pos)` (즉시) -> **DB 동기**: `INSERT positions (state='Opening', coin, qty, client_order_id, expected_prices)` (★ client_order_id 사전 기록)
+2. **주문 발주 후** -> **DB 비동기**: `UPDATE positions SET upbit_order_id=?, bybit_order_id=? WHERE id=? AND state='Opening'` (체결 확인 후. DB write 실패 → reconciliation 보정)
 3. **체결 확인** -> **메모리**: `pm.transition_to_open(pos)` (즉시) -> **DB 비동기**: `UPDATE positions SET state='Open', qty=?, actual_prices=?`
 
--> 2단계 DB 동기 write 이후 크래시 시 order_id로 `get_order()` 조회 가능
--> 1단계에서 크래시 시 DB에 레코드 없을 수 있음 -> 주문도 미발주이므로 안전
+-> 1단계에서 client_order_id 기록 후 크래시 시 거래소에서 client_order_id로 주문 검색 가능
+-> 1단계 INSERT 전 크래시 시 DB에 레코드 없을 수 있음 -> 주문도 미발주이므로 안전
 
 **PartiallyClosedOneLeg 상태 상세**:
 ```rust
@@ -574,6 +606,11 @@ emergency_attempts: u32,
 - emergency_close 성공 -> `Closed` 전이
 - **Partial fill 세부 전이**: 비상 청산 IOC에서 partial fill 발생 시, 체결 수량만큼 정리 완료 + 미체결 수량으로 PartiallyClosedOneLeg 유지 + emergency_attempts 증가 + 잔여 수량만 재시도.
 
+**PendingExchangeRecovery 상태**:
+- Kill switch 발동 시 장애 거래소 쪽 포지션은 `PendingExchangeRecovery` 상태로 전이
+- 거래소 복구 감지 시 자동으로 잔여 leg 청산 → Closed 전이
+- AlertService에 수동 액션 가이드 포함 (어떤 거래소의 어떤 코인이 미청산인지 상세 안내)
+
 **Crash recovery** (DB 기반):
 - `SELECT * FROM positions WHERE session_id=? AND state NOT IN ('Closed')` -> non-Closed 포지션 조회
 - "Opening" (order_id NULL): 주문 발주 전 크래시 -> DELETE
@@ -585,14 +622,15 @@ emergency_attempts: u32,
 - `#[derive(Serialize, Deserialize)]` 추가 (`serde`는 이미 dependencies에 존재)
 - `upbit_order_id: Option<String>`, `bybit_order_id: Option<String>`
 - `in_flight: bool` (주문 진행 중 플래그)
-- `state: PositionState` (Opening, Open, Closing, Closed, PartiallyClosedOneLeg)
+- `state: PositionState` (Opening, Open, Closing, Closed, PartiallyClosedOneLeg, PendingExchangeRecovery)
+- `closing_started_at: Option<DateTime<Utc>>` (Closing 전이 시각, kill switch timeout 인수용)
 - `db_id: Option<i64>` (DB primary key 참조)
-- **호환성 영향**: 모든 `VirtualPosition` 구조체 리터럴 생성 지점(monitor.rs, 테스트 다수)에 새 필드 추가 필요. 빌더 패턴 또는 `..Default::default()` 적용으로 노동량 최소화.
+- **호환성 영향**: 필드 추가 시 기존 257개 테스트 영향. `..Default::default()` 패턴 또는 빌더 패턴으로 하위 호환성 유지. **Phase 1-2 작업량을 L→XL로 상향.**
 
 **load 실패 시**: DB 조회 실패 -> **order_id 기반 reconciliation 강제 실행** -> 거래소 실주문/포지션 기반 복원. 복원 불가 시 신규 진입 차단 + 알림.
 
 **파일**: `position_store.rs` (신규), `position.rs`, `monitor.rs`
-**규모**: L
+**규모**: XL
 
 #### 1-3. Kill Switch + Risk Manager
 
@@ -612,11 +650,12 @@ emergency_attempts: u32,
       current_equity: Decimal,
       last_reset: DateTime<Utc>,
       rolling_24h_losses: VecDeque<(DateTime<Utc>, Decimal)>,  // 24h sliding window
+      hwm_daily_peaks: VecDeque<(DateTime<Utc>, Decimal)>,     // Rolling 7d HWM (일별 equity 고점)
   }
   ```
 - **AtomicBool**: `spawned_check_tick_signal`과 이벤트 루프에서 동시 접근 가능 -> lock 없이 `Ordering::Acquire/Release`로 확인/설정
 - **일일 리셋**: KST 00:00 (UTC 15:00) 기준으로 고정 (한국 시간 기준 거래일 경계)
-- **Drawdown 기준**: High-Water Mark(HWM) 방식. `peak_equity`는 세션 시작 시 초기 자본으로 설정, 이후 포지션 청산마다 갱신. 일일 리셋 시 HWM은 초기화하지 않음 (세션 수명 동안 유지).
+- **Drawdown 기준**: Rolling 7d High-Water Mark(HWM) 방식. `hwm_window_days = 7` (config). 최근 7일 내 최고 equity를 HWM으로 사용. 8일 전 고점은 무시. `VecDeque<(DateTime<Utc>, Decimal)>`로 일별 equity 고점 기록. 일일 리셋 시 HWM은 초기화하지 않음 (7일 sliding window로 자동 만료).
 
 - 메서드:
   - `is_killed(&self) -> bool`: AtomicBool 확인 (lock 불필요)
@@ -625,6 +664,7 @@ emergency_attempts: u32,
   - `trigger_kill_switch(&self, reason: &str)`: 강제 발동
   - `check_connection_health(&self, upbit_ok, bybit_ok)`: 한쪽 연결 불안정 시 진입 차단
   - `validate_order_size(&self, size_usdt: Decimal) -> bool`: 단일 주문 크기 상한 확인
+  - `check_unrealized_exposure(&self, positions: &[UnrealizedPnlSnapshot]) -> bool`: 전체 미실현 손실 한도 확인. minute_timer에서 매분 호출. 전체 미실현 손실이 `max_unrealized_loss_pct` (config, 기본값 7%)를 초과하면 kill switch 발동. 공식: `unrealized_pnl_i = (current_spread_pct - entry_spread_pct) * position_size - estimated_exit_fees`
 
 - **리스크 한도 -- 자본 대비 비율(%) + 절대값 이중 적용**:
   ```toml
@@ -641,13 +681,23 @@ emergency_attempts: u32,
   max_order_size_usdt = 2000.0     # ★ 단일 주문 크기 상한 (버그 방어)
   max_concurrent_positions = 5     # 소액 단계: 5개 (10은 $300에서 min_notional에 걸림)
   max_rolling_24h_loss_usdt = 80.0 # rolling 24h 누적 손실 상한
+  max_unrealized_loss_pct = 7.0    # 전체 미실현 손실 한도 (자본의 %, 초과 시 kill switch)
 
   # 실효 한도 = min(비율 기반, 절대값 기반)
   ```
 
+- **단계별 리스크 한도 참고 테이블**:
+
+  | 자본 | max_daily_loss | max_drawdown | max_single_loss | max_concurrent | max_order_size |
+  |------|---------------|-------------|----------------|---------------|---------------|
+  | $300 | 10% / $30 | 5% / $15 | 3% / $9 | 3 | $200 |
+  | $2,000 | 10% / $200 | 5% / $100 | 3% / $60 | 5 | $500 |
+  | $5,000 | 8% / $400 | 4% / $200 | 2% / $100 | 8 | $1,000 |
+  | $10,000 | 5% / $500 | 3% / $300 | 2% / $200 | 10 | $2,000 |
+
 - **Lock order**: `RiskManager.inner`는 `position_mgr` lock 해제 후 호출.
   ```
-  ob_cache -> instrument_cache -> position_mgr -> balance_tracker -> risk_manager.inner -> counters -> spread_calc
+  ob_cache -> instrument_cache -> balance_tracker -> position_mgr -> risk_manager.inner -> trades -> session_writer -> counters -> spread_calc
   ```
   (`is_killed` AtomicBool은 lock order 무관)
 
@@ -687,7 +737,7 @@ emergency_attempts: u32,
 - **일반 알림**: `mpsc::channel<AlertEvent>` bounded(64) + `try_send()` + warn (이벤트 루프 블로킹 방지)
 - **치명적 알림** (`KillSwitchTriggered`, `EmergencyCloseFailure`): **★ 청산 먼저, 알림 나중 원칙**: 비상 청산/kill switch 청산 실행 완료 후 알림 전송. 알림 전송 지연(텔레그램 수초~수십초)이 청산을 블로킹하지 않음. 알림은 spawn된 task 내에서 청산 완료 후 `send().await`.
 - **텔레그램 실패 fallback**: `alerts` 테이블에 INSERT (DB 기반, 기존 파일 fallback 대체)
-- **Triple failure 최종 fallback**: 텔레그램 실패 + DB INSERT 실패 시, `eprintln!` + `/tmp/arb_emergency.log` 파일 기록 + `std::process::exit(1)` (외부 프로세스 모니터링이 감지).
+- **Triple failure 최종 fallback** (즉시 죽음이 아닌, 최선을 다한 후 종료): 텔레그램 실패 + DB INSERT 실패 시, ① `is_killed.store(true, Release)` 신규 진입 차단 ② kill switch 청산 시도 (활성 포지션 보호) ③ graceful shutdown 시그널 전송 ④ 타임아웃 30초 후에도 미완료 시 `std::process::exit(1)` ⑤ stderr + `/tmp/arb_emergency.log` 파일 기록 (외부 프로세스 모니터링이 감지).
 
 **파일**: `alert.rs` (신규), `monitor.rs`, `config.rs`
 **의존**: `arb-telegram`, `arb-db`
@@ -824,8 +874,9 @@ emergency_attempts: u32,
 **문제**: Bybit 단일 limiter(18 req/sec)를 public/private API가 공유 -> kill switch 청산 시 오더북 조회와 경합
 
 **변경**:
-- `BybitClient`: `public_limiter` (10 req/sec) + `private_limiter` (10 req/sec) 분리
+- `BybitClient`: `public_limiter` (10 req/sec) + `private_limiter` (10 req/sec) + `emergency_limiter` (burst 허용) 분리
 - 오더북 조회 -> `public_limiter`, 주문/잔고/포지션 -> `private_limiter`
+- **Kill switch 청산은 별도 `emergency_limiter`** 사용. 정상 `private_limiter`와 분리하여 burst 허용. Upbit에도 동일하게 `emergency_limiter` 추가.
 
 **파일**: `bybit/client.rs`
 **규모**: S
@@ -836,7 +887,13 @@ emergency_attempts: u32,
 
 **변경**:
 - `live_executor.rs` 신규 생성
-- `LiveExecutor<U: OrderManagement, B: OrderManagement>` 제네릭 구조체
+- `LiveExecutor<U, B>` 제네릭 구조체:
+  ```rust
+  pub struct LiveExecutor<U, B>
+  where
+      U: MarketData + OrderManagement + Send + Sync + 'static,
+      B: MarketData + OrderManagement + InstrumentDataProvider + Send + Sync + 'static,
+  ```
 - `ZScoreMonitor<U, B>`에서 `LiveExecutor<U, B>` 필드로 직접 보유 (trait object 아님)
 
 - **요청/응답 타입**:
@@ -894,8 +951,8 @@ emergency_attempts: u32,
      - **시장가 (config fallback)**: `krw_amount = qty * upbit_krw_price * (1 + upbit_fee_rate)`
   3. Bybit 주문 준비:
      - **IOC 지정가**: `price = bybit_usdt_price * (1 - max_slippage_pct)` (매도 하한)
-  4. Client Order ID 생성: `format!("{session_id}_{coin}_{timestamp}_{seq}")` (crash recovery 재시도 시 충돌 방지, session_id 포함)
-  4.5. **Client Order ID DB 사전 기록**: order_id 동기 write 실패 시에도 client_order_id로 거래소에서 주문 검색 가능. client_order_id는 Opening INSERT 시 함께 기록.
+  4. Client Order ID 생성: UUID v7 사용 (session 정보 미노출, crash recovery는 DB 매핑으로 해결)
+  4.5. **Client Order ID DB 사전 기록**: client_order_id만 사전 기록 (Opening INSERT 시). order_id는 체결 확인 후 비동기 write. "DB write 실패 시 주문은 이미 발주됨 → reconciliation에서 보정". order_id 동기 write 실패 시에도 client_order_id로 거래소에서 주문 검색 가능.
   5. 양 레그 동시 발주:
      ```rust
      let result = tokio::time::timeout(Duration::from_secs(10),
@@ -912,14 +969,22 @@ emergency_attempts: u32,
        - **Partial fill 초과분 청산 재시도 상한**: 최대 3회, 수렴하지 않으면 잔여 수량 수동 처리 + kill switch
      - 한쪽 Filled + 한쪽 미체결 -> 미체결 쪽 cancel -> 체결된 쪽 비상 청산
      - 양쪽 미체결 -> 양쪽 cancel, 진입 포기
-  8. **Post-execution PnL gate 임계치**: 실체결가 기반 스프레드가 roundtrip 수수료 이하이면 즉시 청산. 다만 **스프레드가 음수(역전)가 아니고 수수료의 50% 이상이면 보유** (즉시 청산 시 왕복 수수료 + 슬리피지 추가 부담이 더 클 수 있음). 체결가 괴리가 3회 연속 발생하면 해당 코인 모니터링 제외.
+  8. **Post-execution PnL gate 임계치**: 실체결가 기반 스프레드가 roundtrip 수수료 이하이면 즉시 청산. 다만 **스프레드가 음수(역전)가 아니고 수수료의 `post_exec_pnl_gate_ratio` (config, 기본값 0.5 = 50%) 이상이면 보유** (즉시 청산 시 왕복 수수료 + 슬리피지 추가 부담이 더 클 수 있음). 체결가 괴리가 3회 연속 발생하면 해당 코인 모니터링 제외.
   9. 결과 반환: `ExecutedEntry`
 
 - **비상 청산 3단계 escalation**:
   1. **0~2분**: IOC 지정가 재시도 (**각 재시도마다 최신 best bid/ask 조회하여 가격 갱신**). 기준 시각 = **레그 실패 감지 시각**. (지수 백오프 1s, 2s, 4s, 8s...)
-  2. **2~5분**: **넓은 IOC 지정가로 전환** (현재가 +/- 2%, 극단적 슬리피지 방어. 순수 시장가는 가격 보호 없어 위험) + 텔레그램 알림
+  2. **2~5분**: **넓은 IOC 지정가로 전환** + 텔레그램 알림. 가격 소스: REST `get_ticker()` 조회 결과. REST 실패 시 마지막 WS 가격 + 5% 마진. 슬리피지 범위 3단계: 첫 시도 2%, 두 번째 3%, 세 번째 5%. 매 재시도마다 최신 가격 갱신. config: `emergency_wide_ioc_slippage_pct = [2.0, 3.0, 5.0]`
   3. **5분 초과**: **kill switch 강제 발동** + `EmergencyCloseFailure` 알림
   4. 비상 청산 손실은 `RiskManager.record_trade()`에 반드시 포함
+  5. kill switch 청산은 **별도 `emergency_limiter`** 사용. 정상 `private_limiter`와 분리하여 burst 허용.
+
+- **Partial fill dust threshold + min_order_qty 처리**:
+  - 초과분 < `max_dust_usdt` (config, 기본값 5.0): warn 로그만, 다음 청산 시 함께 처리
+  - 초과분 $5~$50: 3회 재시도
+  - 초과분 > $50: 3회 재시도 + 해당 코인 모니터링 제외
+  - min_order_qty 미만 잔량: dust로 간주, 포지션 강제 Closed 전이, `adjustment_cost`에 기록
+  - Kill switch: **비상 청산 자체가 5분 초과 실패한 경우만** 발동 (dust 잔량은 kill switch 트리거하지 않음)
 
 - **Cancel 실패 처리**: cancel 실패 -> `get_order()` 재확인 -> PartiallyFilled면 실체결 수량으로 effective_qty 조정
 
@@ -939,16 +1004,18 @@ emergency_attempts: u32,
 **설계**: monitor.rs를 3개 파일로 분리하여 시뮬/라이브 코드 중복을 최소화한다.
 
 **파일 구조**:
-- `monitor_core.rs`: select! 루프 골격, 캔들 빌딩, 스프레드 계산, 시그널 평가. `ExecutionPolicy` trait 콜백 호출.
+- `monitor_core.rs`: select! 루프 골격, 캔들 빌딩, 스프레드 계산, 시그널 평가. `ExecutionPolicy` trait 콜백 호출. **candle_builder는 select! 루프의 로컬 변수로 유지한다. ExecutionPolicy 콜백은 Copy 가능한 스냅샷 값(EntryContext, ExitContext)만 받으며, candle_builder에 대한 참조를 전달하지 않는다.**
 - `monitor_live.rs`: `LivePolicy` 구현. LiveExecutor, BalanceTracker, RiskManager, DB 연동, reconciliation, 펀딩비.
 - `monitor_sim.rs`: `SimPolicy` 구현. 기존 가상 체결 코드, VirtualPosition 즉시 생성.
 
 **ExecutionPolicy trait** (컴파일 타임 디스패치, vtable 없음):
 ```rust
+// RPITIT 패턴 사용 — tokio::spawn 내 호출을 위해 Send 필수.
+// 현재 codebase의 MarketData trait 동일 패턴.
 pub trait ExecutionPolicy: Send + Sync + 'static {
-    async fn on_entry_signal(&self, ctx: EntryContext) -> Result<(), StrategyError>;
-    async fn on_exit_signal(&self, ctx: ExitContext) -> Result<(), StrategyError>;
-    async fn on_ttl_expiry(&self, pos: &VirtualPosition) -> Result<(), StrategyError>;
+    fn on_entry_signal(&self, ctx: EntryContext) -> impl Future<Output = Result<(), StrategyError>> + Send;
+    fn on_exit_signal(&self, ctx: ExitContext) -> impl Future<Output = Result<(), StrategyError>> + Send;
+    fn on_ttl_expiry(&self, pos: &VirtualPosition) -> impl Future<Output = Result<(), StrategyError>> + Send;
     fn is_entry_allowed(&self) -> bool;
 }
 ```
@@ -1000,7 +1067,11 @@ pub trait ExecutionPolicy: Send + Sync + 'static {
 - NTP 시간 동기화 확인: Bybit 서버 시간과 로컬 시간 차이 > 3초 warn, > 5초 **시작 차단** (Bybit 서명 거부)
 - (Live 모드) **Upbit 마켓 상태 확인**: 선택된 코인의 입출금 상태 조회. 입출금 정지된 코인은 모니터링에서 제외 (비정상 김치 프리미엄 시그널 방지).
 - (Live 모드) **Bybit margin mode + crash recovery 상호작용**: 이미 열린 포지션이 있으면 `switch_margin_mode()` 거부됨. 포지션 복원 후 현재 margin mode 확인 -> 이미 Isolated이면 skip.
-- (Live 모드) **Graceful shutdown 핸들러**: `tokio::signal::ctrl_c()` + SIGTERM 핸들러 등록. 수신 시 신규 진입 즉시 차단 + 현재 진행 중 주문 완료 대기 + 세션 DB 'GracefulStop' 마감. 열린 포지션은 DB에 유지하여 다음 세션에서 crash recovery 동일 경로로 복원.
+- (Live 모드) **Graceful shutdown 핸들러**: `tokio::signal::ctrl_c()` + SIGTERM 핸들러 등록. 수신 시 `shutdown_policy` config에 따라 동작:
+  - `"keep"` (기본): 신규 진입 즉시 차단 + 현재 진행 중 주문 완료 대기 + 포지션 DB 유지 + 세션 DB 'GracefulStop' 마감. 다음 세션에서 crash recovery 동일 경로로 복원. **systemd restart와 함께 사용 권장.**
+  - `"close_all"`: 모든 포지션 비상 청산 후 종료. 유지보수/장기 정지 시 사용.
+  - `"close_if_profitable"`: 수익 포지션만 청산 + 손실 포지션은 DB에 유지. 부분 정리용.
+  - **외부 watchdog**: sessions 테이블 heartbeat 5분 미갱신 시 별도 프로세스가 kill switch 수행.
 - (Live 모드) **외부 프로세스 모니터링**: sessions 테이블 heartbeat (매분 `updated_at` 갱신). 외부 cron/systemd가 heartbeat 5분 미갱신 시 알림.
 
 **파일**: `monitor.rs`
@@ -1010,7 +1081,7 @@ pub trait ExecutionPolicy: Send + Sync + 'static {
 
 **변경**:
 - `minute_timer`에서 **tokio::spawn으로 reconciliation task 실행** (★ REST 호출 다수이므로 select! 내 직접 실행 금지)
-- 결과는 mpsc 채널 또는 Arc<Mutex> 공유 상태로 반환 -> select! 루프에서 결과 수신 후 상태 갱신
+- 결과는 **단일 `mpsc::channel<BackgroundTaskResult>` enum 채널**로 반환 -> select! 루프에서 결과 수신 후 상태 갱신
 - **Bybit**: `get_positions()` -> 내부 `PositionManager` 상태와 비교
 - **Upbit**: **order_id 기반** `get_order()` 조회 -> 해당 주문의 체결 수량 확인
   - (잔고 비교는 참고 수준 -- 사용자 개인 보유 코인과 구분 불가)
@@ -1072,8 +1143,11 @@ pub struct FundingSchedule {
 - `RiskManager.record_trade()`에 펀딩비 포함
 - 펀딩비가 포지션 수익 대비 **20% 초과 시 경고**, **50% 초과 시 해당 코인 모니터링 제외**
 
-**기존 포지션 펀딩비 강제 청산**:
-- 정산 N분 전(`funding_force_close_minutes`, 기본 15분), 보유 중인 포지션이 불리한 펀딩(rate > 0, short 지불)이면 **해당 포지션만 강제 청산**
+**기존 포지션 펀딩비 강제 청산 (코인별 차등)**:
+- **Major 코인** (BTC, ETH): 정산 `funding_force_close_minutes_major` (기본 15분) 전 강제 청산
+- **Alt 코인** (나머지): 정산 `funding_force_close_minutes_alt` (기본 30분) 전 강제 청산
+- 24h 거래대금 기준 분류. major 목록은 config에서 설정: `funding_major_coins = ["BTC", "ETH"]`
+- 보유 중인 포지션이 불리한 펀딩(rate > 0, short 지불)이면 **해당 포지션만 강제 청산**
 - 강제 청산 시 `FundingForceClose` 알림
 - config에서 비활성화 가능 (`funding_force_close_enabled = false`)
 
@@ -1097,6 +1171,9 @@ order_timeout_sec = 5             # 주문 체결 대기 타임아웃
 max_retry_count = 2               # 재시도 횟수
 order_type = "limit_ioc"          # "limit_ioc", "limit_gtc_cancel", "market"
 max_slippage_pct = 0.1            # IOC/GTC 지정가 시 최대 슬리피지 %
+post_exec_pnl_gate_ratio = 0.5   # Post-execution PnL gate: 수수료의 N% 이상이면 보유 (0.5 = 50%)
+emergency_wide_ioc_slippage_pct = [2.0, 3.0, 5.0]  # 비상 청산 IOC 슬리피지 단계 (%)
+max_dust_usdt = 5.0               # Dust threshold: 이하 잔량은 다음 청산 시 처리
 
 # 리스크 관리 (비율 + 절대값 이중)
 kill_switch_enabled = true
@@ -1109,6 +1186,7 @@ max_single_loss_usdt = 15.0
 max_order_size_usdt = 2000.0
 max_concurrent_positions = 5
 max_rolling_24h_loss_usdt = 80.0   # rolling 24h 누적 손실 상한
+hwm_window_days = 7                # HWM drawdown 측정 window (최근 N일 내 최고 equity 기준)
 
 # 환율 (Phase 1-9에서 적용)
 max_forex_age_min = 10            # 환율 캐시 최대 수명 (분)
@@ -1117,13 +1195,21 @@ forex_change_alert_pct = 0.2      # 환율 급변 알림 임계치 (%)
 # 펀딩비
 funding_block_before_min = 60      # 정산 N분 전부터 진입 차단
 funding_block_after_min = 15       # 정산 후 N분까지 진입 차단
-funding_force_close_enabled = true # 정산 전 불리 포지션 강제 청산
-funding_force_close_minutes = 15   # 정산 N분 전 강제 청산
+funding_force_close_enabled = true           # 정산 전 불리 포지션 강제 청산
+funding_force_close_minutes_major = 15       # Major 코인 (BTC, ETH) 정산 N분 전 강제 청산
+funding_force_close_minutes_alt = 30         # Alt 코인 정산 N분 전 강제 청산
+funding_major_coins = ["BTC", "ETH"]         # Major 코인 목록
 funding_alert_ratio = 0.2         # 펀딩비 > 수익의 20%이면 경고 (기존 0.5 -> 0.2)
 funding_exclude_ratio = 0.5        # 펀딩비 > 수익의 50%이면 코인 제외
 
-# DB
-db_url = "mysql://user:pass@localhost:3306/arb_poc"
+# 시간대 제한 (P2, 향후)
+# trading_hours_utc = "00:00-23:59"  # 거래 허용 시간대 (UTC). 범위 외 시 진입 차단.
+
+# DB (db_url은 strategy.toml에 포함하지 않음 — DATABASE_URL 환경변수에서만 읽기)
+# db_url = "mysql://..." → 환경변수 DATABASE_URL 전용
+
+# Graceful shutdown
+shutdown_policy = "keep"          # "keep" | "close_all" | "close_if_profitable" (기본값 "keep")
 
 # 텔레그램 알림
 telegram_enabled = true
@@ -1143,14 +1229,19 @@ telegram_chat_id = ""             # 환경변수 우선
 **파일**: `pnl.rs`, `position.rs`, `bybit/client.rs`
 **규모**: S
 
-#### 4-3. API 키 보안 강화
+#### 4-3. 프로덕션 로깅
 
 **변경**:
-- `BybitCredentials`, `UpbitCredentials`의 `#[derive(Debug)]` -> 수동 Debug impl (키 마스킹)
-- 향후: `secrecy::SecretString` 전환
+- `tracing-appender` RollingFileAppender 일별 로테이션
+- 프로덕션 기본 로그 레벨: `info` (debug는 환경변수로 활성화)
+- 로그 파일 경로: config 또는 환경변수로 지정
 
-**파일**: `bybit/auth.rs`, `upbit/auth.rs`
+**파일**: `logging/mod.rs`
 **규모**: S
+
+#### 4-4. (Phase 1-1로 이동됨)
+
+~~API 키 보안 강화~~ → Phase 1-1에서 처리 (실거래 시작 전 필수).
 
 ---
 
@@ -1194,7 +1285,7 @@ telegram_chat_id = ""             # 환경변수 우선
 |------|-------|------|----------|
 | `Cargo.toml` (root) | 1-0 | S | workspace members에 `arb-db` 추가 |
 | `monitor.rs` | 1,3 | XL | 삭제 또는 re-export (monitor_core/live/sim으로 분리). unwrap 제거, 재연결, TOCTOU 이중 체크, 초기화/reconciliation, 환율 guard, 잔고 연동, 펀딩비 |
-| `position.rs` | 1-2 | L | Serialize/Deserialize, PositionState(5종), order_id, db_id, 빌더 패턴 |
+| `position.rs` | 1-2 | XL | Serialize/Deserialize, PositionState(6종), order_id, db_id, closing_started_at, 빌더 패턴 |
 | `config.rs` | 1,4 | M | 리스크 한도(비율+절대값), 주문/환율/펀딩/DB 파라미터 |
 | `output/writer.rs` | 1-5 | L | SessionWriter trait 추상화, FileSessionWriter + DbSessionWriter |
 | `output/summary.rs` | 1-5 | L | 파일 기반 요약 -> DB 쿼리 기반 요약 전환 |
@@ -1208,7 +1299,7 @@ telegram_chat_id = ""             # 환경변수 우선
 | `arb-exchange/types.rs` | 2 | S | PositionInfo 공통 타입 |
 | `arb-exchange/error.rs` | 1-6 | S | is_retryable() 메서드 |
 | `arb-exchange/src/lib.rs` | 2 | S | 신규 타입 re-export |
-| `arb-strategy/Cargo.toml` | 1 | S | `parking_lot`, `arb-db` 추가 |
+| `arb-strategy/Cargo.toml` | 1 | S | `parking_lot`, `arb-db = { ..., optional = true }` 추가. `features = ["live"]`로 라이브 인프라 활성화. 시뮬레이션 example은 live feature 없이 빌드. |
 | `src/main.rs` | 3-1 | L | 라이브 전용 entry point, 모든 인프라 wiring |
 | `pnl.rs` | 4-2 | S | 실수수료 + funding_fee + adjustment_cost 포함 PnL |
 | `mod.rs` | 1,2 | S | 신규 모듈 등록 |
@@ -1284,12 +1375,12 @@ telegram_chat_id = ""             # 환경변수 우선
 |----|------|------|-------|
 | M1 | Box\<dyn Error\> erased | StrategyError 전환 | 1-6 |
 | M2 | forex_task JoinHandle 무시 | 모니터링 + 재시작 | 1-7 |
-| M3 | API 키 평문 메모리 | Debug 마스킹, 향후 secrecy | 4-3 |
+| M3 | API 키 평문 메모리 | Debug 마스킹, 향후 secrecy | **1-1** (승격) |
 | M4 | is_retryable 없음 | ExchangeError에 추가 | 1-6 |
 | M5 | Bybit category "spot" 하드코딩 | place_order_linear() 추가 | 2-1 |
 | M6 | 중복 주문 위험 | Client Order ID | 2-4 |
 | M7 | 거래소 점검/입출금 정지 | 상태 API 조회 + 진입 차단 | 3-2 |
-| M8 | Bybit 강제 청산 실시간 감지 | WS position 이벤트 수신 (향후) | -- |
+| M8 | Bybit 강제 청산/ADL 실시간 감지 | Bybit WS `/v5/private/position` 토픽 `adlRankIndicator` 모니터링. ADL 발생 시 즉시 해당 코인 Upbit 초과분 매도하여 수량 일치. Reconciliation에서도 ADL로 인한 수량 변동 감지. | 2-3, 3-3 |
 | M9 | 펀딩비 종목별 주기 미추적 | 종목별 FundingSchedule + 매분 갱신 | 3-4 |
 | M10 | computing flag lifetime | 주문 완료까지 확장 | 2-4 |
 | M11 | Partial fill 초과분 무한 연쇄 | 최대 3회 재시도 + kill switch | 2-4 |
@@ -1305,6 +1396,10 @@ telegram_chat_id = ""             # 환경변수 우선
 ## 단계적 롤아웃 계획
 
 ```
+사전조건:
+  - Bybit 서브계정 생성 + API 키 발급
+  - MySQL DB 준비 + 마이그레이션 완료
+
 Phase 0 (현재) ─── 시뮬레이션 검증 완료
      │
 Phase 1 ───────── 안전 인프라 구축
@@ -1333,14 +1428,15 @@ Phase 3 ───────── monitor.rs 통합
      │              └── 종목별 펀딩비 모니터링 (FundingSchedule + 매분 갱신)
      │
 Phase 4 ───────── 설정 및 부가 기능
-     │              ├── Config 확장 (비율+절대값 이중, 펀딩비, DB URL)
+     │              ├── Config 확장 (비율+절대값 이중, 펀딩비, shutdown_policy 등)
      │              ├── 실수수료 + 펀딩비 + adjustment_cost PnL
-     │              └── API 키 보안 강화
+     │              ├── 프로덕션 로깅 (tracing-appender 일별 로테이션)
+     │              └── API 키 보안 강화 → Phase 1-1로 승격 완료
      │
      ▼
 검증 단계 (각 단계별 KPI):
-  ① 소액 실거래 ($300~500, max_concurrent=5)
-     KPI: **50건+** 성공, 레그 실패 시 **비상 청산 100% 성공**
+  ① 소액 실거래 ($300~500, max_concurrent=3)
+     KPI: **최소 72시간 + 50건 이상** 성공, 레그 실패 시 **비상 청산 100% 성공**
           API 성공률 > 99%, 24h 무크래시
           양 레그 체결 시간 차이 p95 < 2s
           슬리피지 p95 < 0.1%
@@ -1362,7 +1458,7 @@ Phase 4 ───────── 설정 및 부가 기능
   - 24h 내 kill switch 2회 이상 발동
   - 비상 청산 실패 1건 이상
   - reconciliation 불일치 연속 3회
-  - 수익률이 시뮬 대비 30% 미만
+  - 수익률이 **동시 실행 시뮬 대비 30% 미만** (과거 시뮬이 아닌 병행 실행 시뮬 기준)
   -> 자본 50% 감축 + 원인 분석 후 재진입
 ```
 
@@ -1376,7 +1472,7 @@ Phase 4 ───────── 설정 및 부가 기능
 - [ ] `crates/arb-db/` 디렉토리 및 `Cargo.toml` 생성
 - [ ] `sqlx` 의존성 추가 (mysql, runtime-tokio, chrono, rust_decimal)
 - [ ] `sessions` 테이블 마이그레이션 작성
-- [ ] `positions` 테이블 마이그레이션 작성 (상태 머신 5종, order_id, succeeded_leg)
+- [ ] `positions` 테이블 마이그레이션 작성 (상태 머신 6종: Opening/Open/Closing/Closed/PartiallyClosedOneLeg/PendingExchangeRecovery, order_id, succeeded_leg)
 - [ ] `trades` 테이블 마이그레이션 작성 (side: entry/exit/emergency_close/adjustment)
 - [ ] `minutes` 테이블 마이그레이션 작성
 - [ ] `alerts` 테이블 마이그레이션 작성
@@ -1391,17 +1487,22 @@ Phase 4 ───────── 설정 및 부가 기능
 - [ ] `examples/migrate.rs`: 마이그레이션 실행 바이너리 (DATABASE_URL -> connect -> run)
 - [ ] DB 장애 처리: 시작 시 연결 실패 -> 차단, 운영 중 5분 실패 -> kill switch
 - [ ] workspace `Cargo.toml`에 `arb-db` 추가
-- [ ] `arb-strategy/Cargo.toml`에 `arb-db` 의존 추가
+- [ ] `arb-strategy/Cargo.toml`에 `arb-db = { ..., optional = true }`, `features = ["live"]`로 라이브 인프라 활성화
 - [ ] positions 테이블에 `exit_upbit_order_id`, `exit_bybit_order_id`, `client_order_id`, `in_flight` 컬럼
-- [ ] Background DB Writer: mpsc(256) 단일 consumer, position_id별 순서, 재시도 3회
+- [ ] Background DB Writer: mpsc(256) 단일 consumer, 전체 직렬 순서, try_send 실패 시 newest 드랍 + overflow log, 재시도 3회
 - [ ] DB 커넥션 풀 설정: max=10, min=2, acquire_timeout=5s
 - [ ] MySQL DDL 마이그레이션: 파일당 하나의 DDL만
 - [ ] Crash recovery: client_order_id로 거래소 orphan order 검색
 - [ ] Crash recovery: Opening 양 레그 비대칭 처리 (한쪽만 체결 시 PartiallyClosedOneLeg)
 - [ ] Crash recovery: Closing exit_order_id 양 레그 개별 확인
-- [ ] Session ID 연속성: 이전 세션 Crashed 마감 + 새 session_id + 미청산 포지션 마이그레이션
+- [ ] Session ID 연속성: 이전 세션 Crashed 마감 + 새 session_id (parent_session_id로 참조)
+- [ ] sessions 테이블에 `parent_session_id BIGINT UNSIGNED NULL` 컬럼
+- [ ] sessions.config_json 저장 시 민감 필드(db_url, api_key 등) redact
+- [ ] `db_url`은 `DATABASE_URL` 환경변수에서만 읽기 (strategy.toml에 미포함)
+- [ ] Upbit client_order_id 사전 검증: `/v1/orders/chance` API에서 client_order_id 기반 검색 지원 여부 확인
+- [ ] Client Order ID: UUID v7 형식
 - [ ] SessionWriter trait: FileSessionWriter + DbSessionWriter 추상화
-- [ ] Triple failure fallback: stderr + /tmp/arb_emergency.log + exit(1)
+- [ ] Triple failure fallback: kill switch → graceful shutdown → 30초 timeout → exit(1) + stderr + /tmp/arb_emergency.log
 
 **1-1. unwrap 패닉 제거**
 - [ ] `parking_lot` 크레이트 추가, `std::sync::Mutex` -> `parking_lot::Mutex` 전환 (monitor.rs, orderbook.rs, coin_selector.rs)
@@ -1410,15 +1511,17 @@ Phase 4 ───────── 설정 및 부가 기능
 - [ ] `SystemTime::expect()` -> `unwrap_or_default()` + warn 로그 (bybit/auth.rs + bithumb/auth.rs)
 - [ ] coin_selector.rs, spread.rs의 `.expect()`는 `#[cfg(test)]` 한정 -- 프로덕션 영향 없음 확인
 - [ ] `Decimal::ZERO` fallback 시 즉시 return 가드 (monitor.rs)
+- [ ] API 키 Debug 마스킹: `BybitCredentials`, `UpbitCredentials`에 수동 `Debug` impl (키 마스킹)
 
 **1-2. 포지션 영속화 (Dual-State: 메모리 + DB)**
 - [ ] `position_store.rs` 생성: `PositionStore` trait 정의
 - [ ] `DbPositionStore` 구현 (arb-db 연동)
 - [ ] Dual-State 설계: 메모리(PositionManager) = authoritative, DB = async shadow
-- [ ] order_id 기록만 동기 DB write, 나머지 상태 전이는 비동기 DB write
-- [ ] 상태 전이 3단계: 메모리 Opening -> DB 동기(order_id) -> 메모리 Open + DB 비동기
+- [ ] client_order_id 사전 기록 동기 DB write (Opening INSERT 시), order_id는 체결 후 비동기 write
+- [ ] 상태 전이 3단계: DB 동기(Opening + client_order_id) -> 주문 발주 -> DB 비동기(order_id) -> 메모리 Open + DB 비동기
 - [ ] `VirtualPosition`에 `Serialize/Deserialize`, `PositionState`, `order_id`, `db_id` 추가 + 빌더 패턴
-- [ ] 포지션 상태 머신: Opening -> Open -> Closing -> Closed + PartiallyClosedOneLeg(상세 필드)
+- [ ] 포지션 상태 머신: Opening -> Open -> Closing -> Closed + PartiallyClosedOneLeg + PendingExchangeRecovery (6종)
+- [ ] `closing_started_at: Option<DateTime<Utc>>` 필드 추가
 - [ ] Crash recovery: Opening(order_id) -> get_order() 조회, Closing -> 청산 주문 확인
 - [ ] `load_open()` 실패 시 order_id 기반 reconciliation 강제 + 진입 차단
 
@@ -1429,17 +1532,20 @@ Phase 4 ───────── 설정 및 부가 기능
 - [ ] kill switch 청산: 별도 task spawn, notional 내림차순, 정상 청산 비활성화, 포지션 0 재스캔
 - [ ] kill switch COMPLETE 조건: open_count==0 AND reconciliation 통과
 - [ ] RiskManager 일일 리셋: KST 00:00 (UTC 15:00) 기준
-- [ ] lock order 갱신: `ob_cache -> instrument_cache -> position_mgr -> balance_tracker -> risk_manager.inner -> counters -> spread_calc`
+- [ ] lock order 갱신: `ob_cache -> instrument_cache -> balance_tracker -> position_mgr -> risk_manager.inner -> trades -> session_writer -> counters -> spread_calc`
 - [ ] Rolling 24h 누적 손실 한도 (VecDeque sliding window)
-- [ ] Drawdown HWM 방식 명시 (세션 수명 동안 유지)
+- [ ] Drawdown HWM rolling 7d 방식 (`hwm_window_days = 7`, `VecDeque<(DateTime, Decimal)>` 일별 고점)
+- [ ] `check_unrealized_exposure()`: 전체 미실현 손실 > `max_unrealized_loss_pct` 시 kill switch
 - [ ] Opening in_flight 플래그 + kill switch 재스캔 (1~2초, 최대 30회)
+- [ ] Closing timeout 인수: `state == Closing && (now - closing_started_at) > 30s` → kill switch 인수
+- [ ] `try_transition_to_closing(pos_id) -> bool` 메서드 추가
 
 **1-4. AlertService**
 - [ ] `alert.rs` 생성: 일반 알림 mpsc(64) try_send, 치명적 알림 동기 전송
 - [ ] 텔레그램 실패 시 `alerts` 테이블에 INSERT (DB fallback)
 - [ ] 알림 이벤트 타입 13종 구현 (DbConnectionLost, FundingBlockEntry 추가)
 - [ ] "청산 먼저, 알림 나중" 원칙 적용 (알림이 청산 블로킹 금지)
-- [ ] Triple failure: 텔레그램 + DB 모두 실패 시 stderr + 파일 + exit
+- [ ] Triple failure: 텔레그램 + DB 모두 실패 시 kill switch → graceful → 30초 timeout → exit(1)
 
 **1-5. output DB 전환**
 - [ ] `SessionWriter` -> `DbSessionWriter` 전환 (trades/minutes INSERT)
@@ -1470,11 +1576,15 @@ Phase 4 ───────── 설정 및 부가 기능
 - [ ] 동시 진입 잔고 경합 방지 (reservation 패턴)
 - [ ] 시뮬레이션 example은 BalanceTracker 미사용 확인
 - [ ] ReservationToken RAII: Drop impl + committed 플래그
-- [ ] ReservationToken TTL: 2분 sweeper
+- [ ] ReservationToken TTL: 6분 sweeper (비상 청산 5분 + 여유 1분)
 - [ ] 양 거래소 원자적 예약 (단일 Mutex, 롤백)
 - [ ] sync_from_exchange: expected = available + reserved_total 비교
 - [ ] 괴리 임계값 5% (소액 기준), InsufficientFunds 시 즉시 sync
 - [ ] Decimal checked_sub/checked_add, 음수 clamp
+- [ ] BalanceTracker 동시성 테스트: `reserve()` 100회 동시 호출 → 총 예약 ≤ 초기 잔고
+- [ ] BalanceTracker 동시성 테스트: `reserve() + commit()`과 `reserve() + release()` 교차 → 잔고 정합성
+- [ ] BalanceTracker 동시성 테스트: ReservationToken Drop → 잔고 복원
+- [ ] BalanceTracker 동시성 테스트: TTL sweeper 미확정 토큰 해제
 
 **1-9. 환율 guard**
 - [ ] 환율 staleness guard: 캐시 age > 10분 시 진입 차단, 급변 > 0.2% 시 알림
@@ -1490,14 +1600,15 @@ Phase 4 ───────── 설정 및 부가 기능
 - [ ] Bybit 선물 API: `place_order_linear()`, `set_leverage()`, `switch_margin_mode()`, `get_positions()`
 - [ ] margin_mode 변경 실패 -> 현재 모드 확인 -> Cross면 시작 차단
 - [ ] `PositionInfo` 타입 추가
-- [ ] Bybit rate limiter `public_limiter` / `private_limiter` 분리
+- [ ] Bybit rate limiter `public_limiter` / `private_limiter` / `emergency_limiter` 분리
+- [ ] Upbit에도 `emergency_limiter` 추가
 - [ ] `live_executor.rs` 생성: `LiveExecutor<U, B>` 구체 타입 (trait/dyn 없음)
 - [ ] `EntryRequest`/`ExitRequest`/`ExecutedEntry`/`ExecutedExit` 타입 정의
 - [ ] `OrderExecutionError` enum (Timeout에 leg/order_id/other_leg 상세)
 - [ ] `ExecutedEntry`에 `adjustment_cost` 필드
 - [ ] 양 레그 모두 IOC 지정가 (Upbit + Bybit)
 - [ ] `tokio::time::timeout` 개별(5s) + 전체(10s) 이중 timeout
-- [ ] Client Order ID 멱등성
+- [ ] Client Order ID 멱등성 (UUID v7)
 - [ ] 비상 청산 3단계: IOC(0~2분) -> 시장가(2~5분) -> kill switch(5분+)
 - [ ] Cancel 실패 -> get_order -> PartiallyFilled 수량 조정
 - [ ] Partial fill 초과분 청산 최대 3회 재시도, 수렴 안 하면 kill switch
@@ -1507,15 +1618,20 @@ Phase 4 ───────── 설정 및 부가 기능
 - [ ] 비상 청산 손실 -> RiskManager.record_trade() 포함
 - [ ] `RiskManager.validate_order_size()` 발주 전 확인
 - [ ] 단위 테스트: 양쪽 성공/한쪽 실패/타임아웃/partial fill
+- [ ] Upbit `/v1/orders/chance` API로 마켓별 order_types 확인. IOC 미지원 시 GTC fallback 자동 선택.
 - [ ] Bybit WS execution topic 체결 확인 (REST polling 병행)
-- [ ] Client Order ID: session_id 포함
+- [ ] Bybit WS `/v5/private/position` 토픽 구독. 포지션 외부 변경(강제 청산, ADL) 즉시 감지. execution topic과 함께 private WS 채널에 구독.
+- [ ] Client Order ID: UUID v7 (session 정보 미노출, DB 매핑으로 해결)
 - [ ] Client Order ID DB 사전 기록 (Opening INSERT 시)
 - [ ] 비상 청산 IOC 재시도: 매 재시도마다 최신 가격 갱신
-- [ ] 비상 청산 시장가 -> 넓은 IOC (현재가 +/-2%)
+- [ ] 비상 청산 넓은 IOC 3단계: 2% → 3% → 5% (`emergency_wide_ioc_slippage_pct` config)
 - [ ] 비상 청산 타이머 기준점 = 레그 실패 감지 시각
-- [ ] Post-execution PnL gate 임계치: 수수료 이하 -> 즉시 청산, 수수료 50%+ -> 보유
+- [ ] Post-execution PnL gate 임계치: 수수료 이하 -> 즉시 청산, `post_exec_pnl_gate_ratio` 이상 -> 보유
+- [ ] Partial fill dust threshold: < `max_dust_usdt` warn, $5~$50 3회 재시도, >$50 3회 재시도+코인 제외
+- [ ] min_order_qty 미만 잔량: dust → 포지션 강제 Closed, adjustment_cost 기록
 - [ ] Upbit 시장가 매수 KRW 금액 기준 (수수료 별도)
 - [ ] `cargo test` 전체 통과 + `cargo clippy` 경고 0
+- [ ] Bybit testnet E2E 테스트: testnet 환경에서 LiveExecutor 양 레그 주문/체결/비상 청산 전체 흐름 검증
 
 ### Phase 3: monitor.rs 통합 + 바이너리 분리
 
@@ -1542,7 +1658,8 @@ Phase 4 ───────── 설정 및 부가 기능
 - [ ] NTP > 3초 warn, > 5초 시작 차단
 - [ ] Upbit 마켓 상태 확인 (입출금 정지 코인 제외)
 - [ ] Bybit margin mode + crash recovery 상호작용
-- [ ] Graceful shutdown: SIGTERM -> 진입 차단 -> 진행 중 주문 대기 -> 세션 마감 -> 포지션 유지
+- [ ] Graceful shutdown: SIGTERM -> `shutdown_policy` config에 따라 동작 ("keep"/"close_all"/"close_if_profitable")
+- [ ] 외부 watchdog: heartbeat 5분 미갱신 시 별도 프로세스가 kill switch 수행
 - [ ] 외부 모니터링: sessions 테이블 heartbeat (매분)
 
 **3-3. Reconciliation**
@@ -1553,33 +1670,47 @@ Phase 4 ───────── 설정 및 부가 기능
 - [ ] 차단 범위: 잔고 불일치 -> 전체, 코인 불일치 -> 해당 코인만
 - [ ] 불일치 상태에서 청산 허용 (진입만 차단)
 - [ ] 3회 연속 reconciliation 통과 시 자동 해제
+- [ ] ADL 감지: Bybit WS `/v5/private/position` `adlRankIndicator` 모니터링. ADL 발생 시 Upbit 초과분 매도.
+- [ ] PendingExchangeRecovery: 거래소 장애 시 해당 leg 포지션 전이, 복구 후 자동 청산
 
 **3-4. 펀딩비**
 - [ ] 종목별 펀딩비: 코인 선택 시 FundingSchedule 초기 조회
 - [ ] 펀딩비: spawn + 매분 getTickers -> fundingRate/nextFundingTime 갱신
 - [ ] 펀딩비 진입 차단: 정산 1시간 전~정산 후 15분
-- [ ] 기존 포지션 펀딩비 강제 청산: 정산 15분 전 + 불리 시
+- [ ] 기존 포지션 펀딩비 강제 청산: Major 코인 15분 전, Alt 코인 30분 전 + 불리 시 (`funding_major_coins` config)
 - [ ] 펀딩비 경고 20%, 모니터링 제외 50%
 - [ ] 펀딩비: DB funding_schedules 테이블 UPSERT
 
 **Phase 3 공통**
 - [ ] 시뮬 example이 기존 동작 100% 유지 확인 (`cargo run --example zscore_sim`)
 - [ ] 통합 테스트: LiveExecutor + PositionStore + RiskManager + BalanceTracker end-to-end
-- [ ] Crash recovery 테스트 (DB 기반 각 상태에서 크래시 시뮬레이션)
+- [ ] Crash recovery 테스트: 8개 시나리오 (Opening/order_id NULL, Opening/한쪽만, Opening/양쪽+한쪽Filled, Open, Closing/한쪽Filled, PartiallyClosedOneLeg, DB write 실패, Session ID cross-session)
 - [ ] RiskManager 테스트 (비율+절대값 한도, TOCTOU, kill switch 재스캔)
+- [ ] RiskManager 일일 리셋 시나리오 테스트: 23:50 KST -$40 → 00:00 리셋 → 00:10 -$20 → 일일 $20, rolling 24h $60
+- [ ] HWM rolling 7d 경계값 테스트: 7일 전 고점 만료, 6일 전 고점 유지 확인
 - [ ] `cargo test` 전체 통과 + `cargo clippy` 경고 0
 
 ### Phase 4: 설정 및 부가 기능
 - [ ] `config.rs`에 라이브 전용 설정 추가 (order_timeout_sec, max_slippage_pct, 환율, 펀딩비, db_url 등)
 - [ ] rolling_24h_loss_usdt config 추가
-- [ ] 펀딩 강제청산 config (enabled, minutes, alert/exclude ratio)
+- [ ] 펀딩 강제청산 config (enabled, minutes_major/minutes_alt, major_coins, alert/exclude ratio)
 - [ ] `ClosedPosition`에 `actual_fees`, `funding_fee`, `adjustment_cost` 추가
 - [ ] Order.paid_fee 기반 실수수료 PnL 계산
-- [ ] API 키 Debug impl 마스킹 (bybit/auth.rs, upbit/auth.rs)
+- [ ] API 키 Debug impl 마스킹 → Phase 1-1로 이동 완료
+- [ ] `shutdown_policy` config ("keep"/"close_all"/"close_if_profitable")
+- [ ] `max_unrealized_loss_pct` config (기본값 7%)
+- [ ] `hwm_window_days` config (기본값 7)
+- [ ] `post_exec_pnl_gate_ratio` config (기본값 0.5)
+- [ ] `emergency_wide_ioc_slippage_pct` config ([2.0, 3.0, 5.0])
+- [ ] `max_dust_usdt` config (기본값 5.0)
+- [ ] `funding_force_close_minutes_major` / `funding_force_close_minutes_alt` config
+- [ ] `funding_major_coins` config (["BTC", "ETH"])
+- [ ] tracing-appender RollingFileAppender 일별 로테이션
+- [ ] trades 테이블 `exit_usd_krw` 컬럼 (세금 산정용)
 - [ ] `cargo test` 전체 통과 + `cargo clippy` 경고 0
 
 ### 검증
-- [ ] 소액 ($300-500): 50건+ 성공, 비상 청산 100% 성공, API 성공률 > 99%, 24h 무크래시, 체결 latency p95 < 2s, partial fill < 5%, Sim 병행 PnL 오차 분해, 잔고 오차 < 1%, DB 기록 정합성 100%, ReservationToken leak 0건, 시간대별 성과 분석
+- [ ] 소액 ($300-500, max_concurrent=3): 최소 72시간 + 50건 이상 성공, 비상 청산 100% 성공, API 성공률 > 99%, 24h 무크래시, 체결 latency p95 < 2s, partial fill < 5%, Sim 병행 PnL 오차 분해, 잔고 오차 < 1%, DB 기록 정합성 100%, ReservationToken leak 0건, 시간대별 성과 분석
 - [ ] 중액 ($1,000-2,000): 24h 무중단, kill switch 통과, reconciliation 불일치 0건, 펀딩비 진입 차단 정상 동작
 - [ ] 중간 ($2,000-5,000): 48h 무중단, 수익률 > 0, 슬리피지 안정화 확인
 - [ ] 풀자본 ($10,000): 72h 무중단, 수익률 > 0 AND 시뮬 대비 50%+
