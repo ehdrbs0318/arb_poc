@@ -6,15 +6,17 @@ use crate::bybit::auth::{AuthHeaders, BybitCredentials, build_query_string};
 use crate::bybit::stream::BybitStreamInner;
 use crate::bybit::types::{
     BybitCancelOrderRequest, BybitCancelOrderResult, BybitCreateOrderResult,
-    BybitInstrumentInfoList, BybitKlineList, BybitOrder, BybitOrderList, BybitOrderRequest,
-    BybitOrderbookResult, BybitResponse, BybitTickerList, BybitWalletBalanceResult,
+    BybitInstrumentInfoList, BybitKlineList, BybitLinearTickerList, BybitOrder, BybitOrderList,
+    BybitOrderRequest, BybitOrderbookResult, BybitPositionList, BybitResponse,
+    BybitSetLeverageRequest, BybitSwitchIsolatedRequest, BybitTickerList, BybitWalletBalanceResult,
+    LinearTickerInfo,
 };
 use crate::rate_limit::RateLimiter;
 use arb_exchange::{
     Balance, Candle, CandleInterval, ExchangeError, ExchangeResult, InstrumentDataProvider,
     InstrumentInfoResponse, MarketData, Order, OrderBook, OrderBookLevel, OrderManagement,
-    OrderRequest, OrderSide, OrderStatus, OrderType, PriceChange, StreamConfig, Ticker,
-    TimeInForce,
+    OrderRequest, OrderSide, OrderStatus, OrderType, PositionInfo, PriceChange, StreamConfig,
+    Ticker, TimeInForce,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use reqwest::Client;
@@ -31,11 +33,23 @@ const BASE_URL_TESTNET: &str = "https://api-testnet.bybit.com";
 /// 현물 거래 기본 카테고리.
 const DEFAULT_CATEGORY: &str = "spot";
 
-/// Bybit API 레이트 리밋 (초당 요청 수).
-/// 공식 제한: 20 req/sec (UID 기반). 90%로 보수적 적용.
-const BYBIT_RATE_LIMIT: u32 = 18;
-/// Bybit API 최대 버스트 용량.
-const BYBIT_BURST: u32 = 3;
+/// Bybit 공개 API 레이트 리밋 (초당 요청 수).
+/// 시세, 오더북, 캔들 등 공개 엔드포인트 전용.
+const BYBIT_PUBLIC_RATE_LIMIT: u32 = 10;
+/// 공개 API 최대 버스트 용량.
+const BYBIT_PUBLIC_BURST: u32 = 3;
+
+/// Bybit 비공개 API 레이트 리밋 (초당 요청 수).
+/// 주문, 잔고, 포지션 등 인증 필요 엔드포인트 전용.
+const BYBIT_PRIVATE_RATE_LIMIT: u32 = 10;
+/// 비공개 API 최대 버스트 용량.
+const BYBIT_PRIVATE_BURST: u32 = 3;
+
+/// Bybit 긴급 API 레이트 리밋 (초당 요청 수).
+/// kill switch 청산 등 긴급 상황에서만 사용.
+const BYBIT_EMERGENCY_RATE_LIMIT: u32 = 20;
+/// 긴급 API 최대 버스트 용량.
+const BYBIT_EMERGENCY_BURST: u32 = 5;
 
 /// Bybit V5 API 클라이언트.
 ///
@@ -48,8 +62,14 @@ pub struct BybitClient {
     category: String,
     /// WebSocket 스트림 내부 상태.
     pub(crate) stream: Arc<BybitStreamInner>,
-    /// API 레이트 리밋터.
-    limiter: Arc<RateLimiter>,
+    /// 공개 API (시세, 오더북) 레이트 리밋터.
+    public_limiter: Arc<RateLimiter>,
+    /// 비공개 API (주문, 잔고, 포지션) 레이트 리밋터.
+    private_limiter: Arc<RateLimiter>,
+    /// 긴급 API (kill switch 청산) 레이트 리밋터.
+    /// 향후 LiveExecutor의 kill switch에서 사용됩니다.
+    #[allow(dead_code)]
+    emergency_limiter: Arc<RateLimiter>,
 }
 
 impl std::fmt::Debug for BybitClient {
@@ -59,6 +79,25 @@ impl std::fmt::Debug for BybitClient {
             .field("category", &self.category)
             .field("credentials", &self.credentials.is_some())
             .finish()
+    }
+}
+
+impl Clone for BybitClient {
+    /// 클라이언트를 복제합니다.
+    ///
+    /// reqwest::Client와 모든 Arc 필드는 내부적으로 참조 카운팅이므로
+    /// 실제 리소스(커넥션 풀, rate limiter 상태 등)를 공유합니다.
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            credentials: self.credentials.clone(),
+            base_url: self.base_url.clone(),
+            category: self.category.clone(),
+            stream: Arc::clone(&self.stream),
+            public_limiter: Arc::clone(&self.public_limiter),
+            private_limiter: Arc::clone(&self.private_limiter),
+            emergency_limiter: Arc::clone(&self.emergency_limiter),
+        }
     }
 }
 
@@ -142,7 +181,21 @@ impl BybitClient {
             base_url,
             category: DEFAULT_CATEGORY.to_string(),
             stream: Arc::new(BybitStreamInner::new(StreamConfig::default())),
-            limiter: Arc::new(RateLimiter::new("bybit", BYBIT_RATE_LIMIT, BYBIT_BURST)),
+            public_limiter: Arc::new(RateLimiter::new(
+                "bybit-public",
+                BYBIT_PUBLIC_RATE_LIMIT,
+                BYBIT_PUBLIC_BURST,
+            )),
+            private_limiter: Arc::new(RateLimiter::new(
+                "bybit-private",
+                BYBIT_PRIVATE_RATE_LIMIT,
+                BYBIT_PRIVATE_BURST,
+            )),
+            emergency_limiter: Arc::new(RateLimiter::new(
+                "bybit-emergency",
+                BYBIT_EMERGENCY_RATE_LIMIT,
+                BYBIT_EMERGENCY_BURST,
+            )),
         })
     }
 
@@ -175,9 +228,9 @@ impl BybitClient {
         endpoint: &str,
         params: &[(&str, &str)],
     ) -> ExchangeResult<T> {
-        self.limiter.acquire().await;
+        self.public_limiter.acquire().await;
         let url = format!("{}{}", self.base_url, endpoint);
-        debug!(endpoint, "Bybit public GET 요청");
+        debug!(endpoint, ?params, "Bybit public GET 요청");
         let response = self
             .client
             .get(&url)
@@ -195,10 +248,10 @@ impl BybitClient {
         endpoint: &str,
         params: &[(&str, &str)],
     ) -> ExchangeResult<T> {
-        self.limiter.acquire().await;
+        self.private_limiter.acquire().await;
         let creds = self.credentials()?;
         let url = format!("{}{}", self.base_url, endpoint);
-        debug!(endpoint, "Bybit private GET 요청");
+        debug!(endpoint, ?params, "Bybit private GET 요청");
 
         let query_string = build_query_string(params.iter().map(|(k, v)| (*k, *v)));
         let auth = creds.auth_headers_get(&query_string)?;
@@ -227,7 +280,7 @@ impl BybitClient {
         endpoint: &str,
         body: &impl serde::Serialize,
     ) -> ExchangeResult<T> {
-        self.limiter.acquire().await;
+        self.private_limiter.acquire().await;
         let creds = self.credentials()?;
         let url = format!("{}{}", self.base_url, endpoint);
         debug!(endpoint, "Bybit private POST 요청");
@@ -260,10 +313,19 @@ impl BybitClient {
         response: reqwest::Response,
     ) -> ExchangeResult<T> {
         let status = response.status();
+        let url = response.url().to_string();
         let body = response.text().await.map_err(ExchangeError::HttpError)?;
 
+        debug!(
+            status = status.as_u16(),
+            url = %url,
+            body_len = body.len(),
+            body_preview = %if body.len() > 200 { &body[..200] } else { &body },
+            "Bybit API 응답 수신"
+        );
+
         if !status.is_success() {
-            warn!(status = status.as_u16(), "Bybit API HTTP 에러");
+            warn!(status = status.as_u16(), body = %body, "Bybit API HTTP 에러");
             return Err(self.parse_error(&body, status.as_u16()));
         }
 
@@ -512,6 +574,8 @@ impl OrderManagement for BybitClient {
             time_in_force: time_in_force.map(|s| s.to_string()),
             order_link_id: request.identifier.clone(),
             market_unit,
+            reduce_only: None,
+            position_idx: None,
         };
 
         let result: BybitCreateOrderResult = self.post_private("/v5/order/create", &body).await?;
@@ -650,6 +714,371 @@ impl InstrumentDataProvider for BybitClient {
             max_order_qty,
             min_notional,
         })
+    }
+}
+
+impl arb_exchange::LinearOrderManagement for BybitClient {
+    async fn place_order_linear(
+        &self,
+        request: &OrderRequest,
+        reduce_only: bool,
+    ) -> ExchangeResult<Order> {
+        self.place_order_linear_impl(request, reduce_only).await
+    }
+
+    async fn get_order_linear(&self, order_id: &str) -> ExchangeResult<Order> {
+        self.get_order_linear_impl(order_id).await
+    }
+
+    async fn cancel_order_linear(
+        &self,
+        order_id: &str,
+        symbol: Option<&str>,
+    ) -> ExchangeResult<Order> {
+        self.cancel_order_linear_impl(order_id, symbol).await
+    }
+}
+
+/// Bybit 선물(linear) 전용 API 메서드.
+impl BybitClient {
+    /// 선물(linear) 주문을 생성합니다.
+    ///
+    /// # 인자
+    ///
+    /// * `request` - 주문 요청 파라미터
+    /// * `reduce_only` - 포지션 감소 전용 주문 여부 (true이면 기존 포지션을 줄이는 방향으로만 체결)
+    ///
+    /// # 반환값
+    ///
+    /// 생성된 주문 정보를 반환합니다.
+    pub async fn place_order_linear_impl(
+        &self,
+        request: &OrderRequest,
+        reduce_only: bool,
+    ) -> ExchangeResult<Order> {
+        let symbol = Self::to_bybit_symbol(&request.market);
+
+        let side = match request.side {
+            OrderSide::Buy => "Buy",
+            OrderSide::Sell => "Sell",
+        };
+
+        let order_type = match request.order_type {
+            OrderType::Limit => "Limit",
+            OrderType::Market | OrderType::Price => "Market",
+            OrderType::Best => "Limit",
+        };
+
+        let time_in_force = request.time_in_force.map(|tif| match tif {
+            TimeInForce::Gtc => "GTC",
+            TimeInForce::Ioc => "IOC",
+            TimeInForce::Fok => "FOK",
+            TimeInForce::PostOnly => "PostOnly",
+        });
+
+        let qty = request.volume.unwrap_or(Decimal::ZERO).to_string();
+
+        let body = BybitOrderRequest {
+            category: "linear".to_string(),
+            symbol: symbol.clone(),
+            side: side.to_string(),
+            order_type: order_type.to_string(),
+            qty,
+            price: request.price.map(|p| p.to_string()),
+            time_in_force: time_in_force.map(|s| s.to_string()),
+            order_link_id: request.identifier.clone(),
+            market_unit: None,
+            reduce_only: Some(reduce_only),
+            position_idx: Some(0), // one-way mode
+        };
+
+        debug!(
+            symbol = %symbol,
+            side = %side,
+            qty = %body.qty,
+            price = ?request.price,
+            order_type = %order_type,
+            time_in_force = ?time_in_force,
+            reduce_only,
+            "Bybit linear 주문 생성 요청"
+        );
+
+        let result: BybitCreateOrderResult = self.post_private("/v5/order/create", &body).await?;
+
+        debug!(
+            order_id = %result.order_id,
+            order_link_id = ?result.order_link_id,
+            "Bybit linear 주문 생성 완료"
+        );
+
+        self.get_order_linear_impl(&result.order_id).await
+    }
+
+    /// 선물(linear) 주문을 조회합니다.
+    ///
+    /// # 인자
+    ///
+    /// * `order_id` - 조회할 주문 ID
+    pub async fn get_order_linear_impl(&self, order_id: &str) -> ExchangeResult<Order> {
+        let params = [("category", "linear"), ("orderId", order_id)];
+
+        debug!(order_id, "Bybit linear 주문 조회 요청");
+
+        let result: BybitOrderList = self.get_private("/v5/order/realtime", &params).await?;
+
+        result
+            .list
+            .into_iter()
+            .next()
+            .map(convert_order)
+            .ok_or_else(|| ExchangeError::OrderNotFound(order_id.to_string()))
+    }
+
+    /// 선물(linear) 주문을 취소합니다.
+    ///
+    /// # 인자
+    ///
+    /// * `order_id` - 취소할 주문 ID
+    /// * `symbol` - 심볼 (예: "BTCUSDT"). 지정하면 주문 조회를 생략하여 API 호출 1회 절약.
+    pub async fn cancel_order_linear_impl(
+        &self,
+        order_id: &str,
+        symbol: Option<&str>,
+    ) -> ExchangeResult<Order> {
+        let bybit_symbol = if let Some(s) = symbol {
+            s.to_string()
+        } else {
+            // 심볼이 없으면 주문 조회하여 심볼 확인
+            let order = self.get_order_linear_impl(order_id).await?;
+            Self::to_bybit_symbol(&order.market)
+        };
+
+        debug!(order_id, symbol = %bybit_symbol, "Bybit linear 주문 취소 요청");
+
+        let body = BybitCancelOrderRequest {
+            category: "linear".to_string(),
+            symbol: bybit_symbol,
+            order_id: Some(order_id.to_string()),
+            order_link_id: None,
+        };
+
+        let _result: BybitCancelOrderResult = self.post_private("/v5/order/cancel", &body).await?;
+
+        debug!(order_id, "Bybit linear 주문 취소 완료");
+
+        self.get_order_linear_impl(order_id).await
+    }
+
+    /// 선물 심볼의 레버리지를 설정합니다.
+    ///
+    /// buyLeverage와 sellLeverage를 동일하게 설정합니다.
+    /// 이미 동일한 레버리지가 설정되어 있으면 에러를 무시합니다.
+    ///
+    /// # 인자
+    ///
+    /// * `symbol` - 심볼 (예: "BTCUSDT")
+    /// * `leverage` - 설정할 레버리지 배수
+    pub async fn set_leverage(&self, symbol: &str, leverage: u32) -> ExchangeResult<()> {
+        let lev_str = leverage.to_string();
+        debug!(symbol, leverage, "Bybit 레버리지 설정 요청");
+
+        let body = BybitSetLeverageRequest {
+            category: "linear".to_string(),
+            symbol: symbol.to_string(),
+            buy_leverage: lev_str.clone(),
+            sell_leverage: lev_str,
+        };
+
+        match self
+            .post_private::<serde_json::Value>("/v5/position/set-leverage", &body)
+            .await
+        {
+            Ok(_) => {
+                debug!(symbol, leverage, "Bybit 레버리지 설정 완료");
+                Ok(())
+            }
+            Err(ExchangeError::ApiError(msg)) if msg.contains("leverage not modified") => {
+                debug!(symbol, leverage, "레버리지 이미 동일 — 무시");
+                Ok(())
+            }
+            Err(ExchangeError::UnknownError { code, message }) if code == "110043" => {
+                // 110043: Set leverage not modified
+                debug!(
+                    symbol,
+                    leverage, "레버리지 이미 동일 (110043) — 무시: {}", message
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 선물 심볼의 마진 모드를 전환합니다 (cross/isolated).
+    ///
+    /// 이미 동일한 모드가 설정되어 있으면 에러를 무시합니다.
+    ///
+    /// # 인자
+    ///
+    /// * `symbol` - 심볼 (예: "BTCUSDT")
+    /// * `trade_mode` - 0=cross, 1=isolated
+    /// * `leverage` - 전환 시 적용할 레버리지
+    pub async fn switch_margin_mode(
+        &self,
+        symbol: &str,
+        trade_mode: i32,
+        leverage: u32,
+    ) -> ExchangeResult<()> {
+        let lev_str = leverage.to_string();
+        let mode_name = if trade_mode == 0 { "cross" } else { "isolated" };
+        debug!(
+            symbol,
+            mode = mode_name,
+            leverage,
+            "Bybit 마진 모드 전환 요청"
+        );
+
+        let body = BybitSwitchIsolatedRequest {
+            category: "linear".to_string(),
+            symbol: symbol.to_string(),
+            trade_mode,
+            buy_leverage: lev_str.clone(),
+            sell_leverage: lev_str,
+        };
+
+        match self
+            .post_private::<serde_json::Value>("/v5/position/switch-isolated", &body)
+            .await
+        {
+            Ok(_) => {
+                debug!(symbol, mode = mode_name, "Bybit 마진 모드 전환 완료");
+                Ok(())
+            }
+            Err(ExchangeError::UnknownError { code, message }) if code == "110026" => {
+                // 110026: Cross/isolated margin mode is not modified
+                debug!(
+                    symbol,
+                    mode = mode_name,
+                    "마진 모드 이미 동일 (110026) — 무시: {}",
+                    message
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 선물 포지션 정보를 조회합니다.
+    ///
+    /// # 인자
+    ///
+    /// * `symbol` - 심볼 (예: "BTCUSDT")
+    pub async fn get_positions(&self, symbol: &str) -> ExchangeResult<Vec<PositionInfo>> {
+        let params = [("category", "linear"), ("symbol", symbol)];
+
+        debug!(symbol, "Bybit 포지션 조회 요청");
+
+        let result: BybitPositionList = self.get_private("/v5/position/list", &params).await?;
+
+        let positions: Vec<PositionInfo> = result
+            .list
+            .into_iter()
+            .map(|p| PositionInfo {
+                symbol: p.symbol,
+                side: p.side,
+                size: p.size,
+                entry_price: p.avg_price,
+                leverage: p.leverage,
+                unrealised_pnl: p.unrealised_pnl,
+                liq_price: p.liq_price.unwrap_or(Decimal::ZERO),
+            })
+            .collect();
+
+        debug!(symbol, count = positions.len(), "Bybit 포지션 조회 완료");
+        Ok(positions)
+    }
+
+    /// 선물(linear) 티커 정보를 조회합니다 (펀딩레이트 포함).
+    ///
+    /// # 인자
+    ///
+    /// * `symbol` - 조회할 심볼 (None이면 전체 조회)
+    pub async fn get_tickers_linear(
+        &self,
+        symbol: Option<&str>,
+    ) -> ExchangeResult<Vec<LinearTickerInfo>> {
+        let symbol_owned;
+        let mut params = vec![("category", "linear")];
+        if let Some(s) = symbol {
+            symbol_owned = s.to_string();
+            params.push(("symbol", &symbol_owned));
+        }
+
+        debug!(symbol = ?symbol, "Bybit linear 티커 조회 요청");
+
+        let result: BybitLinearTickerList = self.get_public("/v5/market/tickers", &params).await?;
+
+        let tickers: Vec<LinearTickerInfo> = result
+            .list
+            .into_iter()
+            .map(|t| {
+                let funding_rate = t
+                    .funding_rate
+                    .map(|d| d.to_string().parse::<f64>().unwrap_or(0.0))
+                    .unwrap_or(0.0);
+                let next_funding_time = t
+                    .next_funding_time
+                    .as_deref()
+                    .unwrap_or("0")
+                    .parse::<i64>()
+                    .unwrap_or(0);
+
+                LinearTickerInfo {
+                    symbol: t.symbol,
+                    funding_rate,
+                    next_funding_time,
+                }
+            })
+            .collect();
+
+        debug!(count = tickers.len(), "Bybit linear 티커 조회 완료");
+        Ok(tickers)
+    }
+
+    /// 긴급 주문용 POST 메서드 (emergency_limiter 사용).
+    ///
+    /// kill switch 등 긴급 청산 시에만 사용합니다.
+    /// 향후 LiveExecutor에서 호출됩니다.
+    #[allow(dead_code)]
+    pub(crate) async fn post_emergency<T: serde::de::DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        body: &impl serde::Serialize,
+    ) -> ExchangeResult<T> {
+        self.emergency_limiter.acquire().await;
+        let creds = self.credentials()?;
+        let url = format!("{}{}", self.base_url, endpoint);
+        debug!(endpoint, "Bybit emergency POST 요청");
+
+        let body_json = serde_json::to_string(body).map_err(ExchangeError::JsonError)?;
+        let auth = creds.auth_headers_post(&body_json)?;
+
+        let response = self
+            .client
+            .post(&url)
+            .header(AuthHeaders::HEADER_API_KEY, &auth.api_key)
+            .header(AuthHeaders::HEADER_TIMESTAMP, auth.timestamp.to_string())
+            .header(AuthHeaders::HEADER_SIGN, &auth.signature)
+            .header(
+                AuthHeaders::HEADER_RECV_WINDOW,
+                auth.recv_window.to_string(),
+            )
+            .header("Content-Type", "application/json")
+            .body(body_json)
+            .send()
+            .await
+            .map_err(ExchangeError::HttpError)?;
+
+        self.handle_response(response).await
     }
 }
 

@@ -7,6 +7,7 @@ use arb_exchange::ExchangeError;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde::Serialize;
 use sha2::{Digest, Sha512};
+use tracing::warn;
 use uuid::Uuid;
 
 /// Bithumb 인증용 JWT 페이로드.
@@ -22,10 +23,24 @@ struct JwtPayload {
 }
 
 /// Bithumb API 인증용 자격 증명.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BithumbCredentials {
     access_key: String,
     secret_key: String,
+}
+
+impl std::fmt::Debug for BithumbCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let masked_access_key = if self.access_key.len() >= 4 {
+            format!("{}****", &self.access_key[..4])
+        } else {
+            "****".to_string()
+        };
+        f.debug_struct("BithumbCredentials")
+            .field("access_key", &masked_access_key)
+            .field("secret_key", &"****")
+            .finish()
+    }
 }
 
 impl BithumbCredentials {
@@ -43,11 +58,17 @@ impl BithumbCredentials {
     }
 
     /// 현재 타임스탬프를 밀리초 단위로 반환합니다.
+    ///
+    /// `SystemTime`이 `UNIX_EPOCH` 이전인 경우 0을 반환하고 warn 로그를 남깁니다.
     fn current_timestamp_ms() -> i64 {
-        std::time::SystemTime::now()
+        let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
-            .unwrap_or(0)
+            .unwrap_or(0);
+        if ts == 0 {
+            warn!("SystemTime duration_since failed, using default");
+        }
+        ts
     }
 
     /// 쿼리 파라미터 없이 JWT 토큰을 생성합니다.
@@ -196,5 +217,25 @@ mod tests {
         let creds = BithumbCredentials::new("test_access_key", "test_secret_key");
         let header = creds.authorization_header().unwrap();
         assert!(header.starts_with("Bearer "));
+    }
+
+    #[test]
+    fn test_debug_masks_credentials() {
+        let creds = BithumbCredentials::new("abcd1234secret", "my_super_secret_key");
+        let debug_str = format!("{:?}", creds);
+        // access_key 앞 4자만 노출
+        assert!(debug_str.contains("abcd****"));
+        // secret_key 완전 마스킹
+        assert!(!debug_str.contains("my_super_secret_key"));
+        assert!(debug_str.contains("\"****\""));
+    }
+
+    #[test]
+    fn test_debug_masks_short_access_key() {
+        let creds = BithumbCredentials::new("ab", "short_secret");
+        let debug_str = format!("{:?}", creds);
+        // 4자 미만이면 전체 마스킹
+        assert!(debug_str.contains("\"****\""));
+        assert!(!debug_str.contains("short_secret"));
     }
 }

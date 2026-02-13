@@ -72,6 +72,33 @@ pub enum ExchangeError {
     UnknownError { code: String, message: String },
 }
 
+impl ExchangeError {
+    /// 에러가 재시도 가능한지 판별합니다.
+    ///
+    /// 일시적 네트워크 문제, rate limit, 거래소 점검 등은 재시도 가능하고,
+    /// 인증 실패, 잔고 부족, 잘못된 파라미터 등은 재시도해도 결과가 동일합니다.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::RateLimitExceeded(_) => true,
+            Self::HttpError(e) => e.is_timeout() || e.is_connect(),
+            Self::ExchangeOffline(_) => true,
+            Self::WebSocketError(_) => true,
+            Self::InternalError(_) => true,
+            Self::AuthError(_) => false,
+            Self::InsufficientFunds(_) => false,
+            Self::InvalidParameter(_) => false,
+            Self::OrderNotFound(_) => false,
+            Self::MarketNotFound(_) => false,
+            Self::ConfigError(_) => false,
+            Self::Unsupported(_) => false,
+            Self::ApiError(_) => false,
+            Self::ParseError(_) => false,
+            Self::JsonError(_) => false,
+            Self::UnknownError { .. } => false,
+        }
+    }
+}
+
 /// 거래소 작업을 위한 Result 타입 별칭.
 pub type ExchangeResult<T> = Result<T, ExchangeError>;
 
@@ -131,5 +158,76 @@ mod tests {
             err.to_string(),
             "Parse error: tick_size parse: invalid decimal"
         );
+    }
+
+    #[test]
+    fn test_is_retryable_true_cases() {
+        // rate limit은 재시도 가능
+        let err = ExchangeError::RateLimitExceeded("too many requests".to_string());
+        assert!(err.is_retryable());
+
+        // 거래소 오프라인은 재시도 가능
+        let err = ExchangeError::ExchangeOffline("maintenance".to_string());
+        assert!(err.is_retryable());
+
+        // WebSocket 에러는 재시도 가능
+        let err = ExchangeError::WebSocketError("connection lost".to_string());
+        assert!(err.is_retryable());
+
+        // 내부 에러는 재시도 가능
+        let err = ExchangeError::InternalError("system error".to_string());
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn test_is_retryable_false_cases() {
+        // 인증 실패는 재시도 불가
+        let err = ExchangeError::AuthError("invalid key".to_string());
+        assert!(!err.is_retryable());
+
+        // 잔고 부족은 재시도 불가
+        let err = ExchangeError::InsufficientFunds("not enough".to_string());
+        assert!(!err.is_retryable());
+
+        // 잘못된 파라미터는 재시도 불가
+        let err = ExchangeError::InvalidParameter("bad param".to_string());
+        assert!(!err.is_retryable());
+
+        // 주문 미발견은 재시도 불가
+        let err = ExchangeError::OrderNotFound("no order".to_string());
+        assert!(!err.is_retryable());
+
+        // 마켓 미발견은 재시도 불가
+        let err = ExchangeError::MarketNotFound("no market".to_string());
+        assert!(!err.is_retryable());
+
+        // 설정 에러는 재시도 불가
+        let err = ExchangeError::ConfigError("bad config".to_string());
+        assert!(!err.is_retryable());
+
+        // 미지원 에러는 재시도 불가
+        let err = ExchangeError::Unsupported("not supported".to_string());
+        assert!(!err.is_retryable());
+
+        // API 에러는 재시도 불가
+        let err = ExchangeError::ApiError("business error".to_string());
+        assert!(!err.is_retryable());
+
+        // 파싱 에러는 재시도 불가
+        let err = ExchangeError::ParseError("parse failed".to_string());
+        assert!(!err.is_retryable());
+
+        // JSON 에러는 재시도 불가
+        let json_str = "invalid json";
+        let result: Result<serde_json::Value, _> = serde_json::from_str(json_str);
+        let err = ExchangeError::from(result.unwrap_err());
+        assert!(!err.is_retryable());
+
+        // 알 수 없는 에러는 재시도 불가
+        let err = ExchangeError::UnknownError {
+            code: "999".to_string(),
+            message: "unknown".to_string(),
+        };
+        assert!(!err.is_retryable());
     }
 }

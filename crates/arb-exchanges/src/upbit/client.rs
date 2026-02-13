@@ -19,7 +19,7 @@ use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, error, info, warn};
 
 /// Upbit REST API 기본 URL.
 const BASE_URL: &str = "https://api.upbit.com/v1";
@@ -40,6 +40,12 @@ const UPBIT_EXCHANGE_RATE_LIMIT: u32 = 25;
 /// Exchange API 최대 버스트 용량.
 const UPBIT_EXCHANGE_BURST: u32 = 3;
 
+/// Upbit 긴급 API 레이트 리밋 (초당 요청 수).
+/// kill switch 청산 등 긴급 상황에서만 사용.
+const UPBIT_EMERGENCY_RATE_LIMIT: u32 = 30;
+/// 긴급 API 최대 버스트 용량.
+const UPBIT_EMERGENCY_BURST: u32 = 5;
+
 pub struct UpbitClient {
     client: Client,
     pub(crate) credentials: Option<UpbitCredentials>,
@@ -49,6 +55,10 @@ pub struct UpbitClient {
     quotation_limiter: Arc<RateLimiter>,
     /// Exchange API (주문/계좌) 레이트 리밋터.
     exchange_limiter: Arc<RateLimiter>,
+    /// 긴급 API (kill switch 청산) 레이트 리밋터.
+    /// 향후 LiveExecutor의 kill switch에서 사용됩니다.
+    #[allow(dead_code)]
+    emergency_limiter: Arc<RateLimiter>,
 }
 
 impl std::fmt::Debug for UpbitClient {
@@ -56,6 +66,23 @@ impl std::fmt::Debug for UpbitClient {
         f.debug_struct("UpbitClient")
             .field("credentials", &self.credentials.is_some())
             .finish()
+    }
+}
+
+impl Clone for UpbitClient {
+    /// 클라이언트를 복제합니다.
+    ///
+    /// reqwest::Client와 모든 Arc 필드는 내부적으로 참조 카운팅이므로
+    /// 실제 리소스(커넥션 풀, rate limiter 상태 등)를 공유합니다.
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            credentials: self.credentials.clone(),
+            stream: Arc::clone(&self.stream),
+            quotation_limiter: Arc::clone(&self.quotation_limiter),
+            exchange_limiter: Arc::clone(&self.exchange_limiter),
+            emergency_limiter: Arc::clone(&self.emergency_limiter),
+        }
     }
 }
 
@@ -86,6 +113,11 @@ impl UpbitClient {
                 "upbit-exchange",
                 UPBIT_EXCHANGE_RATE_LIMIT,
                 UPBIT_EXCHANGE_BURST,
+            )),
+            emergency_limiter: Arc::new(RateLimiter::new(
+                "upbit-emergency",
+                UPBIT_EMERGENCY_RATE_LIMIT,
+                UPBIT_EMERGENCY_BURST,
             )),
         })
     }
@@ -125,6 +157,11 @@ impl UpbitClient {
                 UPBIT_EXCHANGE_RATE_LIMIT,
                 UPBIT_EXCHANGE_BURST,
             )),
+            emergency_limiter: Arc::new(RateLimiter::new(
+                "upbit-emergency",
+                UPBIT_EMERGENCY_RATE_LIMIT,
+                UPBIT_EMERGENCY_BURST,
+            )),
         })
     }
 
@@ -148,7 +185,7 @@ impl UpbitClient {
     ) -> ExchangeResult<T> {
         self.quotation_limiter.acquire().await;
         let url = format!("{BASE_URL}{endpoint}");
-        debug!(endpoint, "Upbit public GET 요청");
+        debug!(endpoint, ?params, "Upbit public GET 요청");
         let mut request = self.client.get(&url);
 
         if let Some(params) = params {
@@ -168,7 +205,7 @@ impl UpbitClient {
         self.exchange_limiter.acquire().await;
         let creds = self.credentials()?;
         let url = format!("{BASE_URL}{endpoint}");
-        debug!(endpoint, "Upbit private GET 요청");
+        debug!(endpoint, ?params, "Upbit private GET 요청");
 
         let auth_header = if let Some(params) = params {
             let query_string = build_query_string(params.iter().map(|(k, v)| (*k, *v)));
@@ -426,6 +463,17 @@ impl OrderManagement for UpbitClient {
             TimeInForce::PostOnly => "post_only",
         });
 
+        debug!(
+            market = %request.market,
+            side = side,
+            ord_type = ord_type,
+            volume = ?request.volume,
+            price = ?request.price,
+            time_in_force = ?time_in_force,
+            identifier = ?request.identifier,
+            "Upbit 주문 생성 요청"
+        );
+
         let body = UpbitOrderRequest {
             market: request.market.clone(),
             side: side.to_string(),
@@ -436,45 +484,111 @@ impl OrderManagement for UpbitClient {
             identifier: request.identifier.clone(),
         };
 
-        let upbit_order: UpbitOrder = self.post_private("/orders", &body).await?;
-        Ok(convert_order(upbit_order))
+        let upbit_order: UpbitOrder = self.post_private("/orders", &body).await.map_err(|e| {
+            error!(
+                market = %request.market,
+                side = side,
+                error = %e,
+                "Upbit 주문 생성 실패"
+            );
+            e
+        })?;
+
+        let order = convert_order(upbit_order);
+        info!(
+            order_id = %order.id,
+            market = %order.market,
+            side = ?order.side,
+            status = ?order.status,
+            executed_volume = %order.executed_volume,
+            avg_price = ?order.avg_price,
+            paid_fee = %order.paid_fee,
+            "Upbit 주문 생성 완료"
+        );
+        Ok(order)
     }
 
     async fn cancel_order(&self, order_id: &str) -> ExchangeResult<Order> {
+        debug!(order_id = order_id, "Upbit 주문 취소 요청");
+
         let params = [("uuid", order_id)];
-        let upbit_order: UpbitOrder = self.delete_private("/order", &params).await?;
-        Ok(convert_order(upbit_order))
+        let upbit_order: UpbitOrder =
+            self.delete_private("/order", &params).await.map_err(|e| {
+                error!(order_id = order_id, error = %e, "Upbit 주문 취소 실패");
+                e
+            })?;
+        let order = convert_order(upbit_order);
+
+        info!(
+            order_id = %order.id,
+            status = ?order.status,
+            remaining = %order.remaining_volume,
+            "Upbit 주문 취소 완료"
+        );
+        Ok(order)
     }
 
     async fn get_order(&self, order_id: &str) -> ExchangeResult<Order> {
+        debug!(order_id = order_id, "Upbit 주문 조회 요청");
+
         let params = [("uuid", order_id)];
-        let upbit_order: UpbitOrder = self.get_private("/order", Some(&params)).await?;
-        Ok(convert_order(upbit_order))
+        let upbit_order: UpbitOrder = self
+            .get_private("/order", Some(&params))
+            .await
+            .map_err(|e| {
+                warn!(order_id = order_id, error = %e, "Upbit 주문 조회 실패");
+                e
+            })?;
+        let order = convert_order(upbit_order);
+
+        debug!(
+            order_id = %order.id,
+            status = ?order.status,
+            executed = %order.executed_volume,
+            remaining = %order.remaining_volume,
+            "Upbit 주문 조회 결과"
+        );
+        Ok(order)
     }
 
     async fn get_open_orders(&self, market: Option<&str>) -> ExchangeResult<Vec<Order>> {
+        debug!(market = ?market, "Upbit 미체결 주문 조회");
+
         let mut params = vec![("state", "wait")];
         if let Some(m) = market {
             params.push(("market", m));
         }
 
         let upbit_orders: Vec<UpbitOrder> = self.get_private("/orders", Some(&params)).await?;
-        Ok(upbit_orders.into_iter().map(convert_order).collect())
+        let orders: Vec<Order> = upbit_orders.into_iter().map(convert_order).collect();
+        debug!(count = orders.len(), "Upbit 미체결 주문 조회 완료");
+        Ok(orders)
     }
 
     async fn get_balances(&self) -> ExchangeResult<Vec<Balance>> {
+        debug!("Upbit 전체 잔고 조회");
         let upbit_balances: Vec<UpbitBalance> = self.get_private("/accounts", None).await?;
-        Ok(upbit_balances.into_iter().map(convert_balance).collect())
+        let balances: Vec<Balance> = upbit_balances.into_iter().map(convert_balance).collect();
+        debug!(count = balances.len(), "Upbit 잔고 조회 완료");
+        Ok(balances)
     }
 
     async fn get_balance(&self, currency: &str) -> ExchangeResult<Balance> {
+        debug!(currency = currency, "Upbit 잔고 조회");
         let balances = self.get_balances().await?;
-        balances
+        let balance = balances
             .into_iter()
             .find(|b| b.currency == currency)
             .ok_or_else(|| {
                 ExchangeError::InvalidParameter(format!("Currency not found: {currency}"))
-            })
+            })?;
+        debug!(
+            currency = currency,
+            balance = %balance.balance,
+            locked = %balance.locked,
+            "Upbit 잔고 조회 결과"
+        );
+        Ok(balance)
     }
 }
 

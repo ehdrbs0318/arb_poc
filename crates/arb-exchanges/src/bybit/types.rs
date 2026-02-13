@@ -399,6 +399,14 @@ pub struct BybitOrderRequest {
     /// 시장가 주문 시 단위 (baseCoin, quoteCoin).
     #[serde(rename = "marketUnit", skip_serializing_if = "Option::is_none")]
     pub market_unit: Option<String>,
+    /// 포지션 감소 전용 주문 여부 (선물 전용).
+    /// true이면 포지션을 줄이는 방향으로만 체결됩니다.
+    #[serde(rename = "reduceOnly", skip_serializing_if = "Option::is_none")]
+    pub reduce_only: Option<bool>,
+    /// 포지션 인덱스 (선물 전용).
+    /// 0: one-way mode, 1: hedge-mode Buy side, 2: hedge-mode Sell side.
+    #[serde(rename = "positionIdx", skip_serializing_if = "Option::is_none")]
+    pub position_idx: Option<i32>,
 }
 
 /// Bybit 주문 취소 요청 본문.
@@ -461,6 +469,117 @@ pub struct BybitLotSizeFilter {
     /// 최소 주문 금액 (USDT). 선물에만 있을 수 있으므로 Option.
     #[serde(rename = "minNotionalValue", default)]
     pub min_notional_value: Option<String>,
+}
+
+/// Bybit 선물 포지션 목록 결과.
+#[derive(Debug, Deserialize)]
+pub struct BybitPositionList {
+    pub category: String,
+    pub list: Vec<BybitPositionItem>,
+    #[serde(rename = "nextPageCursor", default)]
+    pub next_page_cursor: Option<String>,
+}
+
+/// Bybit 선물 포지션 항목.
+#[derive(Debug, Deserialize)]
+pub struct BybitPositionItem {
+    /// 심볼.
+    pub symbol: String,
+    /// 포지션 방향: "Buy" (롱), "Sell" (숏), "" (없음).
+    pub side: String,
+    /// 포지션 수량.
+    #[serde(deserialize_with = "deserialize_decimal_string")]
+    pub size: Decimal,
+    /// 평균 진입가.
+    #[serde(rename = "avgPrice", deserialize_with = "deserialize_decimal_string")]
+    pub avg_price: Decimal,
+    /// 레버리지.
+    #[serde(deserialize_with = "deserialize_decimal_string")]
+    pub leverage: Decimal,
+    /// 미실현 손익.
+    #[serde(
+        rename = "unrealisedPnl",
+        deserialize_with = "deserialize_decimal_string"
+    )]
+    pub unrealised_pnl: Decimal,
+    /// 청산 가격 (빈 문자열이면 None).
+    #[serde(
+        rename = "liqPrice",
+        default,
+        deserialize_with = "deserialize_optional_decimal_string"
+    )]
+    pub liq_price: Option<Decimal>,
+}
+
+/// Bybit 선물(linear) 티커 목록 결과.
+#[derive(Debug, Deserialize)]
+pub struct BybitLinearTickerList {
+    pub category: String,
+    pub list: Vec<BybitLinearTicker>,
+}
+
+/// Bybit 선물 티커 정보 (펀딩레이트 포함).
+#[derive(Debug, Deserialize)]
+pub struct BybitLinearTicker {
+    /// 심볼 (예: "BTCUSDT").
+    pub symbol: String,
+    /// 최근 체결가.
+    #[serde(rename = "lastPrice", deserialize_with = "deserialize_decimal_string")]
+    pub last_price: Decimal,
+    /// 펀딩레이트.
+    #[serde(
+        rename = "fundingRate",
+        default,
+        deserialize_with = "deserialize_optional_decimal_string"
+    )]
+    pub funding_rate: Option<Decimal>,
+    /// 다음 펀딩 시간 (밀리초 타임스탬프, 문자열).
+    #[serde(rename = "nextFundingTime", default)]
+    pub next_funding_time: Option<String>,
+}
+
+/// Bybit 레버리지 설정 요청 본문.
+#[derive(Debug, Serialize)]
+pub struct BybitSetLeverageRequest {
+    /// 카테고리: linear, inverse.
+    pub category: String,
+    /// 심볼.
+    pub symbol: String,
+    /// 매수 레버리지.
+    #[serde(rename = "buyLeverage")]
+    pub buy_leverage: String,
+    /// 매도 레버리지.
+    #[serde(rename = "sellLeverage")]
+    pub sell_leverage: String,
+}
+
+/// Bybit 마진 모드 전환 요청 본문.
+#[derive(Debug, Serialize)]
+pub struct BybitSwitchIsolatedRequest {
+    /// 카테고리: linear, inverse.
+    pub category: String,
+    /// 심볼.
+    pub symbol: String,
+    /// 거래 모드: 0=cross, 1=isolated.
+    #[serde(rename = "tradeMode")]
+    pub trade_mode: i32,
+    /// 매수 레버리지.
+    #[serde(rename = "buyLeverage")]
+    pub buy_leverage: String,
+    /// 매도 레버리지.
+    #[serde(rename = "sellLeverage")]
+    pub sell_leverage: String,
+}
+
+/// 선물(linear) 티커 정보 (공통 타입).
+#[derive(Debug, Clone)]
+pub struct LinearTickerInfo {
+    /// 심볼 (예: "BTCUSDT").
+    pub symbol: String,
+    /// 현재 펀딩레이트.
+    pub funding_rate: f64,
+    /// 다음 펀딩 시간 (밀리초 타임스탬프).
+    pub next_funding_time: i64,
 }
 
 /// 문자열에서 Decimal로 역직렬화.
@@ -638,12 +757,40 @@ mod tests {
             time_in_force: Some("GTC".to_string()),
             order_link_id: None,
             market_unit: None,
+            reduce_only: None,
+            position_idx: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"category\":\"spot\""));
         assert!(json.contains("\"symbol\":\"BTCUSDT\""));
         assert!(!json.contains("orderLinkId"));
+        // None 필드는 직렬화에서 제외됨
+        assert!(!json.contains("reduceOnly"));
+        assert!(!json.contains("positionIdx"));
+    }
+
+    #[test]
+    fn test_bybit_order_request_linear_serialization() {
+        let req = BybitOrderRequest {
+            category: "linear".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            side: "Sell".to_string(),
+            order_type: "Market".to_string(),
+            qty: "0.01".to_string(),
+            price: None,
+            time_in_force: None,
+            order_link_id: Some("test123".to_string()),
+            market_unit: None,
+            reduce_only: Some(true),
+            position_idx: Some(0),
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"category\":\"linear\""));
+        assert!(json.contains("\"reduceOnly\":true"));
+        assert!(json.contains("\"positionIdx\":0"));
+        assert!(json.contains("\"orderLinkId\":\"test123\""));
     }
 
     #[test]
@@ -749,5 +896,149 @@ mod tests {
         assert_eq!(info.list.len(), 2);
         assert_eq!(info.list[0].symbol, "BTCUSDT");
         assert_eq!(info.list[1].symbol, "ETHUSDT");
+    }
+
+    #[test]
+    fn test_deserialize_bybit_position_list() {
+        let json = r#"{
+            "category": "linear",
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "side": "Buy",
+                    "size": "0.01",
+                    "avgPrice": "42000.50",
+                    "leverage": "10",
+                    "unrealisedPnl": "5.25",
+                    "liqPrice": "38000.00"
+                }
+            ],
+            "nextPageCursor": ""
+        }"#;
+
+        let positions: BybitPositionList = serde_json::from_str(json).unwrap();
+        assert_eq!(positions.category, "linear");
+        assert_eq!(positions.list.len(), 1);
+        assert_eq!(positions.list[0].symbol, "BTCUSDT");
+        assert_eq!(positions.list[0].side, "Buy");
+        assert_eq!(positions.list[0].size, Decimal::new(1, 2));
+        assert_eq!(positions.list[0].avg_price, Decimal::new(4200050, 2));
+        assert_eq!(positions.list[0].leverage, Decimal::from(10));
+        assert_eq!(positions.list[0].unrealised_pnl, Decimal::new(525, 2));
+        assert_eq!(positions.list[0].liq_price, Some(Decimal::new(3800000, 2)));
+    }
+
+    #[test]
+    fn test_deserialize_bybit_position_empty_side() {
+        // 포지션이 없는 경우 side=""
+        let json = r#"{
+            "category": "linear",
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "side": "",
+                    "size": "0",
+                    "avgPrice": "0",
+                    "leverage": "10",
+                    "unrealisedPnl": "0",
+                    "liqPrice": ""
+                }
+            ]
+        }"#;
+
+        let positions: BybitPositionList = serde_json::from_str(json).unwrap();
+        assert_eq!(positions.list[0].side, "");
+        assert_eq!(positions.list[0].size, Decimal::ZERO);
+        assert!(positions.list[0].liq_price.is_none());
+    }
+
+    #[test]
+    fn test_deserialize_bybit_linear_ticker_list() {
+        let json = r#"{
+            "category": "linear",
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "lastPrice": "42000.50",
+                    "fundingRate": "0.0001",
+                    "nextFundingTime": "1672300800000"
+                }
+            ]
+        }"#;
+
+        let tickers: BybitLinearTickerList = serde_json::from_str(json).unwrap();
+        assert_eq!(tickers.category, "linear");
+        assert_eq!(tickers.list.len(), 1);
+        assert_eq!(tickers.list[0].symbol, "BTCUSDT");
+        assert_eq!(tickers.list[0].last_price, Decimal::new(4200050, 2));
+        assert_eq!(tickers.list[0].funding_rate, Some(Decimal::new(1, 4)));
+        assert_eq!(
+            tickers.list[0].next_funding_time,
+            Some("1672300800000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_deserialize_bybit_linear_ticker_no_funding() {
+        // 펀딩레이트가 없는 경우
+        let json = r#"{
+            "category": "linear",
+            "list": [
+                {
+                    "symbol": "BTCPERP",
+                    "lastPrice": "42000.50"
+                }
+            ]
+        }"#;
+
+        let tickers: BybitLinearTickerList = serde_json::from_str(json).unwrap();
+        assert_eq!(tickers.list[0].symbol, "BTCPERP");
+        assert!(tickers.list[0].funding_rate.is_none());
+        assert!(tickers.list[0].next_funding_time.is_none());
+    }
+
+    #[test]
+    fn test_bybit_set_leverage_request_serialization() {
+        let req = BybitSetLeverageRequest {
+            category: "linear".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            buy_leverage: "10".to_string(),
+            sell_leverage: "10".to_string(),
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"category\":\"linear\""));
+        assert!(json.contains("\"symbol\":\"BTCUSDT\""));
+        assert!(json.contains("\"buyLeverage\":\"10\""));
+        assert!(json.contains("\"sellLeverage\":\"10\""));
+    }
+
+    #[test]
+    fn test_bybit_switch_isolated_request_serialization() {
+        let req = BybitSwitchIsolatedRequest {
+            category: "linear".to_string(),
+            symbol: "ETHUSDT".to_string(),
+            trade_mode: 1,
+            buy_leverage: "5".to_string(),
+            sell_leverage: "5".to_string(),
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"category\":\"linear\""));
+        assert!(json.contains("\"symbol\":\"ETHUSDT\""));
+        assert!(json.contains("\"tradeMode\":1"));
+        assert!(json.contains("\"buyLeverage\":\"5\""));
+    }
+
+    #[test]
+    fn test_linear_ticker_info_create() {
+        let info = LinearTickerInfo {
+            symbol: "BTCUSDT".to_string(),
+            funding_rate: 0.0001,
+            next_funding_time: 1672300800000,
+        };
+        assert_eq!(info.symbol, "BTCUSDT");
+        assert!((info.funding_rate - 0.0001).abs() < f64::EPSILON);
+        assert_eq!(info.next_funding_time, 1672300800000);
     }
 }

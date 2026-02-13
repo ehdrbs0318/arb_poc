@@ -8,6 +8,7 @@ members = [
     "crates/arb-exchanges",
     "crates/arb-forex",
     "crates/arb-strategy",
+    "crates/arb-db",
 ]
 
 [package]
@@ -24,6 +25,7 @@ arb-exchange = { path = "crates/arb-exchange" }
 arb-exchanges = { path = "crates/arb-exchanges" }
 arb-forex = { path = "crates/arb-forex" }
 arb-strategy = { path = "crates/arb-strategy" }
+arb-db = { path = "crates/arb-db" }
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
@@ -32,8 +34,14 @@ tokio = { version = "1.43", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
 
+# JSON serialization
+serde_json = { workspace = true }
+
 # Decimal precision for financial calculations
 rust_decimal = { workspace = true }
+
+# Time handling
+chrono = { workspace = true }
 
 # Cancellation token for graceful shutdown
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -106,6 +114,9 @@ csv = "1.3"
 # TOML parsing
 toml = "0.8"
 
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "chrono", "rust_decimal"] }
+
 [[example]]
 name = "upbit_public"
 path = "examples/upbit_public.rs"
@@ -141,3 +152,11 @@ path = "examples/telegram.rs"
 [[example]]
 name = "zscore_monitor"
 path = "examples/zscore_monitor.rs"
+
+[[example]]
+name = "zscore_sim"
+path = "examples/zscore_sim.rs"
+
+[[example]]
+name = "migrate"
+path = "examples/migrate.rs"

@@ -5,7 +5,9 @@
 //! Upbit KRW 호가 단위 테이블과 Bybit instrument info 캐시를 포함합니다.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use rust_decimal::Decimal;
 use tracing::{info, warn};
@@ -201,7 +203,7 @@ pub fn round_qty_floor(qty: Decimal, qty_step: Decimal) -> Decimal {
 ///
 /// Bybit REST API에서 조회한 tick_size, qty_step 등을 보관합니다.
 /// Upbit은 하드코딩 호가 테이블을 사용하므로 이 구조체에 포함하지 않습니다.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct InstrumentInfo {
     /// 가격 최소 단위 (Bybit priceFilter.tickSize).
     pub tick_size: Decimal,
@@ -217,9 +219,9 @@ pub struct InstrumentInfo {
 
 /// 코인별 InstrumentInfo 캐시.
 ///
-/// `Arc<std::sync::RwLock<InstrumentCache>>`로 래핑하여 공유합니다.
+/// `Arc<parking_lot::RwLock<InstrumentCache>>`로 래핑하여 공유합니다.
 /// 쓰기는 드물고(시작 시 + 재선택 시), 읽기는 매 틱마다 발생하므로
-/// lock 내부에서 `.await`가 불필요한 `std::sync::RwLock`을 사용합니다.
+/// lock 내부에서 `.await`가 불필요한 `parking_lot::RwLock`을 사용합니다.
 #[derive(Debug)]
 pub struct InstrumentCache {
     /// 코인 심볼 → InstrumentInfo 매핑.
@@ -316,7 +318,7 @@ pub async fn fetch_instruments(
         }
     }
     // lock 안에서 삽입 (non-async, 순간적)
-    let mut cache_guard = cache.write().unwrap_or_else(|e| e.into_inner());
+    let mut cache_guard = cache.write();
     for (coin, inst) in infos {
         cache_guard.insert(coin, inst);
     }

@@ -152,6 +152,49 @@ pub trait Exchange: MarketData + OrderManagement {
     fn is_authenticated(&self) -> bool;
 }
 
+/// 선물(linear) 주문 관리 trait.
+///
+/// Bybit linear 등 선물 거래소에서만 구현합니다.
+/// `LiveExecutor`에서 short 진입 및 청산에 사용됩니다.
+///
+/// 현물(`OrderManagement`)과 분리하여, 카테고리(spot/linear) 혼동을
+/// 컴파일 타임에 방지합니다.
+pub trait LinearOrderManagement: Send + Sync {
+    /// 선물 주문을 생성합니다.
+    ///
+    /// # 인자
+    ///
+    /// * `request` - 주문 요청 (market, side, order_type, volume, price 등)
+    /// * `reduce_only` - true이면 포지션 축소만 허용 (청산 전용)
+    fn place_order_linear(
+        &self,
+        request: &OrderRequest,
+        reduce_only: bool,
+    ) -> impl Future<Output = ExchangeResult<Order>> + Send;
+
+    /// 선물 주문을 조회합니다.
+    ///
+    /// # 인자
+    ///
+    /// * `order_id` - 거래소에서 부여한 주문 ID
+    fn get_order_linear(
+        &self,
+        order_id: &str,
+    ) -> impl Future<Output = ExchangeResult<Order>> + Send;
+
+    /// 선물 주문을 취소합니다.
+    ///
+    /// # 인자
+    ///
+    /// * `order_id` - 취소할 주문 ID
+    /// * `symbol` - 심볼 (예: "BTCUSDT"). None이면 주문 조회로 확인.
+    fn cancel_order_linear(
+        &self,
+        order_id: &str,
+        symbol: Option<&str>,
+    ) -> impl Future<Output = ExchangeResult<Order>> + Send;
+}
+
 /// 거래 규격(instrument info) 조회 trait.
 ///
 /// Bybit 등 instrument info API를 제공하는 거래소만 구현합니다.

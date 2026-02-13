@@ -70,6 +70,34 @@ pub struct ClosedPosition {
     pub exit_usd_krw: f64,
     /// 강제 청산 여부.
     pub is_liquidated: bool,
+    /// 실 Upbit 수수료 (라이브 전용, Order.paid_fee 기반).
+    #[serde(
+        with = "rust_decimal::serde::str_option",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub actual_upbit_fee: Option<Decimal>,
+    /// 실 Bybit 수수료 (라이브 전용).
+    #[serde(
+        with = "rust_decimal::serde::str_option",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub actual_bybit_fee: Option<Decimal>,
+    /// 펀딩비 (Bybit 선물, 라이브 전용).
+    #[serde(
+        with = "rust_decimal::serde::str_option",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub funding_fee: Option<Decimal>,
+    /// 수량 조정 비용 (partial fill 초과분 청산 비용).
+    #[serde(
+        with = "rust_decimal::serde::str_option",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub adjustment_cost: Option<Decimal>,
 }
 
 /// Equity curve에서 max drawdown을 계산합니다 (USDT 절대값).
@@ -153,6 +181,10 @@ mod tests {
             entry_usd_krw: 1380.0,
             exit_usd_krw: 1381.0,
             is_liquidated: false,
+            actual_upbit_fee: None,
+            actual_bybit_fee: None,
+            funding_fee: None,
+            adjustment_cost: None,
         }
     }
 
@@ -220,5 +252,67 @@ mod tests {
         assert_eq!(daily.len(), 2);
         assert_eq!(daily[0].1, Decimal::new(7, 0)); // day1: 10 + (-3) = 7
         assert_eq!(daily[1].1, Decimal::new(5, 0)); // day2: 5
+    }
+
+    #[test]
+    fn test_closed_position_actual_fees_default_none() {
+        let pos = make_closed(10, 0);
+        assert!(pos.actual_upbit_fee.is_none());
+        assert!(pos.actual_bybit_fee.is_none());
+        assert!(pos.funding_fee.is_none());
+        assert!(pos.adjustment_cost.is_none());
+    }
+
+    #[test]
+    fn test_closed_position_actual_fees_some() {
+        let pos = ClosedPosition {
+            actual_upbit_fee: Some(Decimal::new(5, 1)), // 0.5 USDT
+            actual_bybit_fee: Some(Decimal::new(3, 1)), // 0.3 USDT
+            funding_fee: Some(Decimal::new(-2, 1)),     // -0.2 USDT (수취)
+            adjustment_cost: Some(Decimal::new(1, 2)),  // 0.01 USDT
+            ..make_closed(10, 0)
+        };
+        assert_eq!(pos.actual_upbit_fee.unwrap(), Decimal::new(5, 1));
+        assert_eq!(pos.actual_bybit_fee.unwrap(), Decimal::new(3, 1));
+        assert_eq!(pos.funding_fee.unwrap(), Decimal::new(-2, 1));
+        assert_eq!(pos.adjustment_cost.unwrap(), Decimal::new(1, 2));
+    }
+
+    #[test]
+    fn test_closed_position_actual_fees_unwrap_or_zero() {
+        // 시뮬 모드에서는 None → Decimal::ZERO로 접근
+        let pos = make_closed(10, 0);
+        let total_actual = pos.actual_upbit_fee.unwrap_or(Decimal::ZERO)
+            + pos.actual_bybit_fee.unwrap_or(Decimal::ZERO)
+            + pos.funding_fee.unwrap_or(Decimal::ZERO)
+            + pos.adjustment_cost.unwrap_or(Decimal::ZERO);
+        assert_eq!(total_actual, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_closed_position_serialize_skips_none_fees() {
+        let pos = make_closed(10, 0);
+        let json = serde_json::to_string(&pos).unwrap();
+        // None 필드는 skip_serializing_if로 JSON에 포함되지 않음
+        assert!(!json.contains("actual_upbit_fee"));
+        assert!(!json.contains("actual_bybit_fee"));
+        assert!(!json.contains("funding_fee"));
+        assert!(!json.contains("adjustment_cost"));
+    }
+
+    #[test]
+    fn test_closed_position_serialize_includes_some_fees() {
+        let pos = ClosedPosition {
+            actual_upbit_fee: Some(Decimal::new(5, 1)),
+            actual_bybit_fee: None,
+            funding_fee: Some(Decimal::ZERO),
+            adjustment_cost: None,
+            ..make_closed(10, 0)
+        };
+        let json = serde_json::to_string(&pos).unwrap();
+        assert!(json.contains("actual_upbit_fee"));
+        assert!(!json.contains("actual_bybit_fee"));
+        assert!(json.contains("funding_fee"));
+        assert!(!json.contains("adjustment_cost"));
     }
 }

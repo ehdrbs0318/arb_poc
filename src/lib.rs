@@ -16,6 +16,7 @@
 //! - [`exchanges`]: 특정 거래소 구현체 (from `arb-exchanges`)
 //! - [`forex`]: USD/KRW 환율 캐시 (from `arb-forex`)
 //! - [`strategy`]: 차익거래 전략 구현 (from `arb-strategy`)
+//! - [`db`]: MySQL 영속화 레이어 (from `arb-db`)
 //!
 //! ## 예제
 //!
@@ -34,8 +35,12 @@
 //! }
 //! ```
 
+// arb-db ↔ arb-strategy 어댑터
+pub mod adapter;
+
 // Re-export workspace crates
 pub use arb_config as config;
+pub use arb_db as db;
 pub use arb_exchange as exchange;
 pub use arb_exchanges as exchanges;
 pub use arb_forex as forex;

@@ -2,9 +2,7 @@
   "env": {
     "ENABLE_LSP_TOOL": "true"
   },
-  "enabledPlugins": {
-    "stripe@claude-plugins-official": true
-  },
+  "enabledPlugins": {},
   "language": "korean",
   "respectGitIgnore": true
 }

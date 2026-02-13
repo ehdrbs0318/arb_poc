@@ -20,10 +20,24 @@ struct JwtPayload {
 }
 
 /// Upbit API 인증을 위한 자격 증명.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UpbitCredentials {
     access_key: String,
     secret_key: String,
+}
+
+impl std::fmt::Debug for UpbitCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let masked_access_key = if self.access_key.len() >= 4 {
+            format!("{}****", &self.access_key[..4])
+        } else {
+            "****".to_string()
+        };
+        f.debug_struct("UpbitCredentials")
+            .field("access_key", &masked_access_key)
+            .field("secret_key", &"****")
+            .finish()
+    }
 }
 
 impl UpbitCredentials {
@@ -192,5 +206,25 @@ mod tests {
         let creds = UpbitCredentials::new("test_access_key", "test_secret_key");
         let header = creds.authorization_header().unwrap();
         assert!(header.starts_with("Bearer "));
+    }
+
+    #[test]
+    fn test_debug_masks_credentials() {
+        let creds = UpbitCredentials::new("abcd1234secret", "my_super_secret_key");
+        let debug_str = format!("{:?}", creds);
+        // access_key 앞 4자만 노출
+        assert!(debug_str.contains("abcd****"));
+        // secret_key 완전 마스킹
+        assert!(!debug_str.contains("my_super_secret_key"));
+        assert!(debug_str.contains("\"****\""));
+    }
+
+    #[test]
+    fn test_debug_masks_short_access_key() {
+        let creds = UpbitCredentials::new("ab", "short_secret");
+        let debug_str = format!("{:?}", creds);
+        // 4자 미만이면 전체 마스킹
+        assert!(debug_str.contains("\"****\""));
+        assert!(!debug_str.contains("short_secret"));
     }
 }

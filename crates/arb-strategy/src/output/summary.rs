@@ -555,6 +555,10 @@ mod tests {
             entry_usd_krw: 1380.0,
             exit_usd_krw: 1381.0,
             is_liquidated,
+            actual_upbit_fee: None,
+            actual_bybit_fee: None,
+            funding_fee: None,
+            adjustment_cost: None,
         }
     }
 

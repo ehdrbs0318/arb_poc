@@ -1,0 +1,20 @@
+CREATE TABLE trades (
+    id                  BIGINT AUTO_INCREMENT PRIMARY KEY,
+    session_id          BIGINT NOT NULL,
+    position_id         BIGINT NOT NULL,
+    coin                VARCHAR(20) NOT NULL,
+    side                VARCHAR(10) NOT NULL,
+    qty                 DECIMAL(20,8) NOT NULL,
+    upbit_price_krw     DECIMAL(20,4),
+    bybit_price_usdt    DECIMAL(20,8),
+    upbit_fee           DECIMAL(20,8),
+    bybit_fee           DECIMAL(20,8),
+    spread_pct          DOUBLE,
+    z_score             DOUBLE,
+    realized_pnl        DECIMAL(20,8),
+    adjustment_cost     DECIMAL(20,8),
+    exit_usd_krw        DOUBLE,
+    executed_at         DATETIME(3) NOT NULL,
+    INDEX idx_session (session_id),
+    INDEX idx_position (position_id)
+);

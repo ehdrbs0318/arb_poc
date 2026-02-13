@@ -303,6 +303,32 @@ fn open_csv_file(dir: &Path, filename: &str) -> io::Result<File> {
         .open(dir.join(filename))
 }
 
+/// DB 기반 세션 라이터 (라이브 전용).
+///
+/// trades, minutes, sessions 테이블에 INSERT합니다.
+/// 실제 DB 기록은 `arb-db`의 `DbWriter`(mpsc 채널)를 통해 비동기로 수행되며,
+/// monitor_live에서 주입됩니다.
+pub struct DbSessionWriter {
+    /// 세션 고유 ID (DB PK).
+    session_id: i64,
+}
+
+impl DbSessionWriter {
+    /// 새 `DbSessionWriter`를 생성합니다.
+    ///
+    /// # 인자
+    ///
+    /// * `session_id` - DB 세션 테이블의 PK
+    pub fn new(session_id: i64) -> Self {
+        Self { session_id }
+    }
+
+    /// 세션 ID를 반환합니다.
+    pub fn session_id(&self) -> i64 {
+        self.session_id
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +364,10 @@ mod tests {
             entry_usd_krw: 1380.0,
             exit_usd_krw: 1381.0,
             is_liquidated: false,
+            actual_upbit_fee: None,
+            actual_bybit_fee: None,
+            funding_fee: None,
+            adjustment_cost: None,
         }
     }
 
@@ -514,5 +544,17 @@ mod tests {
         // minutes.csv는 빈 파일 (헤더도 없음)
         let content = fs::read_to_string(session_dir.join("minutes.csv")).unwrap();
         assert!(content.is_empty());
+    }
+
+    #[test]
+    fn test_db_session_writer_new() {
+        let writer = DbSessionWriter::new(42);
+        assert_eq!(writer.session_id(), 42);
+    }
+
+    #[test]
+    fn test_db_session_writer_negative_id() {
+        let writer = DbSessionWriter::new(-1);
+        assert_eq!(writer.session_id(), -1);
     }
 }

@@ -14,6 +14,7 @@ use arb_exchange::ExchangeError;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::warn;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -21,11 +22,26 @@ type HmacSha256 = Hmac<Sha256>;
 pub const DEFAULT_RECV_WINDOW: u64 = 5000;
 
 /// Bybit API 인증을 위한 자격 증명.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BybitCredentials {
     api_key: String,
     secret_key: String,
     recv_window: u64,
+}
+
+impl std::fmt::Debug for BybitCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let masked_api_key = if self.api_key.len() >= 4 {
+            format!("{}****", &self.api_key[..4])
+        } else {
+            "****".to_string()
+        };
+        f.debug_struct("BybitCredentials")
+            .field("api_key", &masked_api_key)
+            .field("secret_key", &"****")
+            .field("recv_window", &self.recv_window)
+            .finish()
+    }
 }
 
 impl BybitCredentials {
@@ -78,12 +94,18 @@ impl BybitCredentials {
     }
 
     /// 현재 UTC 타임스탬프를 밀리초 단위로 반환합니다.
+    ///
+    /// `SystemTime`이 `UNIX_EPOCH` 이전인 경우 0을 반환하고 warn 로그를 남깁니다.
     #[inline]
     pub fn timestamp() -> u64 {
-        SystemTime::now()
+        let duration = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_millis() as u64
+            .unwrap_or_default();
+        let ts = duration.as_millis() as u64;
+        if ts == 0 {
+            warn!("SystemTime duration_since failed, using default");
+        }
+        ts
     }
 
     /// GET 요청을 위한 서명을 생성합니다.
@@ -318,5 +340,25 @@ mod tests {
         let params: Vec<(&str, &str)> = vec![];
         let query = build_query_string(params);
         assert_eq!(query, "");
+    }
+
+    #[test]
+    fn test_debug_masks_credentials() {
+        let creds = BybitCredentials::new("abcd1234secret", "my_super_secret_key");
+        let debug_str = format!("{:?}", creds);
+        // API 키 앞 4자만 노출
+        assert!(debug_str.contains("abcd****"));
+        // secret_key 완전 마스킹
+        assert!(!debug_str.contains("my_super_secret_key"));
+        assert!(debug_str.contains("\"****\""));
+    }
+
+    #[test]
+    fn test_debug_masks_short_api_key() {
+        let creds = BybitCredentials::new("ab", "short_secret");
+        let debug_str = format!("{:?}", creds);
+        // 4자 미만이면 전체 마스킹
+        assert!(debug_str.contains("\"****\""));
+        assert!(!debug_str.contains("ab"));
     }
 }

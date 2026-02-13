@@ -2,6 +2,9 @@
 //!
 //! Upbit/Bybit WebSocket 스트림에서 실시간으로 Z-Score 기반
 //! 차익거래 시그널을 감지하고, 가상 포지션으로 시뮬레이션합니다.
+//! DB, BalanceTracker, RiskManager 등 라이브 인프라 없이 실행됩니다.
+//!
+//! 라이브 트레이딩은 `cargo run` (src/main.rs)을 사용하세요.
 //!
 //! ## 사전 준비
 //!
@@ -16,13 +19,13 @@
 //!
 //! ```bash
 //! # 기본 실행 (info 로그)
-//! cargo run --example zscore_monitor
+//! cargo run --example zscore_sim
 //!
 //! # 디버그 로그 (오더북/시그널 상세 출력)
-//! RUST_LOG=debug cargo run --example zscore_monitor
+//! RUST_LOG=debug cargo run --example zscore_sim
 //!
 //! # 커스텀 설정 파일 지정
-//! STRATEGY_CONFIG=my_strategy.toml cargo run --example zscore_monitor
+//! STRATEGY_CONFIG=my_strategy.toml cargo run --example zscore_sim
 //! ```
 //!
 //! ## 출력

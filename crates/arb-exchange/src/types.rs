@@ -413,6 +413,27 @@ impl Balance {
     }
 }
 
+/// 선물 포지션 정보.
+///
+/// Bybit linear 계약의 실시간 포지션 데이터를 나타냅니다.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionInfo {
+    /// 심볼 (예: "BTCUSDT").
+    pub symbol: String,
+    /// 포지션 방향 ("Buy" = 롱, "Sell" = 숏, "" = 포지션 없음).
+    pub side: String,
+    /// 포지션 수량 (항상 양수).
+    pub size: Decimal,
+    /// 평균 진입가.
+    pub entry_price: Decimal,
+    /// 레버리지.
+    pub leverage: Decimal,
+    /// 미실현 손익.
+    pub unrealised_pnl: Decimal,
+    /// 청산 가격.
+    pub liq_price: Decimal,
+}
+
 /// 거래 규격 API 응답 (거래소 중립).
 ///
 /// API 응답을 파싱할 때 Decimal로 즉시 변환합니다.
@@ -559,5 +580,72 @@ mod tests {
         assert!(debug_str.contains("InstrumentInfoResponse"));
         assert!(debug_str.contains("tick_size"));
         assert!(debug_str.contains("qty_step"));
+    }
+
+    #[test]
+    fn test_position_info_create() {
+        let pos = PositionInfo {
+            symbol: "BTCUSDT".to_string(),
+            side: "Buy".to_string(),
+            size: Decimal::new(1, 2), // 0.01
+            entry_price: Decimal::new(4200050, 2),
+            leverage: Decimal::from(10),
+            unrealised_pnl: Decimal::new(525, 2),
+            liq_price: Decimal::new(3800000, 2),
+        };
+        assert_eq!(pos.symbol, "BTCUSDT");
+        assert_eq!(pos.side, "Buy");
+        assert_eq!(pos.size, Decimal::new(1, 2));
+        assert_eq!(pos.entry_price, Decimal::new(4200050, 2));
+        assert_eq!(pos.leverage, Decimal::from(10));
+    }
+
+    #[test]
+    fn test_position_info_clone() {
+        let pos = PositionInfo {
+            symbol: "ETHUSDT".to_string(),
+            side: "Sell".to_string(),
+            size: Decimal::from(1),
+            entry_price: Decimal::from(3000),
+            leverage: Decimal::from(5),
+            unrealised_pnl: Decimal::new(-100, 0),
+            liq_price: Decimal::from(3500),
+        };
+        let cloned = pos.clone();
+        assert_eq!(cloned.symbol, pos.symbol);
+        assert_eq!(cloned.side, pos.side);
+        assert_eq!(cloned.size, pos.size);
+    }
+
+    #[test]
+    fn test_position_info_empty() {
+        // 포지션이 없는 경우
+        let pos = PositionInfo {
+            symbol: "BTCUSDT".to_string(),
+            side: String::new(),
+            size: Decimal::ZERO,
+            entry_price: Decimal::ZERO,
+            leverage: Decimal::from(10),
+            unrealised_pnl: Decimal::ZERO,
+            liq_price: Decimal::ZERO,
+        };
+        assert!(pos.side.is_empty());
+        assert_eq!(pos.size, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_position_info_debug() {
+        let pos = PositionInfo {
+            symbol: "BTCUSDT".to_string(),
+            side: "Buy".to_string(),
+            size: Decimal::new(1, 2),
+            entry_price: Decimal::from(42000),
+            leverage: Decimal::from(10),
+            unrealised_pnl: Decimal::ZERO,
+            liq_price: Decimal::ZERO,
+        };
+        let debug_str = format!("{:?}", pos);
+        assert!(debug_str.contains("PositionInfo"));
+        assert!(debug_str.contains("BTCUSDT"));
     }
 }

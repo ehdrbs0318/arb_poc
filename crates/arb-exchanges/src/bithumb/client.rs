@@ -10,15 +10,15 @@ use arb_exchange::{
 
 use crate::bithumb::auth::{BithumbCredentials, build_query_string};
 use crate::bithumb::types::{
-    BithumbBalance, BithumbCandle, BithumbError, BithumbOrder, BithumbOrderRequest,
-    BithumbOrderbook, BithumbTicker,
+    BithumbBalance, BithumbCandle, BithumbCancelV2Response, BithumbError, BithumbOrder,
+    BithumbOrderRequest, BithumbOrderV2Response, BithumbOrderbook, BithumbTicker,
 };
 use crate::rate_limit::RateLimiter;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Bithumb REST API 기본 URL.
 const BASE_URL: &str = "https://api.bithumb.com";
@@ -386,7 +386,7 @@ impl OrderManagement for BithumbClient {
             OrderSide::Sell => "ask",
         };
 
-        let ord_type = match request.order_type {
+        let order_type = match request.order_type {
             OrderType::Limit => "limit",
             OrderType::Market => "market",
             OrderType::Price => "price",
@@ -403,20 +403,59 @@ impl OrderManagement for BithumbClient {
         let body = BithumbOrderRequest {
             market: request.market.clone(),
             side: side.to_string(),
-            ord_type: ord_type.to_string(),
+            order_type: order_type.to_string(),
             volume: request.volume.map(|v| v.to_string()),
             price: request.price.map(|p| p.to_string()),
             time_in_force: time_in_force.map(|s| s.to_string()),
             identifier: request.identifier.clone(),
         };
 
-        let bithumb_order: BithumbOrder = self.post_private("/v1/orders", &body).await?;
+        debug!(
+            market = %request.market,
+            side,
+            order_type,
+            volume = ?request.volume,
+            price = ?request.price,
+            time_in_force = ?time_in_force,
+            identifier = ?request.identifier,
+            "Bithumb 주문 생성 요청 (v2)"
+        );
+
+        // v2 POST /v2/orders: 간소화된 응답 (order_id, market, side, order_type, created_at)
+        let v2_response: BithumbOrderV2Response =
+            self.post_private("/v2/orders", &body).await?;
+
+        info!(
+            order_id = %v2_response.order_id,
+            market = %v2_response.market,
+            side = %v2_response.side,
+            "Bithumb 주문 생성 완료 (v2)"
+        );
+
+        // v2 응답은 간소화되어 전체 주문 정보가 없으므로 GET /v1/order로 후속 조회
+        let params = [("uuid", v2_response.order_id.as_str())];
+        let bithumb_order: BithumbOrder =
+            self.get_private("/v1/order", Some(&params)).await?;
         Ok(convert_order(bithumb_order))
     }
 
     async fn cancel_order(&self, order_id: &str) -> ExchangeResult<Order> {
-        let params = [("uuid", order_id)];
-        let bithumb_order: BithumbOrder = self.delete_private("/v1/order", &params).await?;
+        debug!(order_id, "Bithumb 주문 취소 요청 (v2)");
+
+        // v2 DELETE /v2/order: 파라미터 uuid → order_id로 변경
+        let params = [("order_id", order_id)];
+        let v2_response: BithumbCancelV2Response =
+            self.delete_private("/v2/order", &params).await?;
+
+        info!(
+            order_id = %v2_response.order_id,
+            "Bithumb 주문 취소 접수 완료 (v2)"
+        );
+
+        // v2 응답은 간소화되어 전체 주문 정보가 없으므로 GET /v1/order로 후속 조회
+        let get_params = [("uuid", order_id)];
+        let bithumb_order: BithumbOrder =
+            self.get_private("/v1/order", Some(&get_params)).await?;
         Ok(convert_order(bithumb_order))
     }
 

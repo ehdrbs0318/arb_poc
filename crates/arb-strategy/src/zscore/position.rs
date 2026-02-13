@@ -14,11 +14,48 @@ use tracing::{info, warn};
 use crate::error::PositionError;
 use crate::zscore::pnl::ClosedPosition;
 
+/// 포지션 상태 머신.
+///
+/// Opening → Open → Closing → Closed
+///           |       |    \
+///           |       |     └→ PendingExchangeRecovery → Closed
+///           |       └→ PartiallyClosedOneLeg → Closed
+///           └→ PartiallyClosedOneLeg → PendingExchangeRecovery → Closed
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PositionState {
+    /// 주문 발주 중 (Opening INSERT 완료, 체결 대기).
+    Opening,
+    /// 양 레그 체결 완료, 활성 포지션.
+    #[default]
+    Open,
+    /// 청산 주문 진행 중.
+    Closing,
+    /// 청산 완료.
+    Closed,
+    /// 한쪽 레그만 체결/청산됨 (비상 청산 필요).
+    PartiallyClosedOneLeg,
+    /// 거래소 장애로 복구 대기 중.
+    PendingExchangeRecovery,
+}
+
+impl std::fmt::Display for PositionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Opening => write!(f, "Opening"),
+            Self::Open => write!(f, "Open"),
+            Self::Closing => write!(f, "Closing"),
+            Self::Closed => write!(f, "Closed"),
+            Self::PartiallyClosedOneLeg => write!(f, "PartiallyClosedOneLeg"),
+            Self::PendingExchangeRecovery => write!(f, "PendingExchangeRecovery"),
+        }
+    }
+}
+
 /// 가상 포지션.
 ///
 /// Upbit 현물 매수 + Bybit 선물 short 한 쌍을 나타냅니다.
 /// 코인당 복수 포지션이 존재할 수 있으며, 고유 ID로 식별합니다.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VirtualPosition {
     /// 포지션 고유 ID (시퀀스 번호).
     pub id: u64,
@@ -40,6 +77,63 @@ pub struct VirtualPosition {
     pub entry_z_score: f64,
     /// 포지션 수량 (코인 단위, 양 leg 동일).
     pub qty: Decimal,
+    /// DB primary key 참조 (라이브 전용, 시뮬에서는 None).
+    #[serde(default)]
+    pub db_id: Option<i64>,
+    /// Upbit 주문 ID (라이브 전용).
+    #[serde(default)]
+    pub upbit_order_id: Option<String>,
+    /// Bybit 주문 ID (라이브 전용).
+    #[serde(default)]
+    pub bybit_order_id: Option<String>,
+    /// 주문 진행 중 플래그 (in_flight 동안 다른 시그널 무시).
+    #[serde(default)]
+    pub in_flight: bool,
+    /// 포지션 상태.
+    #[serde(default)]
+    pub state: PositionState,
+    /// Closing 전이 시각 (kill switch timeout 판단용).
+    #[serde(default)]
+    pub closing_started_at: Option<DateTime<Utc>>,
+    /// Client Order ID (crash recovery용, UUID v7).
+    #[serde(default)]
+    pub client_order_id: Option<String>,
+    /// 청산 Client Order ID (crash recovery용).
+    #[serde(default)]
+    pub exit_client_order_id: Option<String>,
+    /// 한쪽 레그만 성공한 경우 성공한 레그 ("upbit" or "bybit").
+    #[serde(default)]
+    pub succeeded_leg: Option<String>,
+    /// 비상 청산 시도 횟수.
+    #[serde(default)]
+    pub emergency_attempts: u32,
+}
+
+impl Default for VirtualPosition {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            coin: String::new(),
+            entry_time: Utc::now(),
+            upbit_entry_price: Decimal::ZERO,
+            bybit_entry_price: Decimal::ZERO,
+            bybit_liquidation_price: Decimal::ZERO,
+            entry_usd_krw: 0.0,
+            entry_spread_pct: 0.0,
+            entry_z_score: 0.0,
+            qty: Decimal::ZERO,
+            db_id: None,
+            upbit_order_id: None,
+            bybit_order_id: None,
+            in_flight: false,
+            state: PositionState::Open,
+            closing_started_at: None,
+            client_order_id: None,
+            exit_client_order_id: None,
+            succeeded_leg: None,
+            emergency_attempts: 0,
+        }
+    }
 }
 
 impl VirtualPosition {
@@ -399,6 +493,64 @@ impl PositionManager {
             entry_usd_krw: pos.entry_usd_krw,
             exit_usd_krw,
             is_liquidated,
+            actual_upbit_fee: None,
+            actual_bybit_fee: None,
+            funding_fee: None,
+            adjustment_cost: None,
+        }
+    }
+
+    /// 포지션을 Opening 상태로 등록합니다 (LivePolicy 전용).
+    pub fn register_opening(&mut self, pos: VirtualPosition) {
+        let coin = pos.coin.clone();
+        self.open_positions.entry(coin).or_default().push(pos);
+    }
+
+    /// 포지션 상태를 전이합니다.
+    /// 이중 전이를 방지하기 위해 현재 상태를 검증합니다.
+    pub fn transition_state(&mut self, coin: &str, pos_id: u64, to: PositionState) -> bool {
+        if let Some(positions) = self.open_positions.get_mut(coin)
+            && let Some(pos) = positions.iter_mut().find(|p| p.id == pos_id)
+        {
+            pos.state = to;
+            return true;
+        }
+        false
+    }
+
+    /// Closing 전이를 시도합니다 (TOCTOU 방지: 이미 Closing이면 false).
+    pub fn try_transition_to_closing(&mut self, coin: &str, pos_id: u64) -> bool {
+        if let Some(positions) = self.open_positions.get_mut(coin)
+            && let Some(pos) = positions
+                .iter_mut()
+                .find(|p| p.id == pos_id && p.state == PositionState::Open)
+        {
+            pos.state = PositionState::Closing;
+            pos.closing_started_at = Some(Utc::now());
+            return true;
+        }
+        false
+    }
+
+    /// in_flight 포지션 목록을 반환합니다 (kill switch 재스캔용).
+    pub fn in_flight_positions(&self) -> Vec<(String, u64)> {
+        self.open_positions
+            .iter()
+            .flat_map(|(coin, positions)| {
+                positions
+                    .iter()
+                    .filter(|p| p.in_flight)
+                    .map(move |p| (coin.clone(), p.id))
+            })
+            .collect()
+    }
+
+    /// 특정 포지션의 in_flight 플래그를 설정합니다.
+    pub fn set_in_flight(&mut self, coin: &str, pos_id: u64, in_flight: bool) {
+        if let Some(positions) = self.open_positions.get_mut(coin)
+            && let Some(pos) = positions.iter_mut().find(|p| p.id == pos_id)
+        {
+            pos.in_flight = in_flight;
         }
     }
 }
@@ -438,6 +590,7 @@ mod tests {
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
             qty: Decimal::new(qty, 0),
+            ..Default::default()
         }
     }
 
@@ -510,6 +663,7 @@ mod tests {
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
             qty: Decimal::ONE,
+            ..Default::default()
         })
         .unwrap();
         let position_id = 0; // open_position에서 할당된 ID
@@ -606,6 +760,7 @@ mod tests {
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
             qty: Decimal::new(5, 0),
+            ..Default::default()
         })
         .unwrap();
 
@@ -658,6 +813,7 @@ mod tests {
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
             qty: Decimal::new(5, 0),
+            ..Default::default()
         })
         .unwrap();
 
@@ -725,6 +881,7 @@ mod tests {
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
             qty: Decimal::ONE,
+            ..Default::default()
         })
         .unwrap();
 
@@ -739,6 +896,7 @@ mod tests {
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
             qty: Decimal::new(2, 0),
+            ..Default::default()
         })
         .unwrap();
 
@@ -842,6 +1000,7 @@ mod tests {
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
             qty: Decimal::new(10, 0), // 10 ETH
+            ..Default::default()
         })
         .unwrap();
 
@@ -895,6 +1054,7 @@ mod tests {
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
             qty: Decimal::new(1, 3), // 0.001 BTC
+            ..Default::default()
         })
         .unwrap();
 
@@ -947,6 +1107,7 @@ mod tests {
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
             qty: Decimal::new(10, 1), // 1.0 ETH
+            ..Default::default()
         })
         .unwrap();
 
@@ -997,6 +1158,7 @@ mod tests {
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
             qty: Decimal::new(3, 0), // 3 BTC
+            ..Default::default()
         };
         // 3 * 100050 = 300150
         assert_eq!(pos.size_usdt(), Decimal::new(300_150, 0));
@@ -1018,6 +1180,7 @@ mod tests {
             entry_spread_pct: 0.05,
             entry_z_score: 2.5,
             qty: Decimal::new(10, 0), // 10 ETH
+            ..Default::default()
         })
         .unwrap();
 
@@ -1048,5 +1211,261 @@ mod tests {
         assert_eq!(closed.net_pnl, Decimal::new(2000, 0));
         // size_usdt = 10 * 3000 = 30000
         assert_eq!(closed.size_usdt, Decimal::new(30000, 0));
+    }
+
+    // --- PositionState 테스트 ---
+
+    #[test]
+    fn test_position_state_default() {
+        assert_eq!(PositionState::default(), PositionState::Open);
+    }
+
+    #[test]
+    fn test_position_state_display() {
+        assert_eq!(PositionState::Opening.to_string(), "Opening");
+        assert_eq!(PositionState::Open.to_string(), "Open");
+        assert_eq!(PositionState::Closing.to_string(), "Closing");
+        assert_eq!(PositionState::Closed.to_string(), "Closed");
+        assert_eq!(
+            PositionState::PartiallyClosedOneLeg.to_string(),
+            "PartiallyClosedOneLeg"
+        );
+        assert_eq!(
+            PositionState::PendingExchangeRecovery.to_string(),
+            "PendingExchangeRecovery"
+        );
+    }
+
+    #[test]
+    fn test_position_state_equality() {
+        assert_eq!(PositionState::Open, PositionState::Open);
+        assert_ne!(PositionState::Open, PositionState::Closing);
+    }
+
+    #[test]
+    fn test_position_state_serde_roundtrip() {
+        let state = PositionState::PendingExchangeRecovery;
+        let json = serde_json::to_string(&state).unwrap();
+        let deserialized: PositionState = serde_json::from_str(&json).unwrap();
+        assert_eq!(state, deserialized);
+    }
+
+    // --- VirtualPosition 새 필드 테스트 ---
+
+    #[test]
+    fn test_virtual_position_default() {
+        let pos = VirtualPosition::default();
+        assert_eq!(pos.id, 0);
+        assert!(pos.coin.is_empty());
+        assert_eq!(pos.qty, Decimal::ZERO);
+        assert!(pos.db_id.is_none());
+        assert!(pos.upbit_order_id.is_none());
+        assert!(pos.bybit_order_id.is_none());
+        assert!(!pos.in_flight);
+        assert_eq!(pos.state, PositionState::Open);
+        assert!(pos.closing_started_at.is_none());
+        assert!(pos.client_order_id.is_none());
+        assert!(pos.exit_client_order_id.is_none());
+        assert!(pos.succeeded_leg.is_none());
+        assert_eq!(pos.emergency_attempts, 0);
+    }
+
+    #[test]
+    fn test_virtual_position_serde_roundtrip() {
+        let pos = VirtualPosition {
+            id: 42,
+            coin: "BTC".to_string(),
+            entry_time: Utc::now(),
+            upbit_entry_price: Decimal::new(100_000, 0),
+            bybit_entry_price: Decimal::new(100_050, 0),
+            bybit_liquidation_price: Decimal::new(199_445, 0),
+            entry_usd_krw: 1380.0,
+            entry_spread_pct: 0.05,
+            entry_z_score: 2.5,
+            qty: Decimal::ONE,
+            db_id: Some(123),
+            upbit_order_id: Some("upbit-uuid-1".to_string()),
+            bybit_order_id: Some("bybit-uuid-1".to_string()),
+            in_flight: true,
+            state: PositionState::Opening,
+            closing_started_at: None,
+            client_order_id: Some("client-uuid-1".to_string()),
+            exit_client_order_id: None,
+            succeeded_leg: None,
+            emergency_attempts: 0,
+        };
+
+        let json = serde_json::to_string(&pos).unwrap();
+        let deserialized: VirtualPosition = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.id, 42);
+        assert_eq!(deserialized.coin, "BTC");
+        assert_eq!(deserialized.db_id, Some(123));
+        assert_eq!(deserialized.upbit_order_id.as_deref(), Some("upbit-uuid-1"));
+        assert!(deserialized.in_flight);
+        assert_eq!(deserialized.state, PositionState::Opening);
+        assert_eq!(
+            deserialized.client_order_id.as_deref(),
+            Some("client-uuid-1")
+        );
+    }
+
+    #[test]
+    fn test_virtual_position_serde_default_fields() {
+        // 새 필드가 없는 JSON에서 역직렬화 시 default 적용
+        let json = r#"{
+            "id": 1,
+            "coin": "ETH",
+            "entry_time": "2026-01-01T00:00:00Z",
+            "upbit_entry_price": "3000",
+            "bybit_entry_price": "3010",
+            "bybit_liquidation_price": "6000",
+            "entry_usd_krw": 1380.0,
+            "entry_spread_pct": 0.05,
+            "entry_z_score": 2.5,
+            "qty": "10"
+        }"#;
+
+        let pos: VirtualPosition = serde_json::from_str(json).unwrap();
+        assert_eq!(pos.id, 1);
+        assert!(pos.db_id.is_none());
+        assert!(!pos.in_flight);
+        assert_eq!(pos.state, PositionState::Open);
+        assert_eq!(pos.emergency_attempts, 0);
+    }
+
+    // --- register_opening / transition_state 테스트 ---
+
+    #[test]
+    fn test_register_opening() {
+        let mut pm = PositionManager::new();
+        let pos = VirtualPosition {
+            id: 99,
+            coin: "BTC".to_string(),
+            state: PositionState::Opening,
+            qty: Decimal::ONE,
+            bybit_entry_price: Decimal::new(50000, 0),
+            ..Default::default()
+        };
+
+        pm.register_opening(pos);
+        assert!(pm.has_position("BTC"));
+        assert_eq!(pm.open_count(), 1);
+
+        let positions = pm.open_positions.get("BTC").unwrap();
+        assert_eq!(positions[0].id, 99); // ID가 유지됨 (open_position과 다르게)
+        assert_eq!(positions[0].state, PositionState::Opening);
+    }
+
+    #[test]
+    fn test_transition_state_success() {
+        let mut pm = PositionManager::new();
+        let pos = VirtualPosition {
+            id: 1,
+            coin: "BTC".to_string(),
+            state: PositionState::Opening,
+            ..Default::default()
+        };
+        pm.register_opening(pos);
+
+        let result = pm.transition_state("BTC", 1, PositionState::Open);
+        assert!(result);
+
+        let positions = pm.open_positions.get("BTC").unwrap();
+        assert_eq!(positions[0].state, PositionState::Open);
+    }
+
+    #[test]
+    fn test_transition_state_not_found() {
+        let mut pm = PositionManager::new();
+        let result = pm.transition_state("BTC", 999, PositionState::Open);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_try_transition_to_closing_success() {
+        let mut pm = PositionManager::new();
+        pm.open_position(make_position("BTC", 1, 50_000)).unwrap();
+
+        // 포지션 ID=0, state=Open (default)
+        let result = pm.try_transition_to_closing("BTC", 0);
+        assert!(result);
+
+        let positions = pm.open_positions.get("BTC").unwrap();
+        assert_eq!(positions[0].state, PositionState::Closing);
+        assert!(positions[0].closing_started_at.is_some());
+    }
+
+    #[test]
+    fn test_try_transition_to_closing_already_closing() {
+        let mut pm = PositionManager::new();
+        pm.open_position(make_position("BTC", 1, 50_000)).unwrap();
+
+        // 첫 번째 전이 성공
+        assert!(pm.try_transition_to_closing("BTC", 0));
+        // 두 번째 전이 실패 (이미 Closing)
+        assert!(!pm.try_transition_to_closing("BTC", 0));
+    }
+
+    #[test]
+    fn test_try_transition_to_closing_wrong_coin() {
+        let mut pm = PositionManager::new();
+        pm.open_position(make_position("BTC", 1, 50_000)).unwrap();
+
+        let result = pm.try_transition_to_closing("ETH", 0);
+        assert!(!result);
+    }
+
+    // --- in_flight 테스트 ---
+
+    #[test]
+    fn test_set_in_flight() {
+        let mut pm = PositionManager::new();
+        pm.open_position(make_position("BTC", 1, 50_000)).unwrap();
+
+        // 초기값: false
+        let positions = pm.open_positions.get("BTC").unwrap();
+        assert!(!positions[0].in_flight);
+
+        // true로 설정
+        pm.set_in_flight("BTC", 0, true);
+        let positions = pm.open_positions.get("BTC").unwrap();
+        assert!(positions[0].in_flight);
+
+        // false로 되돌림
+        pm.set_in_flight("BTC", 0, false);
+        let positions = pm.open_positions.get("BTC").unwrap();
+        assert!(!positions[0].in_flight);
+    }
+
+    #[test]
+    fn test_in_flight_positions_empty() {
+        let mut pm = PositionManager::new();
+        pm.open_position(make_position("BTC", 1, 50_000)).unwrap();
+
+        let in_flight = pm.in_flight_positions();
+        assert!(in_flight.is_empty());
+    }
+
+    #[test]
+    fn test_in_flight_positions_some() {
+        let mut pm = PositionManager::new();
+        pm.open_position(make_position("BTC", 1, 50_000)).unwrap();
+        pm.open_position(make_position("ETH", 1, 3_000)).unwrap();
+
+        pm.set_in_flight("BTC", 0, true);
+
+        let in_flight = pm.in_flight_positions();
+        assert_eq!(in_flight.len(), 1);
+        assert_eq!(in_flight[0].0, "BTC");
+        assert_eq!(in_flight[0].1, 0);
+    }
+
+    #[test]
+    fn test_set_in_flight_nonexistent() {
+        let mut pm = PositionManager::new();
+        // 존재하지 않는 포지션에 대해 set_in_flight → 무시 (패닉 없음)
+        pm.set_in_flight("BTC", 999, true);
+        assert!(pm.in_flight_positions().is_empty());
     }
 }

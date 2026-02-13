@@ -130,12 +130,16 @@ pub struct BithumbOrder {
     pub identifier: Option<String>,
 }
 
-/// Bithumb 주문 요청 본문.
+/// Bithumb v2 주문 요청 본문.
+///
+/// v2 API에서 `ord_type`이 `order_type`으로 변경됨.
 #[derive(Debug, Serialize)]
 pub struct BithumbOrderRequest {
     pub market: String,
     pub side: String,
-    pub ord_type: String,
+    /// 주문 방식 (limit, market, price, best).
+    /// v2 API에서 `ord_type` → `order_type`으로 필드명 변경.
+    pub order_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -144,6 +148,28 @@ pub struct BithumbOrderRequest {
     pub time_in_force: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identifier: Option<String>,
+}
+
+/// Bithumb v2 주문 생성 응답 (간소화됨).
+///
+/// v2 POST /v2/orders는 전체 주문 정보 대신 기본 필드만 반환합니다.
+/// 전체 주문 정보가 필요하면 GET /v1/order로 후속 조회해야 합니다.
+#[derive(Debug, Deserialize)]
+pub struct BithumbOrderV2Response {
+    pub order_id: String,
+    pub market: String,
+    pub side: String,
+    pub order_type: String,
+    pub created_at: String,
+}
+
+/// Bithumb v2 주문 취소 응답 (간소화됨).
+///
+/// v2 DELETE /v2/order는 최소한의 확인 정보만 반환합니다.
+#[derive(Debug, Deserialize)]
+pub struct BithumbCancelV2Response {
+    pub order_id: String,
+    pub created_at: String,
 }
 
 /// 밀리초 타임스탬프를 역직렬화.

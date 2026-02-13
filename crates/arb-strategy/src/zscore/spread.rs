@@ -929,7 +929,7 @@ mod tests {
             calc.update(
                 "BTC",
                 ts + chrono::Duration::minutes(i),
-                Some(dec(138_000_000 + i as i64 * 100_000, 0)),
+                Some(dec(138_000_000 + i * 100_000, 0)),
                 1380.0,
                 Some(dec(100_000 + i * 10, 0)),
             )
@@ -1070,7 +1070,7 @@ mod tests {
             calc.update(
                 "BTC",
                 ts,
-                Some(dec(138_000_000 + i as i64 * 1000, 0)),
+                Some(dec(138_000_000 + i * 1000, 0)),
                 1380.0,
                 Some(dec(100_000 + i * 10, 0)),
             )
@@ -1088,7 +1088,7 @@ mod tests {
             calc.update(
                 "BTC",
                 ts,
-                Some(dec(138_000_000 + i as i64 * 1000, 0)),
+                Some(dec(138_000_000 + i * 1000, 0)),
                 1380.0,
                 Some(dec(100_000 + i * 10, 0)),
             )

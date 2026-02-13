@@ -170,20 +170,20 @@ impl Default for ObCacheData {
 
 /// Computing flag 관리자 (동시성 안전).
 ///
-/// `std::sync::Mutex`로 보호되며, `try_set_computing`으로 원자적
+/// `parking_lot::Mutex`로 보호되며, `try_set_computing`으로 원자적
 /// check-and-set을 제공합니다. lock hold 시간이 극히 짧아
 /// async context에서도 안전하게 사용할 수 있습니다.
 #[derive(Debug)]
 pub struct ComputingFlags {
     /// 거래소/코인별 computing flag.
-    inner: std::sync::Mutex<HashMap<(Exchange, String), bool>>,
+    inner: parking_lot::Mutex<HashMap<(Exchange, String), bool>>,
 }
 
 impl ComputingFlags {
     /// 새 ComputingFlags를 생성합니다.
     pub fn new() -> Self {
         Self {
-            inner: std::sync::Mutex::new(HashMap::new()),
+            inner: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -197,7 +197,7 @@ impl ComputingFlags {
     /// - `true`: 이미 다른 task가 computing 중 (이 task는 스킵)
     /// - `false`: 설정 성공 (이 task가 REST 수행)
     pub fn try_set_computing(&self, exchange: Exchange, coin: &str) -> bool {
-        let mut flags = self.inner.lock().unwrap();
+        let mut flags = self.inner.lock();
         let entry = flags.entry((exchange, coin.to_string())).or_insert(false);
         if *entry {
             true // 이미 computing 중
@@ -213,20 +213,20 @@ impl ComputingFlags {
     /// task 완료 시 반드시 호출하여 다음 task가 실행될 수 있도록 합니다.
     /// 에러 발생 시에도 반드시 호출해야 합니다.
     pub fn clear_computing(&self, exchange: Exchange, coin: &str) {
-        let mut flags = self.inner.lock().unwrap();
+        let mut flags = self.inner.lock();
         flags.insert((exchange, coin.to_string()), false);
         debug!(exchange = ?exchange, coin = %coin, "computing flag 해제");
     }
 
     /// 특정 코인의 computing flag를 양쪽 거래소에서 제거합니다.
     pub fn remove_coin(&self, coin: &str) {
-        let mut flags = self.inner.lock().unwrap();
+        let mut flags = self.inner.lock();
         flags.retain(|k, _| k.1 != coin);
     }
 
     /// computing flag 상태를 조회합니다 (테스트/디버깅용).
     pub fn is_computing(&self, exchange: Exchange, coin: &str) -> bool {
-        let flags = self.inner.lock().unwrap();
+        let flags = self.inner.lock();
         flags
             .get(&(exchange, coin.to_string()))
             .copied()
@@ -246,7 +246,7 @@ impl Default for ComputingFlags {
 /// 분리하여 lock 경합을 최소화합니다.
 ///
 /// - `data`: `tokio::sync::RwLock`으로 보호 (읽기 빈번, 쓰기는 REST 완료 시만)
-/// - `computing`: `std::sync::Mutex` 기반 atomic CAS (lock hold 극히 짧음)
+/// - `computing`: `parking_lot::Mutex` 기반 atomic CAS (lock hold 극히 짧음)
 #[derive(Debug, Clone)]
 pub struct SharedObCache {
     /// 오더북 데이터 캐시 (RwLock 보호).
