@@ -1,26 +1,60 @@
-# arb_poc Configuration Template
+# =============================================================================
+# arb_poc 시크릿 설정 템플릿
+# =============================================================================
+# 사용법:
+#   cp config.example.toml config.toml
+#   config.toml을 편집하여 실제 API 키를 입력하세요.
 #
-# Copy this file to config.toml and fill in your API credentials.
-# IMPORTANT: Never commit config.toml to version control!
+# 주의: config.toml은 절대 Git에 커밋하지 마세요! (.gitignore에 포함됨)
+#
+# 우선순위 (높은 순):
+#   1. 환경변수 (UPBIT_API_KEY, BYBIT_API_KEY 등)
+#   2. config.local.toml (로컬 오버라이드)
+#   3. config.toml (이 파일의 복사본)
+#
+# DB 접속 정보는 환경변수로만 설정합니다:
+#   DATABASE_URL=mysql://user:password@localhost:3306/arb
+# =============================================================================
 
+# ---------------------------------------------------------------------------
+# Upbit (한국 거래소, KRW 마켓) — 라이브 모드 필수
+# ---------------------------------------------------------------------------
 [upbit]
 api_key = "YOUR_UPBIT_API_KEY"
 secret_key = "YOUR_UPBIT_SECRET_KEY"
 
+# ---------------------------------------------------------------------------
+# Bybit (글로벌 거래소, USDT 선물) — 라이브 모드 필수
+# ---------------------------------------------------------------------------
+[bybit]
+api_key = "YOUR_BYBIT_API_KEY"
+secret_key = "YOUR_BYBIT_SECRET_KEY"
+
+# ---------------------------------------------------------------------------
+# Bithumb (한국 거래소, KRW 마켓) — 현재 미사용 (향후 확장)
+# ---------------------------------------------------------------------------
 [bithumb]
 api_key = "YOUR_BITHUMB_API_KEY"
 secret_key = "YOUR_BITHUMB_SECRET_KEY"
 
-[bybit]
-api_key = "YOUR_BYBIT_API_KEY"
-secret_key = "YOUR_BYBIT_SECRET_KEY"
-# Optional: Use testnet instead of mainnet (default: false)
-testnet = false
+# ---------------------------------------------------------------------------
+# Telegram 알림 (선택)
+# ---------------------------------------------------------------------------
+# 미설정 시 알림 비활성화 (거래는 정상 동작)
+# Bot 생성: https://t.me/BotFather → /newbot
+# Chat ID 확인: https://api.telegram.org/bot<TOKEN>/getUpdates
+[telegram]
+bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
+chat_id = "YOUR_TELEGRAM_CHAT_ID"
 
-# Future exchanges can be added here:
-# [binance]
-# api_key = "YOUR_BINANCE_API_KEY"
-# secret_key = "YOUR_BINANCE_SECRET_KEY"
+# ---------------------------------------------------------------------------
+# 데이터베이스 (라이브 모드 필수)
+# ---------------------------------------------------------------------------
+# MySQL/MariaDB 접속 URL
+# 환경변수 DATABASE_URL로도 설정 가능 (환경변수가 우선)
+[database]
+url = "mysql://user:password@localhost:3306/arb"
 
-# NOTE: Z-Score 전략 설정은 별도 파일(strategy.toml)에서 관리합니다.
-# strategy.example.toml을 strategy.toml로 복사하여 사용하세요.
+# =============================================================================
+# 전략 설정은 별도 파일(strategy.toml)에서 관리합니다.
+# =============================================================================

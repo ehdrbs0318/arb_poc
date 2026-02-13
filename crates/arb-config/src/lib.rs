@@ -26,6 +26,9 @@ pub struct Config {
     /// Telegram 설정.
     #[serde(default)]
     pub telegram: TelegramConfig,
+    /// 데이터베이스 설정.
+    #[serde(default)]
+    pub database: DatabaseConfig,
 }
 
 /// 단일 거래소 설정.
@@ -48,6 +51,22 @@ pub struct TelegramConfig {
     /// Telegram Chat ID.
     #[serde(default)]
     pub chat_id: String,
+}
+
+/// 데이터베이스 설정.
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct DatabaseConfig {
+    /// 데이터베이스 접속 URL (e.g., "mysql://user:pass@localhost:3306/arb").
+    #[serde(default)]
+    pub url: String,
+}
+
+impl DatabaseConfig {
+    /// DB URL이 설정되어 있으면 true를 반환합니다.
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        !self.url.is_empty()
+    }
 }
 
 impl ExchangeConfig {
@@ -147,11 +166,17 @@ impl Config {
             config.telegram.chat_id = chat_id;
         }
 
+        // Database
+        if let Ok(database_url) = std::env::var("DATABASE_URL") {
+            config.database.url = database_url;
+        }
+
         debug!(
             upbit_configured = config.upbit.has_credentials(),
             bithumb_configured = config.bithumb.has_credentials(),
             bybit_configured = config.bybit.has_credentials(),
             telegram_configured = config.telegram.is_configured(),
+            database_configured = config.database.is_configured(),
             "설정 로드 완료: 자격 증명 상태"
         );
 
@@ -200,6 +225,7 @@ fn parse_toml_simple(content: &str) -> Result<Config, ConfigError> {
                 ("bybit", "secret_key") => config.bybit.secret_key = value.to_string(),
                 ("telegram", "bot_token") => config.telegram.bot_token = value.to_string(),
                 ("telegram", "chat_id") => config.telegram.chat_id = value.to_string(),
+                ("database", "url") => config.database.url = value.to_string(),
                 _ => {}
             }
         }
@@ -279,6 +305,41 @@ mod tests {
 
         let config = parse_toml_simple(content).unwrap();
         assert_eq!(config.upbit.api_key, "key");
+    }
+
+    #[test]
+    fn test_database_config_is_configured() {
+        let empty = DatabaseConfig::default();
+        assert!(!empty.is_configured());
+
+        let configured = DatabaseConfig {
+            url: "mysql://user:pass@localhost/arb".to_string(),
+        };
+        assert!(configured.is_configured());
+    }
+
+    #[test]
+    fn test_parse_toml_database() {
+        let content = r#"
+            [database]
+            url = "mysql://user:pass@localhost:3306/arb"
+        "#;
+
+        let config = parse_toml_simple(content).unwrap();
+        assert_eq!(config.database.url, "mysql://user:pass@localhost:3306/arb");
+        assert!(config.database.is_configured());
+    }
+
+    #[test]
+    fn test_parse_toml_database_missing() {
+        let content = r#"
+            [upbit]
+            api_key = "key"
+            secret_key = "secret"
+        "#;
+
+        let config = parse_toml_simple(content).unwrap();
+        assert!(!config.database.is_configured());
     }
 
     #[test]

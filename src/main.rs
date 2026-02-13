@@ -9,16 +9,16 @@
 //!    DATABASE_URL=mysql://user:pass@localhost/arb cargo run --example migrate
 //!    ```
 //!
-//! 2. 설정 파일 (`strategy.toml`) + 거래소 API 키 (`config.toml`)
+//! 2. 설정 파일: `config.toml` (API 키 + DB URL) + `strategy.toml` (전략 파라미터)
 //!
 //! ## 실행 방법
 //!
 //! ```bash
-//! # 필수 환경변수: DATABASE_URL, config.toml (API 키)
-//! DATABASE_URL=mysql://user:pass@localhost/arb cargo run
+//! # config.toml에 모든 시크릿이 설정된 경우
+//! cargo run
 //!
 //! # 디버그 로그
-//! RUST_LOG=debug DATABASE_URL=mysql://... cargo run
+//! RUST_LOG=debug cargo run
 //! ```
 //!
 //! ## Graceful Shutdown
@@ -98,11 +98,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---------------------------------------------------------------
     // 2. DB 초기화
     // ---------------------------------------------------------------
-    let database_url =
-        std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL 환경변수가 필요합니다.")?;
+    if !config.database.is_configured() {
+        return Err(
+            "DB URL이 필요합니다. config.toml의 [database] url 또는 DATABASE_URL 환경변수를 설정하세요."
+                .into(),
+        );
+    }
+    let database_url = &config.database.url;
 
     info!("DB 연결 시도...");
-    let db_pool = DbPool::connect(&database_url, &DbPoolConfig::default()).await?;
+    let db_pool = DbPool::connect(database_url, &DbPoolConfig::default()).await?;
     db_pool.health_check().await?;
     info!("DB 연결 성공");
 
