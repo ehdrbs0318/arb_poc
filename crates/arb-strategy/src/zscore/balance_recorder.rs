@@ -404,6 +404,11 @@ impl BalanceRecorderTask {
         // 5. Upbit 처리
         match upbit_result {
             Ok(balances) => {
+                debug!(
+                    count = balances.len(),
+                    currencies = ?balances.iter().map(|b| b.currency.as_str()).collect::<Vec<_>>(),
+                    "Upbit 잔고 조회 성공"
+                );
                 match self
                     .build_upbit_row(
                         &balances,
@@ -441,6 +446,11 @@ impl BalanceRecorderTask {
         // 6. Bybit 처리
         match bybit_result {
             Ok(balances) => {
+                debug!(
+                    count = balances.len(),
+                    currencies = ?balances.iter().map(|b| b.currency.as_str()).collect::<Vec<_>>(),
+                    "Bybit 잔고 조회 성공"
+                );
                 match Self::build_bybit_row(
                     &balances,
                     self.session_id,
