@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use chrono::Local;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use tracing::{debug, error, info, warn};
@@ -50,6 +51,7 @@ use arb_poc::db::writer::{DbWriteRequest, DbWriter};
 use arb_poc::exchange::{ExchangeAdapter, MarketData, OrderManagement};
 use arb_poc::exchanges::{BybitAdapter, BybitClient, UpbitAdapter, UpbitClient};
 use arb_poc::forex::{ForexCache, UsdtKrwCache};
+use arb_poc::logging::{LogConfig, init_logging};
 use arb_poc::strategy::zscore::alert::{
     AlertConsumer, AlertEvent, AlertService, DbAlertFn, TelegramSendFn, TripleFailureFn,
 };
@@ -63,25 +65,57 @@ use arb_poc::strategy::zscore::pnl::ClosedPosition;
 use arb_poc::strategy::zscore::risk::{RiskConfig, RiskManager};
 use tokio_util::sync::CancellationToken;
 
+/// 실행 시점의 로그 파일 경로를 계산합니다.
+///
+/// - 우선순위: `strategy.toml`의 `[output].dir` → 기본값 `"output"`
+/// - 파일명: `live_YYYYMMDD_HHMMSS.log`
+fn resolve_live_log_file_path(strategy_config_path: &str) -> std::path::PathBuf {
+    let output_dir = if Path::new(strategy_config_path).exists() {
+        match ZScoreConfig::from_file(strategy_config_path) {
+            Ok(cfg) => cfg.output.dir,
+            Err(err) => {
+                eprintln!(
+                    "WARN: strategy config 파싱 실패로 output 디렉토리 기본값을 사용합니다: {err}"
+                );
+                "output".to_string()
+            }
+        }
+    } else {
+        "output".to_string()
+    };
+
+    let dir = Path::new(&output_dir);
+    if let Err(err) = std::fs::create_dir_all(dir) {
+        eprintln!(
+            "WARN: 로그 디렉토리 생성 실패 (dir={}): {}. 현재 디렉토리를 사용합니다.",
+            output_dir, err
+        );
+        return Path::new(".").join(format!("live_{}.log", Local::now().format("%Y%m%d_%H%M%S")));
+    }
+
+    dir.join(format!("live_{}.log", Local::now().format("%Y%m%d_%H%M%S")))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 로깅 초기화
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let strategy_config_path =
+        std::env::var("STRATEGY_CONFIG").unwrap_or_else(|_| "strategy.toml".into());
 
-    info!("=== arb_poc 라이브 트레이딩 시작 ===");
+    // 로깅 초기화 (stdout + 파일 동시 출력)
+    let log_file_path = resolve_live_log_file_path(&strategy_config_path);
+    let mut log_config = LogConfig::from_env();
+    log_config.console_enabled = true;
+    log_config.file_enabled = true;
+    log_config.file_path = Some(log_file_path.clone());
+    init_logging(&log_config)?;
+
+    info!(log_file = %log_file_path.display(), "=== arb_poc 라이브 트레이딩 시작 ===");
 
     // ---------------------------------------------------------------
     // 1. 설정 로드 + 검증
     // ---------------------------------------------------------------
     let config = Config::load_or_default();
 
-    let strategy_config_path =
-        std::env::var("STRATEGY_CONFIG").unwrap_or_else(|_| "strategy.toml".into());
     let mut strategy_config = if Path::new(&strategy_config_path).exists() {
         info!(path = %strategy_config_path, "전략 설정 파일 로드");
         let cfg = ZScoreConfig::from_file(&strategy_config_path)?;
