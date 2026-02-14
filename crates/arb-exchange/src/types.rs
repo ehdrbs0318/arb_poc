@@ -396,7 +396,8 @@ pub struct Balance {
     /// 통화 코드 (예: "BTC", "KRW").
     pub currency: String,
     /// 가용 잔고.
-    /// Bybit의 경우 `availableToWithdraw`(출금 가능 잔고)를 매핑합니다.
+    /// Bybit 선물(Unified)에서는 `walletBalance`를 매핑합니다.
+    /// (`availableToWithdraw`는 UNIFIED에서 deprecated)
     pub balance: Decimal,
     /// 잠긴 잔고 (주문에 사용 중).
     /// Bybit의 경우 API `locked` 필드를 원본 그대로 매핑합니다.

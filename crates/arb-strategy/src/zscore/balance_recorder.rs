@@ -575,10 +575,10 @@ impl BalanceRecorderTask {
     /// Bybit 잔고에서 BalanceSnapshotRow를 조립합니다.
     ///
     /// - USDT 항목: equity -> total 직접 사용 (합산하지 않음)
-    /// - available = balance (availableToWithdraw 매핑)
+    /// - available = balance (Bybit walletBalance 매핑)
     /// - locked = locked (Option -> ZERO)
-    /// - coin_value = unrealised_pnl (Option -> ZERO)
-    /// - total = equity (None이면 balance + locked fallback + warn)
+    /// - coin_value = unrealised_pnl (Option -> ZERO, 포지션 가치 분해용)
+    /// - total = equity (None이면 balance + coin_value fallback + warn)
     #[allow(clippy::too_many_arguments)]
     fn build_bybit_row(
         balances: &[Balance],
@@ -599,8 +599,8 @@ impl BalanceRecorderTask {
 
         // total = equity 직접 사용 (합산하지 않음)
         let total = usdt.equity.unwrap_or_else(|| {
-            warn!("Bybit equity가 None, balance + locked fallback 사용");
-            usdt.balance + usdt.locked
+            warn!("Bybit equity가 None, balance + coin_value fallback 사용");
+            usdt.balance + coin_value
         });
 
         // USDT = USD 가정: total_usd = total, total_usdt = total
@@ -1114,7 +1114,7 @@ mod tests {
 
     #[test]
     fn test_bybit_row_equity_none_fallback() {
-        // equity가 None이면 balance + locked으로 fallback
+        // equity가 None이면 balance + coin_value로 fallback
         let balances = vec![make_usdt_balance(
             Decimal::new(3000, 0), // available = 3000
             Decimal::new(500, 0),  // locked = 500
@@ -1134,8 +1134,8 @@ mod tests {
         );
 
         let row = row.unwrap();
-        // total = balance + locked = 3000 + 500 = 3500 (fallback)
-        assert_eq!(row.total, Decimal::new(3500, 0));
+        // total = balance + coin_value = 3000 + 0 = 3000 (fallback)
+        assert_eq!(row.total, Decimal::new(3000, 0));
         assert_eq!(row.coin_value, Decimal::ZERO);
     }
 

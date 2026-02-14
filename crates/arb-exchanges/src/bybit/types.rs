@@ -238,6 +238,13 @@ pub struct BybitWalletAccount {
         deserialize_with = "deserialize_optional_decimal_string"
     )]
     pub total_equity: Option<Decimal>,
+    /// 주문 가능 총 잔고 (Unified 계정 기준, USD/USDT).
+    #[serde(
+        rename = "totalAvailableBalance",
+        default,
+        deserialize_with = "deserialize_optional_decimal_string"
+    )]
+    pub total_available_balance: Option<Decimal>,
     /// 계정 코인 목록.
     pub coin: Vec<BybitCoinBalance>,
 }
@@ -256,9 +263,10 @@ pub struct BybitCoinBalance {
     /// 출금 가능 잔고.
     #[serde(
         rename = "availableToWithdraw",
-        deserialize_with = "deserialize_decimal_string"
+        default,
+        deserialize_with = "deserialize_optional_decimal_string"
     )]
-    pub available_to_withdraw: Decimal,
+    pub available_to_withdraw: Option<Decimal>,
     /// 동결 잔고 (주문 등에 사용 중).
     #[serde(default, deserialize_with = "deserialize_optional_decimal_string")]
     pub locked: Option<Decimal>,
@@ -743,6 +751,7 @@ mod tests {
 
         let account: BybitWalletAccount = serde_json::from_str(json).unwrap();
         assert_eq!(account.account_type, "UNIFIED");
+        assert!(account.total_available_balance.is_none());
         assert_eq!(account.coin.len(), 2);
         assert_eq!(account.coin[0].coin, "USDT");
         assert_eq!(account.coin[0].wallet_balance, Decimal::new(5000000, 2));
@@ -772,9 +781,32 @@ mod tests {
         let coin = &account.coin[0];
         assert_eq!(coin.coin, "USDT");
         assert_eq!(coin.wallet_balance, Decimal::new(5000000, 2));
-        assert_eq!(coin.available_to_withdraw, Decimal::new(4500000, 2));
+        assert_eq!(coin.available_to_withdraw, Some(Decimal::new(4500000, 2)));
         assert_eq!(coin.equity, Some(Decimal::new(5100050, 2)));
         assert_eq!(coin.unrealised_pnl, Some(Decimal::new(100050, 2)));
+    }
+
+    #[test]
+    fn test_deserialize_bybit_wallet_account_total_available_balance() {
+        let json = r#"{
+            "accountType": "UNIFIED",
+            "totalEquity": "3003.82500044",
+            "totalAvailableBalance": "3003.82500044",
+            "coin": [
+                {
+                    "coin": "USDT",
+                    "walletBalance": "3003.82500044",
+                    "availableToWithdraw": "0",
+                    "equity": "3003.82500044"
+                }
+            ]
+        }"#;
+
+        let account: BybitWalletAccount = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            account.total_available_balance,
+            Some(Decimal::new(300382500044, 8))
+        );
     }
 
     #[test]

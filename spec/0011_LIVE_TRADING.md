@@ -13,6 +13,21 @@
 - `OrderManagement` trait + Upbit/Bybit SDK에 `place_order`, `cancel_order`, `get_order` 이미 구현
 - `arb-telegram` 크레이트 메시지 전송 인프라 준비 완료
 
+## 사용자 의사결정 반영 (2026-02-14)
+
+본 문서의 일부 초기 요구사항은 아래 운영 정책으로 대체한다. 본 섹션이 충돌 시 우선한다.
+
+1. 이슈 5 (DB URL 정책 변경)
+   - 기존: `DATABASE_URL` 환경변수 전용
+   - 변경: `DATABASE_URL` 우선 + `strategy.toml`의 `db_url` fallback 허용
+2. 이슈 6 (Upbit IOC 사전검증/GTC fallback 변경)
+   - 기존: `/v1/orders/chance` 기반 IOC 지원 사전검증 + 미지원 시 GTC+cancel fallback
+   - 변경: 해당 사전검증/자동 fallback을 운영 범위에서 제외한다.
+     주문 거부는 일반 실패 경로로 처리하되, **코인 단위 circuit breaker**를 적용한다.
+     (권장 기본값: `upbit_ioc_reject_block_count=3`, `upbit_ioc_reject_cooldown_minutes=30`)
+3. 이슈 4 (라이브 출력 정책 고정)
+   - 선택: **LIVE는 DB-only** (`DbSessionWriter`만 사용), 파일 출력은 시뮬레이션 전용
+
 ---
 
 ## 시뮬레이션 vs 라이브 차이점
@@ -192,7 +207,9 @@ minute_timer.tick() => {
 
 **Upbit IOC 지정가**:
 - qty 직접 지정 가능, 슬리피지 상한 제어. 미체결분은 자동 취소.
-- **사전 검증 필요**: Live 시작 시 Upbit API가 실제로 IOC를 지원하는지 마켓별 확인. `ord_type`에 IOC 없는 마켓은 **GTC 지정가 + timeout 후 cancel** fallback 자동 적용.
+- **정책 변경(2026-02-14)**: IOC 지원 사전검증 및 GTC fallback은 적용하지 않는다.
+  주문 거부는 일반 실패 경로로 처리하되, 코인별 거부 카운터 누적 시 circuit breaker를 적용한다.
+  (`upbit_ioc_reject_block_count` 이상 연속 거부 시 `upbit_ioc_reject_cooldown_minutes` 동안 신규 진입 차단)
 - price = `upbit_krw_price * (1 + max_slippage_pct)` (슬리피지 상한)
 - **시장가 fallback** (config): `krw_amount = qty * upbit_krw_price` -> `OrderRequest::market_buy(market, krw_amount)` (Upbit 시장가 매수는 KRW 금액 기준, 수수료는 체결 후 코인 수량에서 별도 차감)
 
@@ -963,7 +980,8 @@ emergency_attempts: u32,
   1. `RiskManager.validate_order_size(size_usdt)` -- 단일 주문 크기 상한 확인
   2. Upbit 주문 준비:
      - **IOC 지정가 (기본)**: `price = upbit_krw_price * (1 + max_slippage_pct)`
-     - **Upbit IOC 미지원 시 fallback**: GTC 지정가 + `tokio::time::timeout(3s)` 후 cancel
+     - **정책 변경(2026-02-14)**: IOC 미지원 사전분기/GTC fallback 자동 전환은 적용하지 않음
+     - 주문 거부(`Invalid time_in_force`, `not supported`, `validation error`)는 코인별 카운터로 집계하고 threshold 도달 시 해당 코인 신규 진입 차단(cooldown)
      - **시장가 (config fallback)**: `krw_amount = qty * upbit_krw_price * (1 + upbit_fee_rate)`
   3. Bybit 주문 준비:
      - **IOC 지정가**: `price = bybit_usdt_price * (1 - max_slippage_pct)` (매도 하한)
@@ -1079,7 +1097,10 @@ pub trait ExecutionPolicy: Send + Sync + 'static {
   - `available_capital = min(upbit_krw / usd_krw, bybit_usdt)`
   - 잔고 부족 시 경고 + `config.total_capital_usdt`를 실잔고 기준으로 조정
 - (Live 모드) DB 연결 확인: `pool.acquire()` 성공 확인, 실패 시 시작 차단
-- (Live 모드) Upbit IOC 지원 여부 사전 검증: 테스트 주문(최소 금액) -> IOC 지원 확인
+- (Live 모드) **정책 변경(2026-02-14)**: Upbit IOC 지원 여부 사전 검증은 운영 범위에서 제외 (주문 실패 경로에서 처리)
+- (Live 모드) Upbit IOC 주문 거부 circuit breaker 초기화:
+  - 코인별 연속 거부 카운터 = 0
+  - threshold 도달 코인은 `cooldown_until` 시각까지 신규 진입 차단
 - 미청산 포지션 복원: `PositionStore::load_open(session_id)`
   - DB 조회 실패 시 -> reconciliation 강제 실행
   - "Opening"/"Closing" 상태 포지션 -> order_id 기반 `get_order()` 조회 후 복구
@@ -1234,8 +1255,14 @@ funding_exclude_ratio = 0.5        # 펀딩비 > 수익의 50%이면 코인 제�
 # 시간대 제한 (P2, 향후)
 # trading_hours_utc = "00:00-23:59"  # 거래 허용 시간대 (UTC). 범위 외 시 진입 차단.
 
-# DB (db_url은 strategy.toml에 포함하지 않음 — DATABASE_URL 환경변수에서만 읽기)
-# db_url = "mysql://..." → 환경변수 DATABASE_URL 전용
+# DB (`DATABASE_URL` 환경변수 우선, 없으면 strategy.toml의 `db_url` fallback 허용)
+# db_url = "mysql://..."
+# 보안: db_url은 로그/알림/세션 config_json 출력 시 password 마스킹
+# 보안: strategy.toml에 db_url 저장 시 파일 권한 0600 권장(완화 불가 시 warn 로그)
+
+# Upbit IOC reject circuit breaker
+upbit_ioc_reject_block_count = 3          # 코인별 연속 거부 N회 시 신규 진입 차단
+upbit_ioc_reject_cooldown_minutes = 30    # 차단 유지 시간(분)
 
 # PendingExchangeRecovery
 pending_recovery_timeout_hours = 2  # 최대 체류 시간 (초과 시 수동 처리 알림 + 잔고 예약 해제)
@@ -1385,7 +1412,7 @@ telegram_chat_id = ""             # 환경변수 우선
 | H3 | Decimal::ZERO fallback | 0가격 진입 위험 | ZERO 가드 추가 | 1-6 |
 | H4 | Bybit 시장가 슬리피지 미제어 | 급변동 시 수익 소멸 | 양 레그 모두 IOC 지정가 | 2-4 |
 | H5 | 비상 청산 이중 실패 | naked exposure 무제한 | 3단계: IOC->시장가->kill switch | 2-4 |
-| H6 | Upbit IOC 미지원 가능성 | 주문 거부 위험 | Live 시작 시 사전 검증 + GTC+cancel fallback | 2-4, 3-2 |
+| H6 | Upbit IOC 미지원 가능성 | 주문 거부 위험 | 주문 실패 경로 + 코인별 circuit breaker (정책 변경) | 2-4, 3-2 |
 | H7 | 잔고 경합 (동시 진입) | 잔고 부족 주문 거부 | BalanceTracker 자본 예약 패턴 | 1-8 |
 | H8 | instrument_cache RwLock unwrap | poisoned 데이터 사용 | `parking_lot::RwLock` 전환 | 1-1 |
 | H9 | 리스크 한도 자본 비연동 | $300에서 $500 한도 = 166% | 비율(%) + 절대값 이중 | 1-3 |
@@ -1531,7 +1558,9 @@ Phase 4 ───────── 설정 및 부가 기능
 - [ ] Session ID 연속성: 이전 세션 Crashed 마감 + 새 session_id (parent_session_id로 참조)
 - [ ] sessions 테이블에 `parent_session_id BIGINT UNSIGNED NULL` 컬럼
 - [ ] sessions.config_json 저장 시 민감 필드(db_url, api_key 등) redact
-- [ ] `db_url`은 `DATABASE_URL` 환경변수에서만 읽기 (strategy.toml에 미포함)
+- [ ] `db_url` 읽기 정책: `DATABASE_URL` 우선, 미설정 시 strategy.toml `db_url` fallback
+- [ ] `db_url` 로그/알림 마스킹 적용 (password redaction)
+- [ ] strategy.toml 권한 점검 (0600 권장, 미충족 시 warn)
 - [ ] Upbit client_order_id 사전 검증: `/v1/orders/chance` API에서 client_order_id 기반 검색 지원 여부 확인
 - [ ] Client Order ID: UUID v7 형식
 - [ ] SessionWriter trait: FileSessionWriter + DbSessionWriter 추상화
@@ -1654,7 +1683,8 @@ Phase 4 ───────── 설정 및 부가 기능
 - [ ] 비상 청산 손실 -> RiskManager.record_trade() 포함
 - [ ] `RiskManager.validate_order_size()` 발주 전 확인
 - [ ] 단위 테스트: 양쪽 성공/한쪽 실패/타임아웃/partial fill
-- [ ] Upbit `/v1/orders/chance` API로 마켓별 order_types 확인. IOC 미지원 시 GTC fallback 자동 선택.
+- [ ] Upbit IOC 사전검증/GTC fallback 자동 선택 비적용 (정책 변경)
+- [ ] Upbit IOC 주문 거부 circuit breaker (코인별 연속 거부 카운터 + cooldown 차단) 구현
 - [ ] Bybit WS execution topic 체결 확인 (REST polling 병행)
 - [ ] Bybit WS `/v5/private/position` 토픽 구독. 포지션 외부 변경(강제 청산, ADL) 즉시 감지. execution topic과 함께 private WS 채널에 구독.
 - [ ] Client Order ID: UUID v7 (session 정보 미노출, DB 매핑으로 해결)
@@ -1689,7 +1719,8 @@ Phase 4 ───────── 설정 및 부가 기능
 - [ ] 시작 시 Bybit 설정 검증 (leverage, margin_mode 실패 처리)
 - [ ] 시작 시 BalanceTracker 초기화 + config.total_capital_usdt 조정
 - [ ] 시작 시 DB 연결 확인
-- [ ] 시작 시 Upbit IOC 지원 여부 사전 검증
+- [ ] 시작 시 Upbit IOC 지원 여부 사전 검증 비적용 (정책 변경)
+- [ ] 시작 시 Upbit IOC 거부 카운터/cooldown 상태 초기화
 - [ ] 미청산 포지션 복원 (DB load_open + order_id 기반 get_order() 조회)
 - [ ] NTP > 3초 warn, > 5초 시작 차단
 - [ ] Upbit 마켓 상태 확인 (입출금 정지 코인 제외)
@@ -1729,7 +1760,7 @@ Phase 4 ───────── 설정 및 부가 기능
 - [ ] `cargo test` 전체 통과 + `cargo clippy` 경고 0
 
 ### Phase 4: 설정 및 부가 기능
-- [ ] `config.rs`에 라이브 전용 설정 추가 (order_timeout_sec, max_slippage_pct, 환율, 펀딩비, db_url 등)
+- [ ] `config.rs`에 라이브 전용 설정 추가 (order_timeout_sec, max_slippage_pct, 환율, 펀딩비, db_url, upbit_ioc_reject_* 등)
 - [ ] rolling_24h_loss_usdt config 추가
 - [ ] 펀딩 강제청산 config (enabled, minutes_major/minutes_alt, major_coins, alert/exclude ratio)
 - [ ] `ClosedPosition`에 `actual_fees`, `funding_fee`, `adjustment_cost` 추가

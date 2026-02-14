@@ -128,14 +128,16 @@ impl DbWriter {
         match self.tx.try_send(request) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(req)) => {
-                self.stats.overflow_count.fetch_add(1, Ordering::Relaxed);
+                let overflow_count = self.stats.overflow_count.fetch_add(1, Ordering::Relaxed) + 1;
 
                 if is_critical_request(&req) {
-                    warn!(
-                        overflow_count = self.stats.overflow_count.load(Ordering::Relaxed),
-                        request_type = describe_request(&req),
-                        "DB writer channel full, queueing critical request with async send"
-                    );
+                    if should_log_overflow(overflow_count) {
+                        warn!(
+                            overflow_count = overflow_count,
+                            request_type = describe_request(&req),
+                            "DB writer channel full, queueing critical request with async send"
+                        );
+                    }
                     let tx = self.tx.clone();
                     let stats = Arc::clone(&self.stats);
                     tokio::spawn(async move {
@@ -144,9 +146,9 @@ impl DbWriter {
                             error!("DB writer channel closed while sending critical request");
                         }
                     });
-                } else {
+                } else if should_log_overflow(overflow_count) {
                     warn!(
-                        overflow_count = self.stats.overflow_count.load(Ordering::Relaxed),
+                        overflow_count = overflow_count,
                         request_type = describe_request(&req),
                         "DB writer channel full, dropping newest request"
                     );
@@ -205,6 +207,11 @@ fn is_critical_request(req: &DbWriteRequest) -> bool {
             | DbWriteRequest::InsertAlert(_)
             | DbWriteRequest::UpdateSession { .. }
     )
+}
+
+/// overflow 로그 스팸 방지를 위한 샘플링 정책.
+fn should_log_overflow(overflow_count: u64) -> bool {
+    overflow_count <= 10 || overflow_count.is_multiple_of(100)
 }
 
 /// 최대 재시도 횟수.

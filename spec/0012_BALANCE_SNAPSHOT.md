@@ -100,14 +100,14 @@ total = equity   ← API 응답에서 직접 사용 (available + locked + coin_v
 
 | 필드 | 소스 | 비고 |
 |------|------|------|
-| `available` | USDT `availableToWithdraw` | 참고용 분해(breakdown) 필드 |
+| `available` | USDT `walletBalance` | 선물 운용 기준 가용 분해 필드 |
 | `locked` | USDT `locked` (Option → ZERO) | 참고용 분해 필드 |
 | `coin_value` | USDT `unrealisedPnl` (Option → ZERO) | 양수/음수 모두 가능 |
 | `total` | USDT `equity` | **ground truth** — `walletBalance + unrealisedPnl` |
 
 > **Bybit에서 `available + locked + coin_value ≠ total` 일 수 있다.**
-> Bybit Unified 계정에서 `availableToWithdraw + locked ≠ walletBalance`이다.
-> (`availableToWithdraw = equity - initialMargin`이므로 IM 차감이 포함됨.)
+> Bybit Unified 계정에서 `availableToWithdraw`는 deprecated이며
+> 실제 운영 시 0/빈값으로 내려올 수 있다.
 > 따라서 Bybit `total`은 반드시 API의 `equity` 필드를 직접 사용해야 하며,
 > `available`, `locked`, `coin_value`는 참고용 분해 필드로만 활용한다.
 
@@ -204,7 +204,7 @@ total       = available + locked + coin_value
 #### 매핑
 
 ```
-available   = USDT availableToWithdraw       // Option → None이면 Decimal::ZERO
+available   = USDT walletBalance             // 선물 운용 기준 가용 잔고
 locked      = USDT locked                    // Option → None이면 Decimal::ZERO
 coin_value  = USDT unrealisedPnl             // Option → None이면 Decimal::ZERO
 total       = USDT equity                    // ← API 필드 직접 사용 (위 3개 합산 아님)
@@ -212,10 +212,10 @@ total       = USDT equity                    // ← API 필드 직접 사용 (�
 
 > **`total`은 `equity`를 직접 사용한다** (Section 2.3 참조).
 > `available + locked + coin_value`로 조립하지 않는다.
-> Bybit Unified에서 `availableToWithdraw = equity - initialMargin`이므로
-> `available + locked ≠ walletBalance`이다.
+> Bybit Unified 파생상품에서 `availableToWithdraw`는 deprecated이므로
+> `available` 분해 필드는 `walletBalance` 기준으로 관리한다.
 >
-> **Option 필드 fallback**: Bybit API의 `locked`, `unrealisedPnl`, `availableToWithdraw`은
+> **Option 필드 fallback**: Bybit API의 `locked`, `unrealisedPnl`은
 > `Option<Decimal>`이다. `None`인 경우 `Decimal::ZERO`로 처리한다.
 >
 > **구현 필요 사항**:
@@ -411,7 +411,7 @@ pub struct BalanceRecorderTask {
    a. `snapshot_group_id` 채번 + `created_at` 생성 (application level 동일 값)
    b. Upbit `get_balances()` + Bybit `get_balances()` **동시 호출** (`tokio::join!`)
    c. Upbit: KRW 잔고 추출 + 보유 코인 목록 (dust 필터링) → ticker cache로 coin_value 계산
-   d. Bybit: USDT coin의 equity(→total) + available/locked/unrealisedPnl 추출 (Option → ZERO fallback)
+   d. Bybit: USDT coin의 walletBalance(→available) + equity(→total) + locked/unrealisedPnl 추출 (Option → ZERO fallback)
    e. `forex.get_usd_krw()` + `usdt_cache.get_usdt_krw()` 조회
    f. 환산값 계산 (`total_usd`, `total_usdt`) — 0 나누기 가드 포함
    g. 2행 Row 조립 → `db_writer.send()` 로 INSERT 위임

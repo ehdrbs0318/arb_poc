@@ -10,6 +10,11 @@
   주문 가능 자금이 `locked`로 오인식되는 문제 분석 및 수정
 - **LD-0002**: 라이브 실행 시 `minutes`/`funding_schedules`/`trades`/`alerts`
   테이블 INSERT 경로가 미연결이거나 실질적으로 동작하지 않는 문제 수정
+- **LD-0003**: `sync_from_exchange()` 주기 동기화가 스펙(`0011`)대로 실행되지 않는 문제
+- **LD-0004**: minute timer 기반 reconciliation task가 스펙(`0011`)과 다르게 미연결/미동작인 문제
+- **LD-0005**: `shutdown_policy` 설정이 runtime 종료 동작 분기에 실제 반영되지 않는 문제
+- **LD-0006**: 라이브 모드의 파일 출력(`SessionWriter`, CSV/JSON) 경로 잔존으로 DB 우선 정책과 불일치하는 문제
+- **LD-0007**: 종료 시 `DbWriter` drain/flush 대기 누락으로 최종 write 유실 가능한 문제
 
 ---
 
@@ -28,6 +33,11 @@
 |---|---|---|---|---|
 | LD-0001 | Bybit USDT `available/locked` 오인식 | Done | P0 | `0011`, `0012` |
 | LD-0002 | DB INSERT 경로 미연결 (`minutes`, `funding_schedules`, `trades`, `alerts`) | Done | P0 | `0011`, `0012` |
+| LD-0003 | `sync_from_exchange()` 5분 주기 미실행 | Open | P0 | `0011` |
+| LD-0004 | minute timer reconciliation 미실행 | Open | P0 | `0011` |
+| LD-0005 | `shutdown_policy` 미반영 | Open | P1 | `0011` |
+| LD-0006 | 라이브 파일 출력 경로 잔존 | Open | P1 | `0011` |
+| LD-0007 | 종료 시 `DbWriter` flush 대기 누락 | Open | P0 | `0011` |
 
 ---
 
@@ -55,8 +65,9 @@ id,created_at,snapshot_group_id,session_id,record_type,cex,currency,available,lo
 
 - `total`은 `equity`를 사용한다 (`0012`와 동일)
 - `locked`는 Bybit API의 `locked` 필드를 사용한다 (가능하면 원본 그대로)
-- `available`은 "실제 주문 가능" 의미를 보존해야 하며,
-  최소한 `locked = total`로 오인되도록 계산되면 안 된다
+- `available`은 **USDT `walletBalance`**로 기록한다 (사용자 운영 정책 반영)
+- `coin_value`는 **포지션 가치(`unrealisedPnl`)**로 기록한다
+- 따라서 `total`은 `equity`(ground truth), 분해 필드(`available/locked/coin_value`)는 진단용으로 관리한다
 
 ### 3. 원인 분석 (현재 코드 기준)
 
@@ -126,10 +137,8 @@ fn convert_balance(b: crate::bybit::types::BybitCoinBalance) -> Balance {
 
 - `convert_balance()`에서 `locked`를 API `locked.unwrap_or(0)`로 변경
 - 파생식 `wallet - availableToWithdraw` 제거
-- `available` 의미를 최종 확정:
-  - 후보 A: `availableToWithdraw` 유지(문서와 동일)
-  - 후보 B: 주문 가능 잔고용 필드로 교체(필요 시 account-level 필드 사용)
-- 선택한 의미를 `Balance` 문서 주석과 스냅샷 문서에 명시
+- `available = walletBalance`로 확정 (`availableToWithdraw`는 deprecated 필드이므로 사용하지 않음)
+- `coin_value = unrealisedPnl`, `total = equity` 매핑을 문서/코드에 고정
 
 ### Phase 3: 스냅샷/초기화 경로 검증
 
@@ -304,7 +313,7 @@ fn convert_balance(b: crate::bybit::types::BybitCoinBalance) -> Balance {
 
 ### Phase 3: `trades` INSERT 구현
 
-- `LivePolicy::record_trade()`에서 CSV 기록과 함께 `DbWriteRequest::InsertTrade` 전송
+- `LivePolicy::record_trade()`에서 **LIVE 파일 출력 없이** `DbWriteRequest::InsertTrade` 전송
 - 일반 청산/TTL 청산/강제 청산/비상 청산 경로 모두 동일 함수 사용 보장
 - 매핑 규칙 고정:
   - `position_id = VirtualPosition.db_id` (필수)
@@ -406,3 +415,114 @@ fn convert_balance(b: crate::bybit::types::BybitCoinBalance) -> Balance {
 4. 핵심 운영 이벤트에서 `alerts`가 텔레그램 성공/실패와 무관하게 DB에 기록된다
 5. backpressure 정책이 중요 이벤트(`trades`/`alerts`) 유실을 방지한다
 6. 관련 테스트/정적검사가 통과한다
+
+---
+
+## LD-0003 — `sync_from_exchange()` 5분 주기 미실행
+
+### 1. 현상
+
+- 라이브 실행 중 `sync_from_exchange()` 주기 로그/동작이 관측되지 않아 내부 예약 잔고와 거래소 실잔고 drift 누적 위험이 존재한다.
+
+### 2. 기대 동작
+
+- `minute_timer`에서 5분마다 별도 `tokio::spawn(sync_from_exchange(...))` 실행
+- 주기 허용 오차: **5분 ± 15초**
+- 누락 허용: 연속 2회 누락 금지 (1회 누락 시 즉시 warn + 카운터 증가)
+- drift 임계치 초과 시 `warn` + 보정
+- `InsufficientFunds` 계열 주문 실패 시 즉시 강제 sync
+
+### 3. 체크리스트
+
+- [ ] 5분 주기 spawn 연결 상태 점검/복구
+- [ ] 실행 간격 SLA 검증 (5분 ± 15초)
+- [ ] 연속 누락 2회 방지 검증 (누락 카운터/알림)
+- [ ] drift 보정/로그/카운터 반영 검증
+- [ ] 주문 실패 즉시 sync 트리거 검증
+
+---
+
+## LD-0004 — minute timer reconciliation 미실행
+
+### 1. 현상
+
+- 스펙에는 1분(또는 조건부 2분) 주기 reconciliation spawn이 명시되어 있으나 런타임에서 미연결/미실행 정황이 확인됐다.
+
+### 2. 기대 동작
+
+- `minute_timer`에서 reconciliation task를 비동기로 주기 실행
+- 실행 주기 규칙: 기본 1분, 열린 포지션 3개 이상이면 2분
+- 주기 허용 오차: **±10초**
+- 불일치 감지 시 진입 차단/알림/카운터 기록
+- 연속 성공 시 차단 자동 해제 규칙 적용
+
+### 3. 체크리스트
+
+- [ ] reconciliation spawn 경로 연결
+- [ ] 주기 규칙 검증 (1분 기본, 3개 이상 시 2분)
+- [ ] 실행 간격 SLA 검증 (±10초)
+- [ ] mismatch 차단 범위(전체/코인 단위) 검증
+- [ ] 연속 성공 해제 로직 검증
+
+---
+
+## LD-0005 — `shutdown_policy` runtime 미반영
+
+### 1. 현상
+
+- 설정에 `shutdown_policy = keep|close_all|close_if_profitable`가 존재하지만 종료 시 분기 적용이 누락되어 정책 차등이 동작하지 않는다.
+
+### 2. 기대 동작
+
+- SIGINT/SIGTERM 수신 시 `shutdown_policy` 값별 종료 분기 실행
+- 정책별 로그, 세션 상태, 포지션 처리 결과가 명확히 남아야 한다
+
+### 3. 체크리스트
+
+- [ ] 종료 핸들러에서 정책 분기 연결
+- [ ] 세 가지 정책별 통합 테스트/수동 검증
+- [ ] 세션 종료 reason/status 기록 확인
+
+---
+
+## LD-0006 — 라이브 파일 출력 경로 잔존
+
+### 1. 현상
+
+- 라이브 모드에서 DB 적재와 별개로 `SessionWriter` 기반 CSV/JSON 출력이 남아 있어 `0011`의 DB 우선/파일 I/O 제거 정책과 충돌한다.
+- 사용자 의사결정(2026-02-14): **LIVE는 DB-only**, 파일 출력은 시뮬레이션 전용.
+
+### 2. 기대 동작
+
+- 라이브 모드는 `DbSessionWriter`만 사용하고 파일 출력은 시뮬레이션 전용으로 제한
+- 라이브 출력 디렉토리 생성/append 경로 제거 또는 feature gate로 차단
+
+### 3. 체크리스트
+
+- [ ] 라이브 진입점에서 FileSessionWriter 경로 제거
+- [ ] 시뮬레이션만 파일 출력 유지 검증
+- [ ] 문서/운영 가이드 동기화
+
+---
+
+## LD-0007 — 종료 시 `DbWriter` drain/flush 대기 누락
+
+### 1. 현상
+
+- 종료 직전 `DbWriteRequest`가 채널에 남아도 writer task flush 완료를 기다리지 않아 마지막 `balance_snapshots`/`alerts`/`trades` 유실 가능성이 있다.
+- 운영 로그에서 `DB writer channel full` 경고가 연속 발생하는 상황과 결합되면 드랍 확률이 커진다.
+
+### 2. 기대 동작
+
+- shutdown 단계에서 producer 중단 -> 채널 drain -> writer join 순서 보장
+- 중요 이벤트(`trades`, `alerts`, 최종 snapshot)는 flush 완료 후 종료
+- 종료 대기 시간 상한:
+  - **soft timeout 10초**: 경고 로그 + flush 진행 상황 출력
+  - **hard timeout 30초**: 강제 종료 경로 진입(유실 건수/큐 길이 로그 필수)
+
+### 3. 체크리스트
+
+- [ ] `DbWriter` graceful shutdown 시그널/종료 프로토콜 구현
+- [ ] writer task join 대기 추가
+- [ ] soft/hard timeout 적용 및 강제 종료 로그 검증
+- [ ] 채널 overflow/최종 flush 메트릭 검증

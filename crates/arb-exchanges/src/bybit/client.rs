@@ -645,18 +645,20 @@ impl OrderManagement for BybitClient {
 
         let mut balances = Vec::new();
         for account in result.list {
+            let total_available_balance = account.total_available_balance;
             for coin in account.coin {
                 if coin.coin == "USDT" && tracing::enabled!(tracing::Level::DEBUG) {
                     debug!(
                         wallet_balance = %coin.wallet_balance,
-                        available_to_withdraw = %coin.available_to_withdraw,
+                        available_to_withdraw = ?coin.available_to_withdraw,
+                        total_available_balance = ?total_available_balance,
                         locked = ?coin.locked,
                         equity = ?coin.equity,
                         unrealised_pnl = ?coin.unrealised_pnl,
                         "Bybit USDT 원본 잔고 필드"
                     );
                 }
-                balances.push(convert_balance(coin));
+                balances.push(convert_balance(coin, total_available_balance));
             }
         }
 
@@ -1218,10 +1220,18 @@ fn convert_order(o: BybitOrder) -> Order {
     }
 }
 
-fn convert_balance(b: crate::bybit::types::BybitCoinBalance) -> Balance {
+fn convert_balance(
+    b: crate::bybit::types::BybitCoinBalance,
+    _total_available_balance: Option<Decimal>,
+) -> Balance {
+    // Bybit V5 문서:
+    // availableToWithdraw는 accountType=UNIFIED에서 2025-01-09 이후 deprecated.
+    // 라이브 운영 기준으로 주문/포지션 추적은 walletBalance를 가용 잔고로 취급합니다.
+    let available = b.wallet_balance;
+
     Balance {
         currency: b.coin,
-        balance: b.available_to_withdraw,
+        balance: available,
         locked: b.locked.unwrap_or(Decimal::ZERO),
         avg_buy_price: Decimal::ZERO, // Bybit은 이 정보를 제공하지 않음
         unit_currency: "USDT".to_string(), // 기본값 USDT
@@ -1339,15 +1349,15 @@ mod tests {
         let raw = crate::bybit::types::BybitCoinBalance {
             coin: "USDT".to_string(),
             wallet_balance: Decimal::new(300382500044, 8),
-            available_to_withdraw: Decimal::ZERO,
+            available_to_withdraw: Some(Decimal::ZERO),
             locked: Some(Decimal::ZERO),
             equity: Some(Decimal::new(300382500044, 8)),
             unrealised_pnl: Some(Decimal::ZERO),
             cum_realised_pnl: Some(Decimal::ZERO),
         };
 
-        let balance = convert_balance(raw);
-        assert_eq!(balance.balance, Decimal::ZERO);
+        let balance = convert_balance(raw, None);
+        assert_eq!(balance.balance, Decimal::new(300382500044, 8));
         assert_eq!(balance.locked, Decimal::ZERO);
         assert_eq!(balance.equity, Some(Decimal::new(300382500044, 8)));
     }
@@ -1357,16 +1367,49 @@ mod tests {
         let raw = crate::bybit::types::BybitCoinBalance {
             coin: "USDT".to_string(),
             wallet_balance: Decimal::new(1000, 0),
-            available_to_withdraw: Decimal::new(700, 0),
+            available_to_withdraw: Some(Decimal::new(700, 0)),
             locked: None,
             equity: Some(Decimal::new(1005, 0)),
             unrealised_pnl: Some(Decimal::new(5, 0)),
             cum_realised_pnl: None,
         };
 
-        let balance = convert_balance(raw);
-        assert_eq!(balance.balance, Decimal::new(700, 0));
+        let balance = convert_balance(raw, None);
+        assert_eq!(balance.balance, Decimal::new(1000, 0));
         assert_eq!(balance.locked, Decimal::ZERO);
         assert_eq!(balance.unrealised_pnl, Some(Decimal::new(5, 0)));
+    }
+
+    #[test]
+    fn test_convert_balance_ignores_total_available_balance() {
+        let raw = crate::bybit::types::BybitCoinBalance {
+            coin: "USDT".to_string(),
+            wallet_balance: Decimal::new(300382500044, 8),
+            available_to_withdraw: Some(Decimal::ZERO),
+            locked: Some(Decimal::ZERO),
+            equity: Some(Decimal::new(300382500044, 8)),
+            unrealised_pnl: Some(Decimal::ZERO),
+            cum_realised_pnl: Some(Decimal::ZERO),
+        };
+
+        let balance = convert_balance(raw, Some(Decimal::new(1, 0)));
+        assert_eq!(balance.balance, Decimal::new(300382500044, 8));
+        assert_eq!(balance.locked, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_convert_balance_uses_wallet_balance_over_withdrawable() {
+        let raw = crate::bybit::types::BybitCoinBalance {
+            coin: "USDT".to_string(),
+            wallet_balance: Decimal::new(1000, 0),
+            available_to_withdraw: Some(Decimal::new(900, 0)),
+            locked: Some(Decimal::ZERO),
+            equity: Some(Decimal::new(1000, 0)),
+            unrealised_pnl: Some(Decimal::ZERO),
+            cum_realised_pnl: Some(Decimal::ZERO),
+        };
+
+        let balance = convert_balance(raw, Some(Decimal::new(700, 0)));
+        assert_eq!(balance.balance, Decimal::new(1000, 0));
     }
 }

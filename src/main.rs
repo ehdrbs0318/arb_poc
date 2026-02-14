@@ -491,21 +491,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let funding_writer = db_writer.clone();
     let funding_coins = strategy_config_arc.coins.clone();
     let funding_auto_select = strategy_config_arc.auto_select;
+    let funding_symbols: Vec<String> = funding_coins
+        .iter()
+        .map(|coin| format!("{coin}USDT"))
+        .collect();
     let funding_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let mut warned_missing_symbols = false;
         loop {
             tokio::select! {
                 _ = cancel_funding.cancelled() => break,
                 _ = interval.tick() => {
-                    match bybit_for_funding.get_tickers_linear(None).await {
-                        Ok(tickers) => {
-                            for ticker in tickers {
+                    if funding_symbols.is_empty() {
+                        if !warned_missing_symbols {
+                            warned_missing_symbols = true;
+                            warn!(
+                                auto_select = funding_auto_select,
+                                "funding 코인 목록이 비어 있어 funding_schedules 갱신을 건너뜁니다"
+                            );
+                        }
+                        continue;
+                    }
+
+                    for symbol in &funding_symbols {
+                        match bybit_for_funding.get_tickers_linear(Some(symbol.as_str())).await {
+                            Ok(tickers) => {
+                                let Some(ticker) = tickers.into_iter().next() else {
+                                    continue;
+                                };
                                 let Some(coin) = ticker.symbol.strip_suffix("USDT") else {
                                     continue;
                                 };
-                                if !funding_auto_select && !funding_coins.iter().any(|c| c == coin) {
-                                    continue;
-                                }
 
                                 if ticker.next_funding_time <= 0 {
                                     warn!(
@@ -546,9 +562,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     },
                                 ));
                             }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Bybit funding ticker 조회 실패");
+                            Err(e) => {
+                                warn!(error = %e, symbol = symbol.as_str(), "Bybit funding ticker 조회 실패");
+                            }
                         }
                     }
                 }
@@ -640,6 +656,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "거래 결과"
         );
     }
+
+    // AlertService sender를 모두 drop해야 consumer가 종료됩니다.
+    // - main scope의 alert_service
+    // - monitor 내부 policy가 보유한 alert_service clone
+    drop(monitor);
+    drop(alert_service);
 
     // AlertService consumer 종료 대기
     info!("AlertService consumer 종료 대기...");
