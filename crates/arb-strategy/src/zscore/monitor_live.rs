@@ -268,6 +268,13 @@ where
         }
     }
 
+    /// 치명적 운영 알림 전송 (채널 여유 대기).
+    async fn emit_alert_critical(&self, event: AlertEvent) {
+        if let Some(service) = &self.alert_service {
+            service.send_critical(event).await;
+        }
+    }
+
     /// f64를 DB 저장용 Decimal로 변환합니다.
     fn decimal_from_f64(value: f64) -> Option<Decimal> {
         if !value.is_finite() {
@@ -450,7 +457,14 @@ where
 
         // ① Kill switch 체크 (AtomicBool, lock 불필요)
         if self.risk_manager.is_killed() {
-            debug!(coin = coin.as_str(), "진입 거부: kill switch 발동됨");
+            info!(
+                coin = coin.as_str(),
+                z_score = ctx.z_score,
+                spread_pct = ctx.spread_pct,
+                expected_profit = ctx.expected_profit_pct,
+                filter = "kill_switch",
+                "진입 거부: z-score 통과 후 kill switch 발동"
+            );
             return Ok(());
         }
 
@@ -467,10 +481,14 @@ where
         // ② 주문 크기 상한 체크
         let order_size_usdt = ctx.qty * ctx.bybit_entry;
         if !self.risk_manager.validate_order_size(order_size_usdt) {
-            debug!(
+            info!(
                 coin = coin.as_str(),
+                z_score = ctx.z_score,
+                spread_pct = ctx.spread_pct,
+                expected_profit = ctx.expected_profit_pct,
                 order_size_usdt = %order_size_usdt,
-                "진입 거부: 주문 크기 상한 초과"
+                filter = "max_order_size_usdt",
+                "진입 거부: z-score 통과 후 주문 크기 상한 초과"
             );
             shared.counters.lock().entry_rejected_order_constraint_count += 1;
             return Ok(());
@@ -515,7 +533,14 @@ where
 
             // Kill switch 이중 체크 (TOCTOU 방지)
             if self.risk_manager.is_killed() {
-                debug!(coin = coin.as_str(), "진입 거부: kill switch 이중 체크");
+                info!(
+                    coin = coin.as_str(),
+                    z_score = ctx.z_score,
+                    spread_pct = ctx.spread_pct,
+                    expected_profit = ctx.expected_profit_pct,
+                    filter = "kill_switch_recheck",
+                    "진입 거부: z-score 통과 후 kill switch 이중 체크"
+                );
                 drop(pm);
                 self.balance_tracker.release(&mut reservation);
                 return Ok(());
@@ -526,11 +551,15 @@ where
                 .max_concurrent_positions
                 .unwrap_or(shared.config.coins.len());
             if pm.open_count() >= max_pos {
-                debug!(
+                info!(
                     coin = coin.as_str(),
+                    z_score = ctx.z_score,
+                    spread_pct = ctx.spread_pct,
+                    expected_profit = ctx.expected_profit_pct,
                     open_count = pm.open_count(),
                     max_pos = max_pos,
-                    "진입 거부: 최대 동시 포지션 수 초과"
+                    filter = "max_concurrent_positions",
+                    "진입 거부: z-score 통과 후 최대 동시 포지션 수 초과"
                 );
                 drop(pm);
                 self.balance_tracker.release(&mut reservation);
@@ -685,6 +714,18 @@ where
                 self.balance_tracker
                     .commit(&mut reservation, actual_upbit_krw, actual_bybit_usdt);
 
+                let expected_pnl = Decimal::try_from(ctx.adjusted_profit_pct)
+                    .ok()
+                    .map(|pct| actual_bybit_usdt * pct / Decimal::from(100u64))
+                    .unwrap_or(Decimal::ZERO);
+                self.emit_alert(AlertEvent::EntryExecuted {
+                    coin: coin.clone(),
+                    qty: executed.effective_qty,
+                    upbit_price: executed.upbit_avg_price_krw,
+                    bybit_price: executed.bybit_avg_price,
+                    expected_pnl,
+                });
+
                 info!(
                     coin = coin.as_str(),
                     pos_id = pos_id,
@@ -831,15 +872,16 @@ where
                             );
 
                             // kill switch 발동
-                            self.emit_alert(AlertEvent::EmergencyCloseFailure {
-                                coin: coin.clone(),
-                                retry_count: 1,
-                                naked_exposure: bybit_usdt_needed,
-                            });
                             self.risk_manager.trigger_kill_switch(&format!(
                                 "emergency close failed: {} leg={}",
                                 coin, leg
                             ));
+                            self.emit_alert_critical(AlertEvent::EmergencyCloseFailure {
+                                coin: coin.clone(),
+                                retry_count: 1,
+                                naked_exposure: bybit_usdt_needed,
+                            })
+                            .await;
                         }
                     }
                     OrderExecutionError::ExchangeError(_) | OrderExecutionError::Timeout { .. } => {
@@ -874,15 +916,16 @@ where
                             order_id = order_id.as_str(),
                             "EmergencyCloseFailed — kill switch 발동"
                         );
-                        self.emit_alert(AlertEvent::EmergencyCloseFailure {
-                            coin: coin.clone(),
-                            retry_count: 1,
-                            naked_exposure: bybit_usdt_needed,
-                        });
                         self.risk_manager.trigger_kill_switch(&format!(
                             "emergency close failed: {} order_id={}",
                             leg, order_id
                         ));
+                        self.emit_alert_critical(AlertEvent::EmergencyCloseFailure {
+                            coin: coin.clone(),
+                            retry_count: 1,
+                            naked_exposure: bybit_usdt_needed,
+                        })
+                        .await;
                     }
                     OrderExecutionError::BothUnfilledWithErrors {
                         upbit_error,
@@ -1102,10 +1145,11 @@ where
                                 pnl = %closed.net_pnl,
                                 "청산 후 kill switch 발동"
                             );
-                            self.emit_alert(AlertEvent::KillSwitchTriggered {
+                            self.emit_alert_critical(AlertEvent::KillSwitchTriggered {
                                 reason: reason.to_string(),
                                 daily_pnl: closed.net_pnl,
-                            });
+                            })
+                            .await;
                         }
 
                         // trades + CSV 기록
@@ -1304,10 +1348,11 @@ where
                                 pnl = %closed.net_pnl,
                                 "TTL 청산 후 kill switch 발동"
                             );
-                            self.emit_alert(AlertEvent::KillSwitchTriggered {
+                            self.emit_alert_critical(AlertEvent::KillSwitchTriggered {
                                 reason: reason.to_string(),
                                 daily_pnl: closed.net_pnl,
-                            });
+                            })
+                            .await;
                         }
 
                         // trades + CSV 기록
@@ -1375,15 +1420,16 @@ where
                             pos_id = ttl_pos.id,
                             "강제 청산 실패 — kill switch 발동"
                         );
-                        self.emit_alert(AlertEvent::EmergencyCloseFailure {
-                            coin: coin.clone(),
-                            retry_count: 1,
-                            naked_exposure: ttl_pos.size_usdt,
-                        });
                         self.risk_manager.trigger_kill_switch(&format!(
                             "TTL force close failed: {} pos_id={}",
                             coin, ttl_pos.id
                         ));
+                        self.emit_alert_critical(AlertEvent::EmergencyCloseFailure {
+                            coin: coin.clone(),
+                            retry_count: 1,
+                            naked_exposure: ttl_pos.size_usdt,
+                        })
+                        .await;
                     }
                 }
             }

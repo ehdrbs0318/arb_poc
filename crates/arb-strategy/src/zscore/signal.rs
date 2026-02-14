@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 use crate::common::fee::roundtrip_fee_pct;
 use crate::common::statistics;
@@ -181,23 +181,26 @@ pub fn evaluate_entry_signal(
     let expected_profit = expected_spread_change - fee_f64;
 
     if expected_profit <= 0.0 {
-        debug!(
+        info!(
             coin,
             z_score = z,
             expected_profit,
             fee_pct = fee_f64,
-            "진입 조건 불충족: 기대 수익 부족"
+            filter = "expected_profit",
+            "진입 거부: z-score 통과 후 기대 수익 부족"
         );
         return Ok(None);
     }
 
     // 3. 코인별 자본 한도 확인
     if coin_used_capital >= max_coin_capital {
-        debug!(
+        info!(
             coin,
+            z_score = z,
             coin_used_capital = %coin_used_capital,
             max_coin_capital = %max_coin_capital,
-            "진입 조건 불충족: 코인 자본 한도 초과"
+            filter = "coin_capital_limit",
+            "진입 거부: z-score 통과 후 코인 자본 한도 초과"
         );
         return Ok(None);
     }
@@ -207,9 +210,13 @@ pub fn evaluate_entry_signal(
         .max_concurrent_positions
         .unwrap_or(config.coins.len().max(config.max_coins));
     if current_open_count >= max_positions {
-        debug!(
+        info!(
             coin,
-            current_open_count, max_positions, "진입 조건 불충족: 최대 동시 포지션 수 초과"
+            z_score = z,
+            current_open_count,
+            max_positions,
+            filter = "max_concurrent_positions",
+            "진입 거부: z-score 통과 후 최대 동시 포지션 수 초과"
         );
         return Ok(None);
     }
@@ -218,11 +225,13 @@ pub fn evaluate_entry_signal(
     if let Some(last_time) = last_entry_at {
         let elapsed = (Utc::now() - last_time).num_seconds();
         if elapsed < config.entry_cooldown_sec as i64 {
-            debug!(
+            info!(
                 coin,
+                z_score = z,
                 elapsed,
                 cooldown = config.entry_cooldown_sec,
-                "진입 쿨다운 중"
+                filter = "entry_cooldown",
+                "진입 거부: z-score 통과 후 코인 쿨다운 적용 중"
             );
             return Ok(None);
         }

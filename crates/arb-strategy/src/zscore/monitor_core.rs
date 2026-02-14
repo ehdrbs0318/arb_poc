@@ -1662,7 +1662,14 @@ where
             )? {
                 // InstrumentInfo 필수 체크
                 let Some(ref inst) = inst_info else {
-                    debug!(coin = c.as_str(), "진입 거부: InstrumentInfo 없음");
+                    info!(
+                        coin = c.as_str(),
+                        z_score,
+                        spread_pct = sp,
+                        expected_profit = expected_profit_pct,
+                        filter = "instrument_info_missing",
+                        "진입 거부: z-score 통과 후 InstrumentInfo 없음"
+                    );
                     counters.lock().entry_rejected_order_constraint_count += 1;
                     return Ok(());
                 };
@@ -1765,34 +1772,63 @@ where
                                         );
                                     }
                                 }
-                                EntryValidation::Rejected(reason) => match reason.as_str() {
-                                    "order_constraint" => {
-                                        counters.lock().entry_rejected_order_constraint_count += 1;
+                                EntryValidation::Rejected(reason) => {
+                                    info!(
+                                        coin = c.as_str(),
+                                        z_score,
+                                        spread_pct = sp,
+                                        expected_profit = expected_profit_pct,
+                                        safe_volume_usdt = sv.safe_volume_usdt,
+                                        volume_ratio = ratio,
+                                        filter = reason.as_str(),
+                                        "진입 거부: z-score 통과 후 진입 검증 필터"
+                                    );
+
+                                    match reason.as_str() {
+                                        "order_constraint" => {
+                                            counters
+                                                .lock()
+                                                .entry_rejected_order_constraint_count += 1;
+                                        }
+                                        "rounding_pnl" => {
+                                            counters.lock().entry_rejected_rounding_pnl_count += 1;
+                                        }
+                                        "min_position" => {
+                                            counters.lock().entry_rejected_min_position_count += 1;
+                                        }
+                                        "min_roi" => {
+                                            counters.lock().entry_rejected_min_roi_count += 1;
+                                        }
+                                        _ => {
+                                            counters.lock().entry_rejected_slippage_count += 1;
+                                        }
                                     }
-                                    "rounding_pnl" => {
-                                        counters.lock().entry_rejected_rounding_pnl_count += 1;
-                                    }
-                                    "min_position" => {
-                                        counters.lock().entry_rejected_min_position_count += 1;
-                                    }
-                                    "min_roi" => {
-                                        counters.lock().entry_rejected_min_roi_count += 1;
-                                    }
-                                    _ => {
-                                        counters.lock().entry_rejected_slippage_count += 1;
-                                    }
-                                },
+                                }
                             }
                         }
                         None => {
                             counters.lock().entry_rejected_slippage_count += 1;
-                            debug!(coin = c.as_str(), "진입 거부: 오더북 안전 볼륨 없음");
+                            info!(
+                                coin = c.as_str(),
+                                z_score,
+                                spread_pct = sp,
+                                expected_profit = expected_profit_pct,
+                                filter = "entry_safe_volume_none",
+                                "진입 거부: z-score 통과 후 오더북 안전 볼륨 없음"
+                            );
                         }
                     }
                 } else {
                     drop(data);
                     counters.lock().stale_cache_skip_count += 1;
-                    debug!(coin = c.as_str(), "진입 거부: 오더북 캐시 없음");
+                    info!(
+                        coin = c.as_str(),
+                        z_score,
+                        spread_pct = sp,
+                        expected_profit = expected_profit_pct,
+                        filter = "orderbook_cache_missing",
+                        "진입 거부: z-score 통과 후 오더북 캐시 없음"
+                    );
                 }
             }
         }

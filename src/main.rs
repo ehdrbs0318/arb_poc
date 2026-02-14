@@ -28,6 +28,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rust_decimal::Decimal;
@@ -49,7 +50,9 @@ use arb_poc::db::writer::{DbWriteRequest, DbWriter};
 use arb_poc::exchange::{ExchangeAdapter, MarketData, OrderManagement};
 use arb_poc::exchanges::{BybitAdapter, BybitClient, UpbitAdapter, UpbitClient};
 use arb_poc::forex::{ForexCache, UsdtKrwCache};
-use arb_poc::strategy::zscore::alert::{AlertConsumer, AlertService, DbAlertFn, TelegramSendFn};
+use arb_poc::strategy::zscore::alert::{
+    AlertConsumer, AlertEvent, AlertService, DbAlertFn, TelegramSendFn, TripleFailureFn,
+};
 use arb_poc::strategy::zscore::balance::BalanceTracker;
 use arb_poc::strategy::zscore::balance_recorder::BalanceRecorderTask;
 use arb_poc::strategy::zscore::config::ZScoreConfig;
@@ -316,6 +319,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("RiskManager 초기화 완료");
 
     let strategy_config_arc = Arc::new(strategy_config);
+    let cancel_token = CancellationToken::new();
 
     // ---------------------------------------------------------------
     // 7. DbWriter + BalanceRecorderTask 생성
@@ -344,24 +348,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---------------------------------------------------------------
     // 7-1. AlertService 생성 (DB always-write + Telegram best-effort)
     // ---------------------------------------------------------------
-    let telegram_send_fn: TelegramSendFn = if config.telegram.is_configured() {
-        info!("텔레그램 알림 활성화");
-        let telegram_client = Arc::new(
-            arb_poc::telegram::TelegramClient::new(&config.telegram)
-                .map_err(|e| format!("Telegram 클라이언트 생성 실패: {e}"))?,
-        );
-        let tg = Arc::clone(&telegram_client);
-        Box::new(move |msg: String| {
-            let tg = Arc::clone(&tg);
-            Box::pin(async move {
-                tg.send_message(&msg).await.map_err(|e| e.to_string())?;
-                Ok(())
+    let telegram_send_fn: TelegramSendFn =
+        if strategy_config_arc.telegram_enabled && config.telegram.is_configured() {
+            info!("텔레그램 알림 활성화");
+            let telegram_client = Arc::new(
+                arb_poc::telegram::TelegramClient::new(&config.telegram)
+                    .map_err(|e| format!("Telegram 클라이언트 생성 실패: {e}"))?,
+            );
+            let tg = Arc::clone(&telegram_client);
+            Box::new(move |msg: String| {
+                let tg = Arc::clone(&tg);
+                Box::pin(async move {
+                    tg.send_message(&msg).await.map_err(|e| e.to_string())?;
+                    Ok(())
+                })
             })
-        })
-    } else {
-        info!("텔레그램 미설정 — DB 전용 알림 모드");
-        Box::new(|_msg: String| Box::pin(async { Ok(()) }))
-    };
+        } else if !strategy_config_arc.telegram_enabled {
+            info!("strategy.telegram_enabled=false — DB 전용 알림 모드");
+            Box::new(|_msg: String| Box::pin(async { Ok(()) }))
+        } else {
+            info!("텔레그램 미설정 — DB 전용 알림 모드");
+            Box::new(|_msg: String| Box::pin(async { Ok(()) }))
+        };
+
+    let alert_trip_once = Arc::new(AtomicBool::new(false));
+    let alert_trip_risk = Arc::clone(&risk_manager);
+    let alert_trip_cancel = cancel_token.clone();
+    let alert_trip_once_ref = Arc::clone(&alert_trip_once);
+    let triple_failure_fn: TripleFailureFn = Box::new(
+        move |sid: i64, level: String, event_type: String, message: String| {
+            let risk = Arc::clone(&alert_trip_risk);
+            let cancel = alert_trip_cancel.clone();
+            let once = Arc::clone(&alert_trip_once_ref);
+            Box::pin(async move {
+                if once.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+
+                let reason = format!(
+                    "alert triple failure sid={sid} level={level} event={event_type} message={message}"
+                );
+                risk.trigger_kill_switch(&reason);
+                cancel.cancel();
+                tracing::error!(reason = reason.as_str(), "Triple failure 대응 시작");
+
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    eprintln!("triple failure timeout exceeded: forcing process exit");
+                    std::process::exit(1);
+                });
+            })
+        },
+    );
 
     let alert_db_writer = db_writer.clone();
     let db_alert_fn: DbAlertFn = Box::new(
@@ -384,8 +422,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let (alert_service, alert_consumer): (AlertService, AlertConsumer) =
-        AlertService::new(session_id, telegram_send_fn, db_alert_fn);
-    info!("AlertService 생성 완료 (DB always-write + Telegram best-effort)");
+        AlertService::new_with_triple_failure(
+            session_id,
+            telegram_send_fn,
+            db_alert_fn,
+            triple_failure_fn,
+        );
+    info!("AlertService 생성 완료 (DB always-write + Telegram best-effort + triple failure)");
 
     // ForexCache 생성 (USD/KRW 공시 환율)
     let forex_cache = Arc::new(ForexCache::new(Duration::from_secs(600)));
@@ -467,8 +510,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---------------------------------------------------------------
     // 10. Graceful Shutdown 핸들러
     // ---------------------------------------------------------------
-    let cancel_token = CancellationToken::new();
-
     let cancel_clone = cancel_token.clone();
     tokio::spawn(async move {
         // SIGINT (Ctrl+C)
@@ -698,6 +739,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             net_pnl = %net_pnl,
             "거래 결과"
         );
+    }
+
+    if risk_manager.is_killed() {
+        let total_pnl: Decimal = trades.iter().map(|t| t.net_pnl).sum();
+        alert_service
+            .send_critical(AlertEvent::KillSwitchComplete {
+                closed_count: trades.len(),
+                total_pnl,
+            })
+            .await;
     }
 
     // AlertService sender를 모두 drop해야 consumer가 종료됩니다.

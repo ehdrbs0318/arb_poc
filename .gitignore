@@ -2,6 +2,5 @@
 .idea
 config.toml
 config.local.toml
-strategy.toml
 .env
 /output/

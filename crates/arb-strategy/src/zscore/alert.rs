@@ -8,6 +8,7 @@ use rust_decimal::Decimal;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::{fs::OpenOptions, io::Write};
 
 /// 알림 이벤트 타입 (13종).
 #[derive(Debug, Clone)]
@@ -258,6 +259,13 @@ pub type DbAlertFn = Box<
         + Sync,
 >;
 
+/// Triple failure 대응 함수 타입.
+///
+/// DB + Telegram이 모두 실패했을 때 호출됩니다.
+pub type TripleFailureFn = Box<
+    dyn Fn(i64, String, String, String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
+>;
+
 /// AlertService: 텔레그램 알림 + DB 감사로그.
 ///
 /// 일반 알림은 mpsc 비동기 채널(64 bounded)로 전송하여 이벤트 루프를 블로킹하지 않습니다.
@@ -309,6 +317,45 @@ impl AlertService {
         + Sync
         + 'static,
     ) -> (Self, AlertConsumer) {
+        Self::new_with_triple_failure(
+            session_id,
+            telegram_send_fn,
+            db_alert_fn,
+            |_sid: i64, _level: String, _event_type: String, _message: String| Box::pin(async {}),
+        )
+    }
+
+    /// AlertService를 생성하고 triple failure 대응 함수를 등록합니다.
+    ///
+    /// DB + Telegram 모두 실패 시:
+    /// 1) stderr + /tmp/arb_emergency.log 기록
+    /// 2) `triple_failure_fn` 호출
+    pub fn new_with_triple_failure(
+        session_id: i64,
+        telegram_send_fn: impl Fn(String) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync
+        + 'static,
+        db_alert_fn: impl Fn(
+            i64,
+            &str,
+            &str,
+            &str,
+            Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync
+        + 'static,
+        triple_failure_fn: impl Fn(
+            i64,
+            String,
+            String,
+            String,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> (Self, AlertConsumer) {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<AlertEvent>(64);
 
         let handle = tokio::spawn(async move {
@@ -322,12 +369,15 @@ impl AlertService {
                 let mut tg_ok = false;
 
                 // DB 감사로그는 항상 기록
+                let mut last_db_err = None;
+                let mut last_tg_err = None;
                 match (db_alert_fn)(session_id, &level, &event_type, &message, Some(payload)).await
                 {
                     Ok(()) => {
                         db_ok = true;
                     }
                     Err(db_err) => {
+                        last_db_err = Some(db_err.clone());
                         tracing::error!(
                             error = db_err.as_str(),
                             event_type = event_type.as_str(),
@@ -346,6 +396,7 @@ impl AlertService {
                         );
                     }
                     Err(tg_err) => {
+                        last_tg_err = Some(tg_err.clone());
                         tracing::warn!(
                             error = tg_err.as_str(),
                             event_type = event_type.as_str(),
@@ -355,10 +406,24 @@ impl AlertService {
                 }
 
                 if !db_ok && !tg_ok {
+                    let emergency_message = format!(
+                        "level={level} event_type={event_type} message={message} db_error={:?} telegram_error={:?}",
+                        last_db_err, last_tg_err
+                    );
+                    AlertService::write_emergency_fallback(emergency_message.as_str());
+
                     tracing::error!(
                         event_type = event_type.as_str(),
                         "알림 DB + 텔레그램 모두 실패"
                     );
+
+                    (triple_failure_fn)(
+                        session_id,
+                        level.clone(),
+                        event_type.clone(),
+                        message.clone(),
+                    )
+                    .await;
                 }
             }
             tracing::info!("AlertService consumer 종료");
@@ -374,9 +439,38 @@ impl AlertService {
         }
     }
 
+    /// 치명적 알림을 동기 전송합니다 (채널 여유 대기).
+    pub async fn send_critical(&self, event: AlertEvent) {
+        if let Err(e) = self.tx.send(event).await {
+            tracing::error!(error = %e, "치명적 알림 전송 실패: 채널 종료");
+        }
+    }
+
     /// 세션 ID를 반환합니다.
     pub fn session_id(&self) -> i64 {
         self.session_id
+    }
+
+    fn write_emergency_fallback(message: &str) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let line = format!("{now} {message}");
+
+        eprintln!("{line}");
+
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/arb_emergency.log")
+        {
+            Ok(mut file) => {
+                if let Err(e) = writeln!(file, "{line}") {
+                    eprintln!("failed to write /tmp/arb_emergency.log: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("failed to open /tmp/arb_emergency.log: {e}");
+            }
+        }
     }
 }
 
@@ -935,8 +1029,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_alert_service_triple_failure_hook_called() {
+        let hook_counter = Arc::new(AtomicU32::new(0));
+        let hook_counter_clone = Arc::clone(&hook_counter);
+
+        let fail_telegram =
+            |_msg: String| -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
+                Box::pin(async { Err("telegram offline".to_string()) })
+            };
+
+        let fail_db = |_sid: i64,
+                       _level: &str,
+                       _evt: &str,
+                       _msg: &str,
+                       _payload: Option<String>|
+         -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
+            Box::pin(async { Err("db offline".to_string()) })
+        };
+
+        let triple_hook = move |_sid: i64,
+                                _level: String,
+                                _event_type: String,
+                                _message: String|
+              -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            let c = Arc::clone(&hook_counter_clone);
+            Box::pin(async move {
+                c.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+
+        let (service, consumer) =
+            AlertService::new_with_triple_failure(1, fail_telegram, fail_db, triple_hook);
+
+        service.send(AlertEvent::Error {
+            message: "triple fail test".into(),
+        });
+
+        drop(service);
+        consumer.shutdown().await;
+
+        assert_eq!(hook_counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn test_alert_service_session_id() {
         let (service, _consumer) = AlertService::new(42, noop_telegram(), noop_db_alert());
         assert_eq!(service.session_id(), 42);
+    }
+
+    #[tokio::test]
+    async fn test_alert_service_send_critical() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let counter_clone = counter.clone();
+
+        let telegram_fn =
+            move |_msg: String| -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
+                let c = counter_clone.clone();
+                Box::pin(async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            };
+
+        let (service, consumer) = AlertService::new(1, telegram_fn, noop_db_alert());
+
+        service
+            .send_critical(AlertEvent::KillSwitchTriggered {
+                reason: "test".into(),
+                daily_pnl: Decimal::ZERO,
+            })
+            .await;
+
+        drop(service);
+        consumer.shutdown().await;
+
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 }
