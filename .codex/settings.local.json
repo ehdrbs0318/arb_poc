@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\n볼륨/슬리피지 모델 구현 및 Bybit volume 버그 수정 \\(spec/0002\\)\n\n- slippage.rs: Square-Root Impact 슬리피지 모델 구현 \\(10개 테스트\\)\n- config.rs: volume_filter_enabled, max_participation_rate, slippage_base_bps, slippage_impact_coeff 설정 추가\n- simulator.rs: 진입/청산 시 슬리피지 적용 \\(볼륨 부족 시 진입 거부, 청산은 항상 실행\\)\n- Bybit kline volume은 코인수량\\(base coin\\)임을 반영 \\(is_coin_volume=true로 수정\\)\n- sweep.rs: 수수료 floor 중복 감지 경고 추가\n- spec/0002: 슬리피지 포함 수익성 게이트 스펙 작성\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")"
+    ]
+  }
+}
