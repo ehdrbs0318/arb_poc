@@ -46,9 +46,11 @@ async fn emit_summary(pool: &MySqlPool) -> Result<(), Box<dyn Error>> {
             .fetch_optional(pool)
             .await?
     } else {
-        sqlx::query("SELECT id, status, started_at, ended_at FROM sessions ORDER BY id DESC LIMIT 1")
-            .fetch_optional(pool)
-            .await?
+        sqlx::query(
+            "SELECT id, status, started_at, ended_at FROM sessions ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await?
     };
 
     let Some(session_row) = session_row else {
@@ -132,6 +134,91 @@ async fn emit_summary(pool: &MySqlPool) -> Result<(), Box<dyn Error>> {
         z_min,
         z_max
     );
+
+    // 극단 z-score 샘플 (최소/최대)
+    let min_row = sqlx::query(
+        "SELECT id, coin, ts, spread_pct, mean, stddev, z_score, \
+                CAST(upbit_close AS DOUBLE) AS upbit_close, \
+                CAST(bybit_close AS DOUBLE) AS bybit_close \
+         FROM minutes \
+         WHERE session_id = ? AND z_score IS NOT NULL \
+         ORDER BY z_score ASC \
+         LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await?;
+    let max_row = sqlx::query(
+        "SELECT id, coin, ts, spread_pct, mean, stddev, z_score, \
+                CAST(upbit_close AS DOUBLE) AS upbit_close, \
+                CAST(bybit_close AS DOUBLE) AS bybit_close \
+         FROM minutes \
+         WHERE session_id = ? AND z_score IS NOT NULL \
+         ORDER BY z_score DESC \
+         LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(row) = min_row {
+        let id: i64 = row.get("id");
+        let coin: String = row.get("coin");
+        let ts: chrono::NaiveDateTime = row.get("ts");
+        let spread_pct: Option<f64> = row.get("spread_pct");
+        let mean: Option<f64> = row.get("mean");
+        let stddev: Option<f64> = row.get("stddev");
+        let z_score: Option<f64> = row.get("z_score");
+        let upbit_close: Option<f64> = row.get("upbit_close");
+        let bybit_close: Option<f64> = row.get("bybit_close");
+        println!(
+            "minutes_extreme:min id={} coin={} ts={} spread={:?} mean={:?} stddev={:?} z={:?} upbit_close={:?} bybit_close={:?}",
+            id, coin, ts, spread_pct, mean, stddev, z_score, upbit_close, bybit_close
+        );
+
+        // 최소 z-score 발생 시점 기준 같은 코인의 전후 5분 샘플
+        let around_rows = sqlx::query(
+            "SELECT ts, spread_pct, mean, stddev, z_score \
+             FROM minutes \
+             WHERE session_id = ? AND coin = ? \
+               AND ts BETWEEN DATE_SUB(?, INTERVAL 5 MINUTE) AND DATE_ADD(?, INTERVAL 5 MINUTE) \
+             ORDER BY ts ASC",
+        )
+        .bind(session_id)
+        .bind(&coin)
+        .bind(ts)
+        .bind(ts)
+        .fetch_all(pool)
+        .await?;
+        println!("minutes_extreme:min_around coin={} center_ts={}", coin, ts);
+        for r in around_rows {
+            let r_ts: chrono::NaiveDateTime = r.get("ts");
+            let r_spread: Option<f64> = r.get("spread_pct");
+            let r_mean: Option<f64> = r.get("mean");
+            let r_std: Option<f64> = r.get("stddev");
+            let r_z: Option<f64> = r.get("z_score");
+            println!(
+                "  ts={} spread={:?} mean={:?} stddev={:?} z={:?}",
+                r_ts, r_spread, r_mean, r_std, r_z
+            );
+        }
+    }
+
+    if let Some(row) = max_row {
+        let id: i64 = row.get("id");
+        let coin: String = row.get("coin");
+        let ts: chrono::NaiveDateTime = row.get("ts");
+        let spread_pct: Option<f64> = row.get("spread_pct");
+        let mean: Option<f64> = row.get("mean");
+        let stddev: Option<f64> = row.get("stddev");
+        let z_score: Option<f64> = row.get("z_score");
+        let upbit_close: Option<f64> = row.get("upbit_close");
+        let bybit_close: Option<f64> = row.get("bybit_close");
+        println!(
+            "minutes_extreme:max id={} coin={} ts={} spread={:?} mean={:?} stddev={:?} z={:?} upbit_close={:?} bybit_close={:?}",
+            id, coin, ts, spread_pct, mean, stddev, z_score, upbit_close, bybit_close
+        );
+    }
 
     let entry_z_threshold = std::env::var("ENTRY_Z")
         .ok()
