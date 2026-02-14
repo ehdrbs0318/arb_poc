@@ -45,6 +45,7 @@ use crate::error::StrategyError;
 use crate::output::summary::MonitoringCounters;
 use crate::output::writer::SessionWriter;
 use crate::zscore::balance::BalanceTracker;
+use crate::zscore::balance_recorder::BalanceSnapshotSender;
 use crate::zscore::config::ZScoreConfig;
 use crate::zscore::execution_policy::{
     EntryContext, ExecutionPolicy, ExitContext, SharedResources, TtlExpiryContext,
@@ -81,7 +82,13 @@ struct LivePolicyShared {
 pub struct LivePolicy<U, B, S>
 where
     U: MarketData + OrderManagement + Send + Sync + 'static,
-    B: MarketData + OrderManagement + LinearOrderManagement + InstrumentDataProvider + Send + Sync + 'static,
+    B: MarketData
+        + OrderManagement
+        + LinearOrderManagement
+        + InstrumentDataProvider
+        + Send
+        + Sync
+        + 'static,
     S: PositionStore + 'static,
 {
     /// 라이브 주문 실행 엔진.
@@ -96,6 +103,8 @@ where
     session_id: i64,
     /// SharedResources 지연 바인딩.
     shared: OnceLock<LivePolicyShared>,
+    /// 잔고 스냅샷 전송 핸들 (None이면 비활성화).
+    balance_sender: Option<BalanceSnapshotSender>,
     /// 제네릭 마커.
     _marker: PhantomData<(U, B)>,
 }
@@ -103,18 +112,34 @@ where
 impl<U, B, S> LivePolicy<U, B, S>
 where
     U: MarketData + OrderManagement + Send + Sync + 'static,
-    B: MarketData + OrderManagement + LinearOrderManagement + InstrumentDataProvider + Send + Sync + 'static,
+    B: MarketData
+        + OrderManagement
+        + LinearOrderManagement
+        + InstrumentDataProvider
+        + Send
+        + Sync
+        + 'static,
     S: PositionStore + 'static,
 {
     /// 새 LivePolicy를 생성합니다.
     ///
     /// `SharedResources`는 `bind_shared_resources()`로 나중에 바인딩됩니다.
+    ///
+    /// # 인자
+    ///
+    /// * `executor` - 라이브 주문 실행 엔진
+    /// * `balance_tracker` - 잔고 추적기
+    /// * `risk_manager` - 리스크 관리자
+    /// * `position_store` - 포지션 영속화 (DB)
+    /// * `session_id` - DB 세션 ID
+    /// * `balance_sender` - 잔고 스냅샷 전송 핸들 (None이면 비활성화)
     pub fn new(
         executor: Arc<LiveExecutor<U, B>>,
         balance_tracker: Arc<BalanceTracker>,
         risk_manager: Arc<RiskManager>,
         position_store: Arc<S>,
         session_id: i64,
+        balance_sender: Option<BalanceSnapshotSender>,
     ) -> Self {
         info!(session_id = session_id, "LivePolicy 초기화");
         Self {
@@ -124,6 +149,7 @@ where
             position_store,
             session_id,
             shared: OnceLock::new(),
+            balance_sender,
             _marker: PhantomData,
         }
     }
@@ -213,7 +239,13 @@ where
 impl<U, B, S> ExecutionPolicy for LivePolicy<U, B, S>
 where
     U: MarketData + OrderManagement + Send + Sync + 'static,
-    B: MarketData + OrderManagement + LinearOrderManagement + InstrumentDataProvider + Send + Sync + 'static,
+    B: MarketData
+        + OrderManagement
+        + LinearOrderManagement
+        + InstrumentDataProvider
+        + Send
+        + Sync
+        + 'static,
     S: PositionStore + 'static,
 {
     async fn on_entry_signal(&self, ctx: EntryContext) -> Result<(), StrategyError> {
@@ -447,6 +479,13 @@ where
                     effective_qty = %executed.effective_qty,
                     "진입 완료 (메모리 + DB)"
                 );
+
+                // 잔고 스냅샷 — 진입 직후
+                if let Some(sender) = &self.balance_sender
+                    && sender.on_position_entry(db_id)
+                {
+                    shared.counters.lock().balance_snapshot_dropped += 1;
+                }
             }
             Err(exec_err) => {
                 // 주문 실패/부분 체결
@@ -779,6 +818,14 @@ where
                         // trades + CSV 기록
                         self.record_trade(&closed).await;
 
+                        // 잔고 스냅샷 — 청산 직후
+                        if let Some(sender) = &self.balance_sender
+                            && let Some(id) = db_id
+                            && sender.on_position_exit(*id)
+                        {
+                            shared.counters.lock().balance_snapshot_dropped += 1;
+                        }
+
                         info!(
                             coin = coin.as_str(),
                             pos_id = pid,
@@ -967,6 +1014,14 @@ where
 
                         // trades + CSV 기록
                         self.record_trade(&closed).await;
+
+                        // 잔고 스냅샷 — TTL 청산 직후
+                        if let Some(sender) = &self.balance_sender
+                            && let Some(id) = db_id
+                            && sender.on_position_exit(id)
+                        {
+                            shared.counters.lock().balance_snapshot_dropped += 1;
+                        }
 
                         if ctx.force_close {
                             shared.counters.lock().forced_liquidation_count += 1;
@@ -1468,6 +1523,7 @@ mod tests {
             Arc::clone(&risk_manager),
             Arc::clone(&position_store),
             1, // session_id
+            None,
         );
 
         let pm = Arc::new(tokio::sync::Mutex::new(PositionManager::new()));
@@ -1629,6 +1685,7 @@ mod tests {
             Arc::clone(&risk_manager),
             Arc::clone(&position_store),
             1,
+            None,
         );
 
         let pm = Arc::new(tokio::sync::Mutex::new(PositionManager::new()));

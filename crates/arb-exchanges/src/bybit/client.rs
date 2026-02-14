@@ -1217,6 +1217,8 @@ fn convert_balance(b: crate::bybit::types::BybitCoinBalance) -> Balance {
         locked,
         avg_buy_price: Decimal::ZERO, // Bybit은 이 정보를 제공하지 않음
         unit_currency: "USDT".to_string(), // 기본값 USDT
+        equity: b.equity,
+        unrealised_pnl: b.unrealised_pnl,
     }
 }
 

@@ -1,20 +1,29 @@
-//! Yahoo Finance USD/KRW 환율 조회 및 캐싱.
+//! 환율 조회 및 캐싱 모듈.
 //!
 //! 틱 경로(hot path)에서 blocking 없이 환율을 조회할 수 있도록
 //! `AtomicU64` 기반 lock-free 캐시를 제공합니다.
 //!
+//! # 제공 캐시
+//!
+//! - [`ForexCache`]: Yahoo Finance 기반 USD/KRW 공시 환율 캐시
+//! - [`UsdtKrwCache`]: Upbit WS 기반 USDT/KRW 실시간 시세 캐시
+//!
 //! # 사용 예시
 //!
 //! ```ignore
-//! use arb_forex::ForexCache;
+//! use arb_forex::{ForexCache, UsdtKrwCache};
 //! use std::sync::Arc;
 //! use std::time::Duration;
 //!
-//! let cache = Arc::new(ForexCache::new(Duration::from_secs(600)));
-//! // 초기 환율 조회
-//! cache.refresh_if_expired().await?;
-//! // 틱 경로에서 즉시 반환
-//! let rate = cache.get_cached_rate().unwrap();
+//! // USD/KRW 공시 환율
+//! let forex = Arc::new(ForexCache::new(Duration::from_secs(600)));
+//! forex.refresh_if_expired().await?;
+//! let usd_krw = forex.get_cached_rate().unwrap();
+//!
+//! // USDT/KRW 거래소 시세 (WS에서 업데이트)
+//! let usdt_cache = Arc::new(UsdtKrwCache::new());
+//! usdt_cache.update(1450.0);
+//! let usdt_krw = usdt_cache.get_usdt_krw().unwrap();
 //! ```
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -265,9 +274,165 @@ impl ForexCache {
     }
 }
 
+/// 기본 USDT/KRW 캐시 TTL (60초).
+const DEFAULT_USDT_KRW_TTL_SECS: u64 = 60;
+
+/// USDT/KRW 실시간 가격 캐시.
+///
+/// Upbit WS에서 KRW-USDT ticker를 수신하여 최신 가격을 캐시합니다.
+/// `AtomicU64` 기반 lock-free 설계로 틱 경로(hot path)에서
+/// blocking 없이 조회 가능합니다.
+///
+/// # 설계 원칙
+///
+/// - `arb-forex`에서 거래소 API를 직접 호출하지 않음 (DI 위반 방지)
+/// - `update(price)` 호출은 상위 레이어(monitor/main)에서 Upbit WS 이벤트 수신 시 수행
+/// - `reqwest::Client`를 소유하지 않음 (REST fallback은 상위 레이어 담당)
+///
+/// # 사용 예시
+///
+/// ```
+/// use arb_forex::UsdtKrwCache;
+/// use std::sync::Arc;
+///
+/// let cache = Arc::new(UsdtKrwCache::new());
+///
+/// // WS 이벤트 수신 시 업데이트
+/// cache.update(1450.0);
+///
+/// // 틱 경로에서 조회
+/// if let Some(price) = cache.get_usdt_krw() {
+///     println!("USDT/KRW: {price}");
+/// }
+/// ```
+pub struct UsdtKrwCache {
+    /// 최신 USDT/KRW 가격 (f64를 u64로 비트 변환 저장, bits == 0이면 미설정).
+    price: AtomicU64,
+    /// 마지막 업데이트 시각 (epoch millis).
+    updated_at: AtomicI64,
+    /// TTL (기본 60초).
+    ttl: Duration,
+}
+
+impl UsdtKrwCache {
+    /// 빈 상태의 USDT/KRW 캐시를 생성합니다.
+    ///
+    /// 초기 상태에서 `get_usdt_krw()`는 `None`을 반환합니다.
+    /// 상위 레이어에서 Upbit REST 또는 WS로 초기값을 조회한 뒤
+    /// `update()` 호출로 주입해야 합니다.
+    ///
+    /// TTL 기본값: 60초.
+    pub fn new() -> Self {
+        Self {
+            price: AtomicU64::new(0),
+            updated_at: AtomicI64::new(0),
+            ttl: Duration::from_secs(DEFAULT_USDT_KRW_TTL_SECS),
+        }
+    }
+
+    /// 지정된 TTL로 USDT/KRW 캐시를 생성합니다.
+    ///
+    /// 테스트에서 짧은 TTL을 지정하여 만료 동작을 검증할 때 사용합니다.
+    ///
+    /// # 인자
+    ///
+    /// * `ttl` - 캐시 만료 시간
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            price: AtomicU64::new(0),
+            updated_at: AtomicI64::new(0),
+            ttl,
+        }
+    }
+
+    /// USDT/KRW 가격을 업데이트합니다.
+    ///
+    /// Upbit WS에서 KRW-USDT ticker 이벤트 수신 시 호출합니다.
+    /// `price`를 atomic으로 저장하고 `updated_at`을 현재 시각으로 갱신합니다.
+    ///
+    /// # 인자
+    ///
+    /// * `price` - USDT/KRW 가격 (예: 1450.0)
+    pub fn update(&self, price: f64) {
+        self.price.store(price.to_bits(), Ordering::Relaxed);
+        self.updated_at
+            .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
+        debug!(price = price, "USDT/KRW 가격 캐시 갱신");
+    }
+
+    /// 캐시된 USDT/KRW 가격을 반환합니다 (TTL 검사 포함).
+    ///
+    /// 다음 경우 `None`을 반환합니다:
+    /// - 한 번도 업데이트되지 않은 경우 (bits == 0)
+    /// - TTL이 만료된 경우 (마지막 업데이트로부터 `ttl` 초과 경과)
+    ///
+    /// # 반환값
+    ///
+    /// 유효한 가격이면 `Some(f64)`, 그렇지 않으면 `None`.
+    pub fn get_usdt_krw(&self) -> Option<f64> {
+        let bits = self.price.load(Ordering::Relaxed);
+        if bits == 0 {
+            return None;
+        }
+        if self.is_stale() {
+            return None;
+        }
+        Some(f64::from_bits(bits))
+    }
+
+    /// TTL 무시하고 캐시된 USDT/KRW 가격을 반환합니다.
+    ///
+    /// WS 연결 끊김 등으로 가격이 stale인 경우에도
+    /// 마지막 유효값을 사용해야 할 때 호출합니다.
+    /// (REST fallback 실패 시 마지막 유효값 사용)
+    ///
+    /// 한 번도 업데이트되지 않은 경우 (bits == 0)에만 `None`을 반환합니다.
+    ///
+    /// # 반환값
+    ///
+    /// 업데이트된 적이 있으면 `Some(f64)`, 없으면 `None`.
+    pub fn get_usdt_krw_with_stale(&self) -> Option<f64> {
+        let bits = self.price.load(Ordering::Relaxed);
+        if bits == 0 {
+            return None;
+        }
+        Some(f64::from_bits(bits))
+    }
+
+    /// 캐시가 stale(만료) 상태인지 확인합니다.
+    ///
+    /// 다음 경우 `true`를 반환합니다:
+    /// - 한 번도 업데이트되지 않은 경우 (`updated_at == 0`)
+    /// - 마지막 업데이트로부터 TTL이 초과한 경우
+    pub fn is_stale(&self) -> bool {
+        let updated_at_ms = self.updated_at.load(Ordering::Relaxed);
+        if updated_at_ms == 0 {
+            return true;
+        }
+        let now_ms = Utc::now().timestamp_millis();
+        let elapsed_ms = now_ms - updated_at_ms;
+        elapsed_ms > self.ttl.as_millis() as i64
+    }
+
+    /// 테스트용: 가격을 직접 설정합니다.
+    ///
+    /// `update()`와 동일한 동작이지만, 테스트 코드에서의 의도를 명확히 합니다.
+    pub fn update_for_test(&self, price: f64) {
+        self.update(price);
+    }
+}
+
+impl Default for UsdtKrwCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========== ForexCache 테스트 ==========
 
     #[test]
     fn test_cache_initially_empty() {
@@ -327,5 +492,134 @@ mod tests {
                 "Rate {rate} should be invalid"
             );
         }
+    }
+
+    // ========== UsdtKrwCache 테스트 ==========
+
+    #[test]
+    fn test_usdt_krw_cache_initially_empty() {
+        // 초기 상태에서 get_usdt_krw()는 None
+        let cache = UsdtKrwCache::new();
+        assert!(cache.get_usdt_krw().is_none());
+        assert!(cache.get_usdt_krw_with_stale().is_none());
+        assert!(cache.is_stale());
+    }
+
+    #[test]
+    fn test_usdt_krw_cache_update_and_read() {
+        // update() 후 get_usdt_krw()로 값 조회
+        let cache = UsdtKrwCache::new();
+        cache.update(1450.0);
+
+        let price = cache.get_usdt_krw();
+        assert!(price.is_some());
+        assert!((price.unwrap() - 1450.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_usdt_krw_cache_ttl_expired_returns_none() {
+        // TTL 만료 후 get_usdt_krw()는 None
+        let cache = UsdtKrwCache::with_ttl(Duration::from_secs(1));
+
+        // 가격 설정 후 과거 시각으로 updated_at 주입
+        cache.price.store((1450.0_f64).to_bits(), Ordering::Relaxed);
+        let past_ms = Utc::now().timestamp_millis() - 2000; // 2초 전
+        cache.updated_at.store(past_ms, Ordering::Relaxed);
+
+        // TTL 만료 → None
+        assert!(cache.get_usdt_krw().is_none());
+        assert!(cache.is_stale());
+    }
+
+    #[test]
+    fn test_usdt_krw_cache_stale_returns_last_value() {
+        // TTL 만료 후에도 get_usdt_krw_with_stale()는 마지막 값 반환
+        let cache = UsdtKrwCache::with_ttl(Duration::from_secs(1));
+
+        // 가격 설정 후 과거 시각으로 updated_at 주입
+        cache.price.store((1450.0_f64).to_bits(), Ordering::Relaxed);
+        let past_ms = Utc::now().timestamp_millis() - 2000; // 2초 전
+        cache.updated_at.store(past_ms, Ordering::Relaxed);
+
+        // TTL 만료 but stale 허용 → Some
+        let price = cache.get_usdt_krw_with_stale();
+        assert!(price.is_some());
+        assert!((price.unwrap() - 1450.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_usdt_krw_cache_is_stale_three_cases() {
+        // is_stale() 테스트: 미설정 / 유효 / 만료
+
+        // 1. 미설정 상태 → stale
+        let cache = UsdtKrwCache::new();
+        assert!(cache.is_stale(), "미설정 상태는 stale이어야 함");
+
+        // 2. 방금 업데이트 → stale 아님
+        cache.update(1450.0);
+        assert!(
+            !cache.is_stale(),
+            "방금 업데이트한 캐시는 stale이 아니어야 함"
+        );
+
+        // 3. TTL 만료 → stale
+        let cache_short = UsdtKrwCache::with_ttl(Duration::from_secs(1));
+        cache_short
+            .price
+            .store((1450.0_f64).to_bits(), Ordering::Relaxed);
+        let past_ms = Utc::now().timestamp_millis() - 2000;
+        cache_short.updated_at.store(past_ms, Ordering::Relaxed);
+        assert!(cache_short.is_stale(), "TTL 만료 시 stale이어야 함");
+    }
+
+    #[test]
+    fn test_usdt_krw_cache_with_ttl_constructor() {
+        // with_ttl() 생성자 테스트: 지정된 TTL이 적용되는지 확인
+        let ttl = Duration::from_secs(30);
+        let cache = UsdtKrwCache::with_ttl(ttl);
+
+        // 초기 상태 확인
+        assert!(cache.get_usdt_krw().is_none());
+        assert!(cache.is_stale());
+
+        // TTL 내 업데이트 → 정상 조회
+        cache.update(1480.5);
+        assert!(cache.get_usdt_krw().is_some());
+        assert!((cache.get_usdt_krw().unwrap() - 1480.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_usdt_krw_cache_update_for_test() {
+        // update_for_test()가 update()와 동일하게 동작하는지 확인
+        let cache = UsdtKrwCache::new();
+        cache.update_for_test(1455.5);
+
+        let price = cache.get_usdt_krw();
+        assert!(price.is_some());
+        assert!((price.unwrap() - 1455.5).abs() < f64::EPSILON);
+        assert!(!cache.is_stale());
+    }
+
+    #[test]
+    fn test_usdt_krw_cache_default() {
+        // Default trait 구현 확인
+        let cache = UsdtKrwCache::default();
+        assert!(cache.get_usdt_krw().is_none());
+        assert!(cache.is_stale());
+    }
+
+    #[test]
+    fn test_usdt_krw_cache_multiple_updates() {
+        // 여러 번 업데이트 시 최신값이 조회되는지 확인
+        let cache = UsdtKrwCache::new();
+
+        cache.update(1440.0);
+        assert!((cache.get_usdt_krw().unwrap() - 1440.0).abs() < f64::EPSILON);
+
+        cache.update(1450.0);
+        assert!((cache.get_usdt_krw().unwrap() - 1450.0).abs() < f64::EPSILON);
+
+        cache.update(1460.0);
+        assert!((cache.get_usdt_krw().unwrap() - 1460.0).abs() < f64::EPSILON);
     }
 }

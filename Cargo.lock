@@ -133,6 +133,7 @@ dependencies = [
 name = "arb-strategy"
 version = "0.1.0"
 dependencies = [
+ "arb-db",
  "arb-exchange",
  "arb-forex",
  "async-trait",

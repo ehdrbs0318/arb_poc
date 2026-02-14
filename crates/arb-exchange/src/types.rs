@@ -403,6 +403,11 @@ pub struct Balance {
     pub avg_buy_price: Decimal,
     /// 평균 매수 가격의 단위 통화.
     pub unit_currency: String,
+    /// Bybit equity (계정 자기자본). Upbit/Bithumb은 None.
+    /// Bybit Unified 계정의 `equity` = `walletBalance + unrealisedPnl`.
+    pub equity: Option<Decimal>,
+    /// Bybit 미실현 손익. Upbit/Bithumb은 None.
+    pub unrealised_pnl: Option<Decimal>,
 }
 
 impl Balance {
@@ -523,6 +528,8 @@ mod tests {
             locked: Decimal::from(5),
             avg_buy_price: Decimal::from(50000000),
             unit_currency: "KRW".to_string(),
+            equity: None,
+            unrealised_pnl: None,
         };
         assert_eq!(balance.total(), Decimal::from(15));
     }

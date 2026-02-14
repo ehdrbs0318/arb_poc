@@ -31,17 +31,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use tracing::{error, info, warn};
 
 use arb_poc::adapter::DbPositionStoreAdapter;
 use arb_poc::config::Config;
+use arb_poc::db::alerts::AlertRepository;
+use arb_poc::db::balance_snapshots::BalanceSnapshotRepository;
+use arb_poc::db::funding::FundingRepository;
+use arb_poc::db::minutes::MinuteRepository;
 use arb_poc::db::pool::{DbPool, DbPoolConfig};
 use arb_poc::db::positions::DbPositionStore;
 use arb_poc::db::sessions::SessionRepository;
-use arb_poc::exchange::{MarketData, OrderManagement};
-use arb_poc::exchanges::{BybitClient, UpbitClient};
-use arb_poc::forex::ForexCache;
+use arb_poc::db::trades::TradeRepository;
+use arb_poc::db::writer::DbWriter;
+use arb_poc::exchange::{ExchangeAdapter, MarketData, OrderManagement};
+use arb_poc::exchanges::{BybitAdapter, BybitClient, UpbitAdapter, UpbitClient};
+use arb_poc::forex::{ForexCache, UsdtKrwCache};
 use arb_poc::strategy::zscore::balance::BalanceTracker;
+use arb_poc::strategy::zscore::balance_recorder::BalanceRecorderTask;
 use arb_poc::strategy::zscore::config::ZScoreConfig;
 use arb_poc::strategy::zscore::live_executor::LiveExecutor;
 use arb_poc::strategy::zscore::monitor::ZScoreMonitor;
@@ -364,10 +372,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // ---------------------------------------------------------------
-    // 7. LiveExecutor + LivePolicy 생성
+    // 7. DbWriter + BalanceRecorderTask 생성
     // ---------------------------------------------------------------
     let strategy_config_arc = Arc::new(strategy_config);
 
+    // DbWriter 생성 (background DB write 파이프라인)
+    let db_writer_session_repo = SessionRepository::new(db_pool.inner().clone());
+    let db_writer_position_store = DbPositionStore::new(db_pool.inner().clone());
+    let db_writer_trade_repo = TradeRepository::new(db_pool.inner().clone());
+    let db_writer_minute_repo = MinuteRepository::new(db_pool.inner().clone());
+    let db_writer_alert_repo = AlertRepository::new(db_pool.inner().clone());
+    let db_writer_funding_repo = FundingRepository::new(db_pool.inner().clone());
+    let db_writer_balance_repo = BalanceSnapshotRepository::new(db_pool.inner().clone());
+
+    let db_writer = DbWriter::new(
+        db_writer_session_repo,
+        db_writer_position_store,
+        db_writer_trade_repo,
+        db_writer_minute_repo,
+        db_writer_alert_repo,
+        db_writer_funding_repo,
+        db_writer_balance_repo,
+    );
+    info!("DbWriter 생성 완료");
+
+    // ForexCache 생성 (USD/KRW 공시 환율)
+    let forex_cache = Arc::new(ForexCache::new(Duration::from_secs(600)));
+
+    // UsdtKrwCache 생성 (USDT/KRW 거래소 시세)
+    let usdt_krw_cache = Arc::new(UsdtKrwCache::new());
+
+    // Upbit REST로 USDT/KRW 초기값 조회
+    match upbit.get_ticker(&["KRW-USDT"]).await {
+        Ok(tickers) if !tickers.is_empty() => {
+            let price = tickers[0].trade_price;
+            if let Some(price_f64) = price.to_f64() {
+                usdt_krw_cache.update(price_f64);
+                info!(usdt_krw = price_f64, "USDT/KRW 초기값 설정");
+            } else {
+                warn!(price = %price, "USDT/KRW Decimal->f64 변환 실패");
+            }
+        }
+        Ok(_) => warn!("USDT/KRW ticker 응답 비어있음"),
+        Err(e) => warn!(error = %e, "USDT/KRW 초기값 조회 실패"),
+    }
+
+    // ExchangeAdapter 생성 (잔고 조회용)
+    let upbit_adapter: Arc<dyn ExchangeAdapter> = Arc::new(UpbitAdapter::new(upbit.clone()));
+    let bybit_adapter: Arc<dyn ExchangeAdapter> = Arc::new(BybitAdapter::new(bybit.clone()));
+
+    // BalanceRecorderTask 시작
+    let snapshot_interval = strategy_config_arc.balance_snapshot.interval_sec;
+    let (snapshot_sender, recorder_task) = BalanceRecorderTask::spawn(
+        session_id,
+        upbit_adapter,
+        bybit_adapter,
+        Arc::clone(&forex_cache),
+        Arc::clone(&usdt_krw_cache),
+        db_writer.clone(),
+        snapshot_interval,
+    );
+    info!(interval_sec = snapshot_interval, "BalanceRecorderTask 시작");
+
+    // ---------------------------------------------------------------
+    // 8. LiveExecutor + LivePolicy 생성
+    // ---------------------------------------------------------------
     // 클라이언트를 clone하여 LiveExecutor용과 ZScoreMonitor용으로 분리.
     // Clone 구현은 Arc 기반이므로 커넥션 풀과 rate limiter를 공유합니다.
     let upbit_for_executor = upbit.clone();
@@ -388,21 +457,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&risk_manager),
         Arc::clone(&position_store_arc),
         session_id,
+        Some(snapshot_sender.clone()),
     );
 
     info!(session_id = session_id, "LivePolicy 생성 완료");
 
     // ---------------------------------------------------------------
-    // 8. ForexCache + ZScoreMonitor 생성
+    // 9. ZScoreMonitor 생성
     // ---------------------------------------------------------------
-    let forex_cache = Arc::new(ForexCache::new(Duration::from_secs(600)));
-
     let config_for_monitor = (*strategy_config_arc).clone();
 
     let monitor = ZScoreMonitor::new(upbit, bybit, config_for_monitor, forex_cache, policy);
 
     // ---------------------------------------------------------------
-    // 9. Graceful Shutdown 핸들러
+    // 10. Graceful Shutdown 핸들러
     // ---------------------------------------------------------------
     let cancel_token = CancellationToken::new();
 
@@ -429,7 +497,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ---------------------------------------------------------------
-    // 10. 세션 heartbeat task
+    // 11. 세션 heartbeat task
     // ---------------------------------------------------------------
     let session_repo_hb = SessionRepository::new(db_pool.inner().clone());
     let session_id_hb = session_id;
@@ -449,7 +517,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // ---------------------------------------------------------------
-    // 11. 모니터링 실행
+    // 12. 모니터링 실행
     // ---------------------------------------------------------------
     info!("=== 실시간 모니터링 시작 (라이브 모드) ===");
 
@@ -465,7 +533,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // ---------------------------------------------------------------
-    // 12. 세션 종료
+    // 13. BalanceRecorderTask 종료
+    // ---------------------------------------------------------------
+    info!("BalanceRecorderTask 종료 요청...");
+    snapshot_sender.shutdown().await;
+    match tokio::time::timeout(Duration::from_secs(60), recorder_task).await {
+        Ok(Ok(())) => info!("BalanceRecorderTask 정상 종료"),
+        Ok(Err(e)) => warn!(error = %e, "BalanceRecorderTask 종료 에러"),
+        Err(_) => warn!("BalanceRecorderTask 종료 타임아웃 (60초), task 포기"),
+    }
+
+    // ---------------------------------------------------------------
+    // 14. 세션 종료
     // ---------------------------------------------------------------
     let session_status = if risk_manager.is_killed() {
         "KillSwitched"

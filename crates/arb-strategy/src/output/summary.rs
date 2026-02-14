@@ -48,6 +48,8 @@ pub struct MonitoringCounters {
     pub entry_rejected_min_position_count: u64,
     /// 최소 기대 수익률 미달로 진입 거부된 횟수.
     pub entry_rejected_min_roi_count: u64,
+    /// 잔고 스냅샷 try_send 실패 (드롭) 수.
+    pub balance_snapshot_dropped: u64,
 }
 
 /// 일별 PnL 기록.
@@ -155,6 +157,8 @@ pub struct SessionSummary {
     pub entry_rejected_min_position_count: u64,
     /// 최소 기대 수익률 미달 진입 거부 횟수.
     pub entry_rejected_min_roi_count: u64,
+    /// 잔고 스냅샷 드롭 횟수.
+    pub balance_snapshot_dropped: u64,
 }
 
 impl SessionSummary {
@@ -295,6 +299,7 @@ impl SessionSummary {
                 .regime_change_suppressed_by_cooldown_count,
             entry_rejected_min_position_count: counters.entry_rejected_min_position_count,
             entry_rejected_min_roi_count: counters.entry_rejected_min_roi_count,
+            balance_snapshot_dropped: counters.balance_snapshot_dropped,
         }
     }
 
@@ -427,6 +432,10 @@ impl SessionSummary {
         s.push_str(&format!(
             "최소 ROI 미달 진입 거부: {}건\n",
             format_number(self.entry_rejected_min_roi_count)
+        ));
+        s.push_str(&format!(
+            "잔고 스냅샷 드롭: {}건\n",
+            format_number(self.balance_snapshot_dropped)
         ));
 
         s

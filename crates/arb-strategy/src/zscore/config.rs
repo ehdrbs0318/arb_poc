@@ -75,6 +75,8 @@ pub struct ZScoreConfig {
     /// qty × bybit_price가 이 값 미만이면 진입 거부.
     /// 0.0이면 비활성화.
     pub min_position_usdt: Decimal,
+    /// 잔고 스냅샷 설정.
+    pub balance_snapshot: BalanceSnapshotConfig,
     /// 세션 출력 설정.
     pub output: crate::output::writer::OutputConfig,
 
@@ -161,6 +163,19 @@ pub struct ZScoreConfig {
     pub telegram_enabled: bool,
 }
 
+/// 잔고 스냅샷 설정.
+#[derive(Debug, Clone)]
+pub struct BalanceSnapshotConfig {
+    /// 정기 기록 주기 (초). 기본값: 600 (10분).
+    pub interval_sec: u64,
+}
+
+impl Default for BalanceSnapshotConfig {
+    fn default() -> Self {
+        Self { interval_sec: 600 }
+    }
+}
+
 impl Default for ZScoreConfig {
     fn default() -> Self {
         Self {
@@ -189,6 +204,7 @@ impl Default for ZScoreConfig {
             max_cache_age_sec: 5,
             min_expected_roi: 0.10,
             min_position_usdt: Decimal::new(100, 0),
+            balance_snapshot: BalanceSnapshotConfig::default(),
             output: crate::output::writer::OutputConfig::default(),
             // 주문 실행
             bybit_category: "linear".to_string(),
@@ -475,6 +491,13 @@ impl ZScoreConfig {
             };
         }
 
+        // [balance_snapshot] 섹션이 있으면 BalanceSnapshotConfig로 변환
+        if let Some(raw_bs) = wrapper.balance_snapshot {
+            config.balance_snapshot = BalanceSnapshotConfig {
+                interval_sec: raw_bs.interval_sec.unwrap_or(600),
+            };
+        }
+
         Ok(config)
     }
 }
@@ -578,13 +601,15 @@ fn default_shutdown_policy() -> String {
     "keep".to_string()
 }
 
-/// TOML 최상위 래퍼 (`[zscore]`, `[output]` 섹션).
+/// TOML 최상위 래퍼 (`[zscore]`, `[output]`, `[balance_snapshot]` 섹션).
 #[derive(Deserialize)]
 struct TomlWrapper {
     #[serde(default)]
     zscore: RawZScoreConfig,
     #[serde(default)]
     output: Option<RawOutputConfig>,
+    #[serde(default)]
+    balance_snapshot: Option<RawBalanceSnapshotConfig>,
 }
 
 /// TOML 출력 설정 역직렬화용 중간 구조체.
@@ -592,6 +617,12 @@ struct TomlWrapper {
 struct RawOutputConfig {
     enabled: Option<bool>,
     dir: Option<String>,
+}
+
+/// TOML 잔고 스냅샷 설정 역직렬화용 중간 구조체.
+#[derive(Deserialize, Default)]
+struct RawBalanceSnapshotConfig {
+    interval_sec: Option<u64>,
 }
 
 /// TOML 역직렬화 전용 중간 구조체.
@@ -813,6 +844,7 @@ impl From<RawZScoreConfig> for ZScoreConfig {
                 .min_position_usdt
                 .and_then(|v| Decimal::try_from(v).ok())
                 .unwrap_or(Decimal::new(100, 0)),
+            balance_snapshot: BalanceSnapshotConfig::default(),
             output: crate::output::writer::OutputConfig::default(),
             // 주문 실행
             bybit_category: raw.bybit_category,
@@ -1514,5 +1546,58 @@ coins = ["BTC"]
             ..ZScoreConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    // --- BalanceSnapshotConfig 테스트 ---
+
+    #[test]
+    fn test_balance_snapshot_config_default() {
+        let config = BalanceSnapshotConfig::default();
+        assert_eq!(config.interval_sec, 600);
+    }
+
+    #[test]
+    fn test_balance_snapshot_config_from_toml() {
+        // [balance_snapshot] 섹션 파싱 테스트
+        let toml = r#"
+[zscore]
+coins = ["BTC"]
+
+[balance_snapshot]
+interval_sec = 300
+"#;
+        let config = ZScoreConfig::from_toml_str(toml).unwrap();
+        assert_eq!(config.balance_snapshot.interval_sec, 300);
+    }
+
+    #[test]
+    fn test_balance_snapshot_config_default_when_omitted() {
+        // [balance_snapshot] 섹션 누락 시 기본값 사용
+        let toml = r#"
+[zscore]
+coins = ["BTC"]
+"#;
+        let config = ZScoreConfig::from_toml_str(toml).unwrap();
+        assert_eq!(config.balance_snapshot.interval_sec, 600);
+    }
+
+    #[test]
+    fn test_balance_snapshot_config_partial() {
+        // [balance_snapshot] 섹션이 있지만 interval_sec 누락 시 기본값
+        let toml = r#"
+[zscore]
+coins = ["BTC"]
+
+[balance_snapshot]
+"#;
+        let config = ZScoreConfig::from_toml_str(toml).unwrap();
+        assert_eq!(config.balance_snapshot.interval_sec, 600);
+    }
+
+    #[test]
+    fn test_balance_snapshot_in_zscore_config_default() {
+        // ZScoreConfig::default()에서 balance_snapshot 기본값 확인
+        let config = ZScoreConfig::default();
+        assert_eq!(config.balance_snapshot.interval_sec, 600);
     }
 }

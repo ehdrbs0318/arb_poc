@@ -2,6 +2,7 @@
 
 pub mod alert;
 pub mod balance;
+pub mod balance_recorder;
 pub mod coin_selector;
 pub mod config;
 pub mod execution_policy;

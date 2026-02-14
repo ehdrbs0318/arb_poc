@@ -7,6 +7,7 @@ license.workspace = true
 description = "Trading strategy implementations for arb_poc"
 
 [dependencies]
+arb-db = { path = "../arb-db" }
 arb-exchange = { path = "../arb-exchange" }
 arb-forex = { path = "../arb-forex" }
 chrono = { workspace = true }

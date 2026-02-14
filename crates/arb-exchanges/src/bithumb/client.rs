@@ -10,7 +10,7 @@ use arb_exchange::{
 
 use crate::bithumb::auth::{BithumbCredentials, build_query_string};
 use crate::bithumb::types::{
-    BithumbBalance, BithumbCandle, BithumbCancelV2Response, BithumbError, BithumbOrder,
+    BithumbBalance, BithumbCancelV2Response, BithumbCandle, BithumbError, BithumbOrder,
     BithumbOrderRequest, BithumbOrderV2Response, BithumbOrderbook, BithumbTicker,
 };
 use crate::rate_limit::RateLimiter;
@@ -422,8 +422,7 @@ impl OrderManagement for BithumbClient {
         );
 
         // v2 POST /v2/orders: 간소화된 응답 (order_id, market, side, order_type, created_at)
-        let v2_response: BithumbOrderV2Response =
-            self.post_private("/v2/orders", &body).await?;
+        let v2_response: BithumbOrderV2Response = self.post_private("/v2/orders", &body).await?;
 
         info!(
             order_id = %v2_response.order_id,
@@ -434,8 +433,7 @@ impl OrderManagement for BithumbClient {
 
         // v2 응답은 간소화되어 전체 주문 정보가 없으므로 GET /v1/order로 후속 조회
         let params = [("uuid", v2_response.order_id.as_str())];
-        let bithumb_order: BithumbOrder =
-            self.get_private("/v1/order", Some(&params)).await?;
+        let bithumb_order: BithumbOrder = self.get_private("/v1/order", Some(&params)).await?;
         Ok(convert_order(bithumb_order))
     }
 
@@ -454,8 +452,7 @@ impl OrderManagement for BithumbClient {
 
         // v2 응답은 간소화되어 전체 주문 정보가 없으므로 GET /v1/order로 후속 조회
         let get_params = [("uuid", order_id)];
-        let bithumb_order: BithumbOrder =
-            self.get_private("/v1/order", Some(&get_params)).await?;
+        let bithumb_order: BithumbOrder = self.get_private("/v1/order", Some(&get_params)).await?;
         Ok(convert_order(bithumb_order))
     }
 
@@ -633,6 +630,8 @@ fn convert_balance(b: BithumbBalance) -> Balance {
         locked: b.locked,
         avg_buy_price: b.avg_buy_price,
         unit_currency: b.unit_currency,
+        equity: None,
+        unrealised_pnl: None,
     }
 }
 

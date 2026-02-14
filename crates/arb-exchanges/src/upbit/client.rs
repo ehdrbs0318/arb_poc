@@ -532,13 +532,13 @@ impl OrderManagement for UpbitClient {
         debug!(order_id = order_id, "Upbit 주문 조회 요청");
 
         let params = [("uuid", order_id)];
-        let upbit_order: UpbitOrder = self
-            .get_private("/order", Some(&params))
-            .await
-            .map_err(|e| {
-                warn!(order_id = order_id, error = %e, "Upbit 주문 조회 실패");
-                e
-            })?;
+        let upbit_order: UpbitOrder =
+            self.get_private("/order", Some(&params))
+                .await
+                .map_err(|e| {
+                    warn!(order_id = order_id, error = %e, "Upbit 주문 조회 실패");
+                    e
+                })?;
         let order = convert_order(upbit_order);
 
         debug!(
@@ -733,6 +733,8 @@ fn convert_balance(b: UpbitBalance) -> Balance {
         locked: b.locked,
         avg_buy_price: b.avg_buy_price,
         unit_currency: b.unit_currency,
+        equity: None,
+        unrealised_pnl: None,
     }
 }
 

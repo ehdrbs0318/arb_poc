@@ -4,6 +4,7 @@
 //! 전체 직렬 순서 보장 (단일 consumer).
 
 use crate::alerts::{AlertRecord, AlertRepository};
+use crate::balance_snapshots::{BalanceSnapshotRepository, BalanceSnapshotRow};
 use crate::error::DbError;
 use crate::funding::{FundingRepository, FundingScheduleRecord};
 use crate::minutes::{MinuteRecord, MinuteRepository};
@@ -35,6 +36,8 @@ pub enum DbWriteRequest {
     InsertAlert(AlertRecord),
     /// 펀딩 스케줄 UPSERT.
     UpsertFunding(FundingScheduleRecord),
+    /// 잔고 스냅샷 INSERT.
+    InsertBalanceSnapshot(BalanceSnapshotRow),
     /// 세션 상태 UPDATE.
     UpdateSession { id: i64, status: String },
     /// 세션 heartbeat UPDATE.
@@ -83,6 +86,7 @@ impl DbWriter {
     /// * `minute_repo` - 분봉 Repository
     /// * `alert_repo` - 알림 Repository
     /// * `funding_repo` - 펀딩 Repository
+    /// * `balance_snapshot_repo` - 잔고 스냅샷 Repository
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_repo: SessionRepository,
@@ -91,6 +95,7 @@ impl DbWriter {
         minute_repo: MinuteRepository,
         alert_repo: AlertRepository,
         funding_repo: FundingRepository,
+        balance_snapshot_repo: BalanceSnapshotRepository,
     ) -> Self {
         let (tx, rx) = mpsc::channel(256);
         let stats = Arc::new(DbWriterStats::default());
@@ -105,6 +110,7 @@ impl DbWriter {
                 minute_repo,
                 alert_repo,
                 funding_repo,
+                balance_snapshot_repo,
                 consumer_stats,
             )
             .await;
@@ -152,6 +158,7 @@ fn describe_request(req: &DbWriteRequest) -> &'static str {
         DbWriteRequest::InsertMinute(_) => "InsertMinute",
         DbWriteRequest::InsertAlert(_) => "InsertAlert",
         DbWriteRequest::UpsertFunding(_) => "UpsertFunding",
+        DbWriteRequest::InsertBalanceSnapshot(_) => "InsertBalanceSnapshot",
         DbWriteRequest::UpdateSession { .. } => "UpdateSession",
         DbWriteRequest::Heartbeat { .. } => "Heartbeat",
     }
@@ -170,6 +177,7 @@ async fn run_consumer(
     minute_repo: MinuteRepository,
     alert_repo: AlertRepository,
     funding_repo: FundingRepository,
+    balance_snapshot_repo: BalanceSnapshotRepository,
     stats: Arc<DbWriterStats>,
 ) {
     debug!("DB writer consumer task 시작");
@@ -187,6 +195,7 @@ async fn run_consumer(
                 &minute_repo,
                 &alert_repo,
                 &funding_repo,
+                &balance_snapshot_repo,
             )
             .await;
 
@@ -226,6 +235,7 @@ async fn run_consumer(
 }
 
 /// 개별 요청 실행.
+#[allow(clippy::too_many_arguments)]
 async fn execute_request(
     request: &DbWriteRequest,
     session_repo: &SessionRepository,
@@ -234,6 +244,7 @@ async fn execute_request(
     minute_repo: &MinuteRepository,
     alert_repo: &AlertRepository,
     funding_repo: &FundingRepository,
+    balance_snapshot_repo: &BalanceSnapshotRepository,
 ) -> Result<(), DbError> {
     match request {
         DbWriteRequest::InsertPosition(pos) => {
@@ -261,6 +272,9 @@ async fn execute_request(
         DbWriteRequest::UpsertFunding(funding) => {
             funding_repo.upsert_funding(funding).await?;
         }
+        DbWriteRequest::InsertBalanceSnapshot(row) => {
+            balance_snapshot_repo.insert_snapshot(row).await?;
+        }
         DbWriteRequest::UpdateSession { id, status } => {
             session_repo.end_session(*id, status).await?;
         }
@@ -285,6 +299,33 @@ mod tests {
             status: "Completed".to_string(),
         };
         assert_eq!(describe_request(&req), "UpdateSession");
+    }
+
+    #[test]
+    fn test_describe_request_insert_balance_snapshot() {
+        use crate::balance_snapshots::BalanceSnapshotRow;
+        use chrono::Utc;
+        use rust_decimal::Decimal;
+
+        let row = BalanceSnapshotRow {
+            created_at: Utc::now(),
+            snapshot_group_id: 1,
+            session_id: 1,
+            record_type: "PERIODIC".to_string(),
+            cex: "UPBIT".to_string(),
+            currency: "KRW".to_string(),
+            available: Decimal::ZERO,
+            locked: Decimal::ZERO,
+            coin_value: Decimal::ZERO,
+            total: Decimal::ZERO,
+            position_id: None,
+            usd_krw: 1350.0,
+            usdt_krw: 1380.0,
+            total_usd: Decimal::ZERO,
+            total_usdt: Decimal::ZERO,
+        };
+        let req = DbWriteRequest::InsertBalanceSnapshot(row);
+        assert_eq!(describe_request(&req), "InsertBalanceSnapshot");
     }
 
     #[test]

@@ -262,6 +262,9 @@ pub struct BybitCoinBalance {
     /// 동결 잔고 (주문 등에 사용 중).
     #[serde(default, deserialize_with = "deserialize_optional_decimal_string")]
     pub locked: Option<Decimal>,
+    /// 계정 자기자본 (= walletBalance + unrealisedPnl).
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_string")]
+    pub equity: Option<Decimal>,
     /// 미실현 손익.
     #[serde(
         rename = "unrealisedPnl",
@@ -577,6 +580,35 @@ mod tests {
         assert_eq!(account.coin.len(), 2);
         assert_eq!(account.coin[0].coin, "USDT");
         assert_eq!(account.coin[0].wallet_balance, Decimal::new(5000000, 2));
+        // equity 필드가 없으면 None
+        assert!(account.coin[0].equity.is_none());
+    }
+
+    #[test]
+    fn test_deserialize_bybit_wallet_balance_with_equity() {
+        // equity, unrealisedPnl이 포함된 Bybit Unified 계정 응답
+        let json = r#"{
+            "accountType": "UNIFIED",
+            "totalEquity": "51000.50",
+            "coin": [
+                {
+                    "coin": "USDT",
+                    "walletBalance": "50000.00",
+                    "availableToWithdraw": "45000.00",
+                    "equity": "51000.50",
+                    "unrealisedPnl": "1000.50"
+                }
+            ]
+        }"#;
+
+        let account: BybitWalletAccount = serde_json::from_str(json).unwrap();
+        assert_eq!(account.coin.len(), 1);
+        let coin = &account.coin[0];
+        assert_eq!(coin.coin, "USDT");
+        assert_eq!(coin.wallet_balance, Decimal::new(5000000, 2));
+        assert_eq!(coin.available_to_withdraw, Decimal::new(4500000, 2));
+        assert_eq!(coin.equity, Some(Decimal::new(5100050, 2)));
+        assert_eq!(coin.unrealised_pnl, Some(Decimal::new(100050, 2)));
     }
 
     #[test]

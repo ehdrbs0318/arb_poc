@@ -523,6 +523,8 @@ fn convert_balance(b: BithumbBalance) -> Balance {
         locked: b.locked,
         avg_buy_price: b.avg_buy_price,
         unit_currency: b.unit_currency,
+        equity: None,
+        unrealised_pnl: None,
     }
 }
 
