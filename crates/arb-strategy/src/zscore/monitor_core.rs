@@ -1684,7 +1684,7 @@ where
                     let bybit_bids = orderbook::levels_to_f64(&bybit_ob.orderbook, false);
                     drop(data);
 
-                    let entry_safe = orderbook::calculate_entry_safe_volume(
+                    let entry_eval = orderbook::evaluate_entry_safe_volume(
                         &upbit_asks,
                         &bybit_bids,
                         mean,
@@ -1693,7 +1693,7 @@ where
                         usd_krw,
                     );
 
-                    match entry_safe {
+                    match entry_eval.safe_volume {
                         Some(sv) => {
                             let volume_1h = config.min_volume_1h_usdt.to_f64().unwrap_or(50_000.0);
                             let ratio = orderbook::safe_volume_ratio_from_volume(volume_1h);
@@ -1719,6 +1719,7 @@ where
                                     bybit_price,
                                     upbit_price,
                                     usd_krw,
+                                    z_score,
                                     sp,
                                     expected_profit_pct,
                                     inst,
@@ -1772,50 +1773,55 @@ where
                                         );
                                     }
                                 }
-                                EntryValidation::Rejected(reason) => {
-                                    info!(
-                                        coin = c.as_str(),
-                                        z_score,
-                                        spread_pct = sp,
-                                        expected_profit = expected_profit_pct,
-                                        safe_volume_usdt = sv.safe_volume_usdt,
-                                        volume_ratio = ratio,
-                                        filter = reason.as_str(),
-                                        "진입 거부: z-score 통과 후 진입 검증 필터"
-                                    );
-
-                                    match reason.as_str() {
-                                        "order_constraint" => {
-                                            counters
-                                                .lock()
-                                                .entry_rejected_order_constraint_count += 1;
-                                        }
-                                        "rounding_pnl" => {
-                                            counters.lock().entry_rejected_rounding_pnl_count += 1;
-                                        }
-                                        "min_position" => {
-                                            counters.lock().entry_rejected_min_position_count += 1;
-                                        }
-                                        "min_roi" => {
-                                            counters.lock().entry_rejected_min_roi_count += 1;
-                                        }
-                                        _ => {
-                                            counters.lock().entry_rejected_slippage_count += 1;
-                                        }
+                                EntryValidation::Rejected(reason) => match reason.as_str() {
+                                    "order_constraint" => {
+                                        counters.lock().entry_rejected_order_constraint_count += 1;
                                     }
-                                }
+                                    "rounding_pnl" => {
+                                        counters.lock().entry_rejected_rounding_pnl_count += 1;
+                                    }
+                                    "min_position" => {
+                                        counters.lock().entry_rejected_min_position_count += 1;
+                                    }
+                                    "min_roi" => {
+                                        counters.lock().entry_rejected_min_roi_count += 1;
+                                    }
+                                    _ => {
+                                        counters.lock().entry_rejected_slippage_count += 1;
+                                    }
+                                },
                             }
                         }
                         None => {
                             counters.lock().entry_rejected_slippage_count += 1;
-                            info!(
-                                coin = c.as_str(),
-                                z_score,
-                                spread_pct = sp,
-                                expected_profit = expected_profit_pct,
-                                filter = "entry_safe_volume_none",
-                                "진입 거부: z-score 통과 후 오더북 안전 볼륨 없음"
-                            );
+                            if let Some(diag) = &entry_eval.last_step {
+                                info!(
+                                    coin = c.as_str(),
+                                    z_score,
+                                    spread_pct = sp,
+                                    expected_profit = expected_profit_pct,
+                                    total_coins = diag.total_coins,
+                                    upbit_vwap_usd = diag.upbit_vwap_usd,
+                                    bybit_vwap = diag.bybit_vwap,
+                                    effective_spread_pct = diag.effective_spread_pct,
+                                    mean_spread_pct = diag.mean_spread_pct,
+                                    roundtrip_fee_pct = diag.roundtrip_fee_pct,
+                                    entry_slippage_pct = diag.entry_slippage_pct,
+                                    estimated_exit_slippage_pct = diag.estimated_exit_slippage_pct,
+                                    safe_volume_profit_pct = diag.profit_pct,
+                                    filter = "entry_safe_volume_none",
+                                    "진입 거부: z-score 통과 후 오더북 안전 볼륨 없음"
+                                );
+                            } else {
+                                info!(
+                                    coin = c.as_str(),
+                                    z_score,
+                                    spread_pct = sp,
+                                    expected_profit = expected_profit_pct,
+                                    filter = "entry_safe_volume_none",
+                                    "진입 거부: z-score 통과 후 오더북 안전 볼륨 없음 (진단값 없음)"
+                                );
+                            }
                         }
                     }
                 } else {
@@ -2577,6 +2583,7 @@ where
         bybit_price: Decimal,
         upbit_price: Decimal,
         usd_krw: f64,
+        z_score: f64,
         spread_pct: f64,
         expected_profit_pct: f64,
         inst: &instrument::InstrumentInfo,
@@ -2594,10 +2601,15 @@ where
 
         // 2. qty == 0 → 진입 거부
         if qty.is_zero() {
-            debug!(
+            info!(
                 coin = coin,
+                z_score = z_score,
+                spread_pct = spread_pct,
+                expected_profit = expected_profit_pct,
+                size_usdt_input = size_usdt_f64,
                 raw_qty = %raw_qty,
                 qty_step = %inst.qty_step,
+                filter = "order_constraint_qty_zero",
                 "진입 거부: 라운딩 후 qty = 0"
             );
             return EntryValidation::Rejected("order_constraint".to_string());
@@ -2609,13 +2621,18 @@ where
             || qty > inst.max_order_qty
             || actual_size_usdt < inst.min_notional
         {
-            debug!(
+            info!(
                 coin = coin,
+                z_score = z_score,
+                spread_pct = spread_pct,
+                expected_profit = expected_profit_pct,
+                size_usdt_input = size_usdt_f64,
                 qty = %qty,
                 min_order_qty = %inst.min_order_qty,
                 max_order_qty = %inst.max_order_qty,
                 actual_size_usdt = %actual_size_usdt,
                 min_notional = %inst.min_notional,
+                filter = "order_constraint_bybit_limits",
                 "진입 거부: Bybit 주문 조건 미달"
             );
             return EntryValidation::Rejected("order_constraint".to_string());
@@ -2624,9 +2641,14 @@ where
         // 4. Upbit KRW 최소 주문 검증 (5100원)
         let upbit_krw_notional = qty * upbit_price;
         if upbit_krw_notional < Decimal::new(5100, 0) {
-            debug!(
+            info!(
                 coin = coin,
+                z_score = z_score,
+                spread_pct = spread_pct,
+                expected_profit = expected_profit_pct,
                 upbit_krw_notional = %upbit_krw_notional,
+                min_upbit_krw_notional = 5100,
+                filter = "order_constraint_upbit_min_krw",
                 "진입 거부: Upbit KRW 최소 주문 미달"
             );
             return EntryValidation::Rejected("order_constraint".to_string());
@@ -2652,11 +2674,15 @@ where
         let rounding_cost = spread_pct - adjusted_spread;
         let adjusted_profit = expected_profit_pct - rounding_cost;
         if adjusted_profit <= 0.0 {
-            debug!(
+            info!(
                 coin = coin,
+                z_score = z_score,
+                spread_pct = spread_pct,
                 original_profit = expected_profit_pct,
+                adjusted_spread = adjusted_spread,
                 adjusted_profit = adjusted_profit,
                 rounding_cost = rounding_cost,
+                filter = "rounding_pnl",
                 "진입 거부: 라운딩 후 수익성 부족"
             );
             return EntryValidation::Rejected("rounding_pnl".to_string());
@@ -2666,10 +2692,14 @@ where
         if config.min_position_usdt > Decimal::ZERO
             && (qty * bybit_entry) < config.min_position_usdt
         {
-            debug!(
+            info!(
                 coin = coin,
+                z_score = z_score,
+                spread_pct = spread_pct,
+                expected_profit = expected_profit_pct,
                 rounded_size_usdt = %(qty * bybit_entry),
                 min_position_usdt = %config.min_position_usdt,
+                filter = "min_position",
                 "진입 거부: 최소 포지션 크기 미달"
             );
             return EntryValidation::Rejected("min_position".to_string());
@@ -2677,10 +2707,14 @@ where
 
         // 8. 최소 기대 수익률 체크
         if config.min_expected_roi > 0.0 && adjusted_profit < config.min_expected_roi {
-            debug!(
+            info!(
                 coin = coin,
+                z_score = z_score,
+                spread_pct = spread_pct,
+                expected_profit = expected_profit_pct,
                 adjusted_profit = adjusted_profit,
                 min_expected_roi = config.min_expected_roi,
+                filter = "min_roi",
                 "진입 거부: 최소 기대 수익률 미달"
             );
             return EntryValidation::Rejected("min_roi".to_string());

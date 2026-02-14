@@ -184,8 +184,12 @@ pub fn evaluate_entry_signal(
         info!(
             coin,
             z_score = z,
+            current_spread_pct = current_spread,
+            mean_spread_pct = mean,
+            expected_spread_change_pct = expected_spread_change,
             expected_profit,
             fee_pct = fee_f64,
+            profit_gap_to_zero = expected_profit,
             filter = "expected_profit",
             "진입 거부: z-score 통과 후 기대 수익 부족"
         );
@@ -194,11 +198,13 @@ pub fn evaluate_entry_signal(
 
     // 3. 코인별 자본 한도 확인
     if coin_used_capital >= max_coin_capital {
+        let remaining_coin_capital = max_coin_capital - coin_used_capital;
         info!(
             coin,
             z_score = z,
             coin_used_capital = %coin_used_capital,
             max_coin_capital = %max_coin_capital,
+            remaining_coin_capital = %remaining_coin_capital,
             filter = "coin_capital_limit",
             "진입 거부: z-score 통과 후 코인 자본 한도 초과"
         );
@@ -210,11 +216,13 @@ pub fn evaluate_entry_signal(
         .max_concurrent_positions
         .unwrap_or(config.coins.len().max(config.max_coins));
     if current_open_count >= max_positions {
+        let remaining_slots = max_positions.saturating_sub(current_open_count);
         info!(
             coin,
             z_score = z,
             current_open_count,
             max_positions,
+            remaining_slots,
             filter = "max_concurrent_positions",
             "진입 거부: z-score 통과 후 최대 동시 포지션 수 초과"
         );
@@ -225,11 +233,13 @@ pub fn evaluate_entry_signal(
     if let Some(last_time) = last_entry_at {
         let elapsed = (Utc::now() - last_time).num_seconds();
         if elapsed < config.entry_cooldown_sec as i64 {
+            let remaining_cooldown_sec = (config.entry_cooldown_sec as i64) - elapsed;
             info!(
                 coin,
                 z_score = z,
                 elapsed,
                 cooldown = config.entry_cooldown_sec,
+                remaining_cooldown_sec,
                 filter = "entry_cooldown",
                 "진입 거부: z-score 통과 후 코인 쿨다운 적용 중"
             );

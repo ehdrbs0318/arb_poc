@@ -286,6 +286,154 @@ pub struct SafeVolumeResult {
     pub entry_slippage_pct: f64,
 }
 
+/// 진입 안전 볼륨 계산 단계의 수익성 진단값.
+#[derive(Debug, Clone)]
+pub struct EntryProfitBreakdown {
+    /// 누적 소비 코인 수량.
+    pub total_coins: f64,
+    /// Upbit VWAP (USD 기준).
+    pub upbit_vwap_usd: f64,
+    /// Bybit VWAP (USDT).
+    pub bybit_vwap: f64,
+    /// 유효 스프레드(%): (Bybit - UpbitUSD) / UpbitUSD.
+    pub effective_spread_pct: f64,
+    /// 롤링 평균 스프레드(%).
+    pub mean_spread_pct: f64,
+    /// 왕복 수수료(%).
+    pub roundtrip_fee_pct: f64,
+    /// 진입 슬리피지(%).
+    pub entry_slippage_pct: f64,
+    /// 추정 청산 슬리피지(%).
+    pub estimated_exit_slippage_pct: f64,
+    /// 최종 수익성 점수(%).
+    pub profit_pct: f64,
+}
+
+/// 진입 안전 볼륨 평가 결과.
+#[derive(Debug, Clone)]
+pub struct EntrySafeVolumeEvaluation {
+    /// 안전 볼륨 계산 결과.
+    pub safe_volume: Option<SafeVolumeResult>,
+    /// 마지막 평가 단계의 수익성 진단값.
+    pub last_step: Option<EntryProfitBreakdown>,
+}
+
+/// 진입 안전 볼륨을 평가하고 단계별 수익성 진단값을 반환합니다.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_entry_safe_volume(
+    upbit_asks: &[(f64, f64)],
+    bybit_bids: &[(f64, f64)],
+    mean_spread_pct: f64,
+    upbit_fee: f64,
+    bybit_fee: f64,
+    usd_krw: f64,
+) -> EntrySafeVolumeEvaluation {
+    if upbit_asks.is_empty() || bybit_bids.is_empty() || usd_krw <= 0.0 {
+        return EntrySafeVolumeEvaluation {
+            safe_volume: None,
+            last_step: None,
+        };
+    }
+
+    let best_ask_usd = upbit_asks[0].0 / usd_krw;
+    let best_bid = bybit_bids[0].0;
+
+    let mut upbit_ptr: usize = 0;
+    let mut bybit_ptr: usize = 0;
+    let mut upbit_remaining = upbit_asks[0].1;
+    let mut bybit_remaining = bybit_bids[0].1;
+
+    let mut total_coins: f64 = 0.0;
+    let mut upbit_cost_krw: f64 = 0.0;
+    let mut bybit_revenue_usdt: f64 = 0.0;
+
+    // 직전 단계의 유효한 결과를 저장
+    let mut last_valid: Option<SafeVolumeResult> = None;
+    let mut last_step: Option<EntryProfitBreakdown> = None;
+
+    loop {
+        // 이번 단계 소비량
+        let consume = upbit_remaining.min(bybit_remaining);
+        if consume <= 0.0 {
+            break;
+        }
+
+        upbit_cost_krw += consume * upbit_asks[upbit_ptr].0;
+        bybit_revenue_usdt += consume * bybit_bids[bybit_ptr].0;
+        total_coins += consume;
+
+        upbit_remaining -= consume;
+        bybit_remaining -= consume;
+
+        // 수익성 검증
+        let upbit_vwap_usd = (upbit_cost_krw / total_coins) / usd_krw;
+        let bybit_vwap = bybit_revenue_usdt / total_coins;
+        let effective_spread = (bybit_vwap - upbit_vwap_usd) / upbit_vwap_usd * 100.0;
+        let roundtrip_fee = (upbit_fee + bybit_fee) * 2.0 * 100.0;
+        let entry_slippage_pct = (upbit_vwap_usd - best_ask_usd) / best_ask_usd * 100.0
+            + (best_bid - bybit_vwap) / best_bid * 100.0;
+        let estimated_exit_slippage = entry_slippage_pct;
+        let profit = (effective_spread - mean_spread_pct) - roundtrip_fee - estimated_exit_slippage;
+
+        let step = EntryProfitBreakdown {
+            total_coins,
+            upbit_vwap_usd,
+            bybit_vwap,
+            effective_spread_pct: effective_spread,
+            mean_spread_pct,
+            roundtrip_fee_pct: roundtrip_fee,
+            entry_slippage_pct,
+            estimated_exit_slippage_pct: estimated_exit_slippage,
+            profit_pct: profit,
+        };
+        last_step = Some(step);
+
+        trace!(
+            total_coins = total_coins,
+            effective_spread = effective_spread,
+            profit = profit,
+            "two-pointer 진입 단계"
+        );
+
+        if profit > 0.0 {
+            last_valid = Some(SafeVolumeResult {
+                safe_volume_coins: total_coins,
+                safe_volume_usdt: total_coins * bybit_vwap,
+                upbit_vwap: upbit_cost_krw / total_coins,
+                bybit_vwap,
+                entry_slippage_pct,
+            });
+        } else {
+            // profit <= 0 → 직전 결과 반환
+            return EntrySafeVolumeEvaluation {
+                safe_volume: last_valid,
+                last_step,
+            };
+        }
+
+        // 잔여 처리: 0인 쪽 다음 호가로 이동
+        if upbit_remaining <= 0.0 {
+            upbit_ptr += 1;
+            if upbit_ptr >= upbit_asks.len() {
+                break;
+            }
+            upbit_remaining = upbit_asks[upbit_ptr].1;
+        }
+        if bybit_remaining <= 0.0 {
+            bybit_ptr += 1;
+            if bybit_ptr >= bybit_bids.len() {
+                break;
+            }
+            bybit_remaining = bybit_bids[bybit_ptr].1;
+        }
+    }
+
+    EntrySafeVolumeEvaluation {
+        safe_volume: last_valid,
+        last_step,
+    }
+}
+
 /// 진입 시 안전 볼륨 계산 (Upbit 매수 + Bybit 숏).
 ///
 /// two-pointer로 Upbit asks + Bybit bids를 동시 소비하며
@@ -312,87 +460,15 @@ pub fn calculate_entry_safe_volume(
     bybit_fee: f64,
     usd_krw: f64,
 ) -> Option<SafeVolumeResult> {
-    if upbit_asks.is_empty() || bybit_bids.is_empty() || usd_krw <= 0.0 {
-        return None;
-    }
-
-    let best_ask_usd = upbit_asks[0].0 / usd_krw;
-    let best_bid = bybit_bids[0].0;
-
-    let mut upbit_ptr: usize = 0;
-    let mut bybit_ptr: usize = 0;
-    let mut upbit_remaining = upbit_asks[0].1;
-    let mut bybit_remaining = bybit_bids[0].1;
-
-    let mut total_coins: f64 = 0.0;
-    let mut upbit_cost_krw: f64 = 0.0;
-    let mut bybit_revenue_usdt: f64 = 0.0;
-
-    // 직전 단계의 유효한 결과를 저장
-    let mut last_valid: Option<SafeVolumeResult> = None;
-
-    loop {
-        // 이번 단계 소비량
-        let consume = upbit_remaining.min(bybit_remaining);
-        if consume <= 0.0 {
-            break;
-        }
-
-        upbit_cost_krw += consume * upbit_asks[upbit_ptr].0;
-        bybit_revenue_usdt += consume * bybit_bids[bybit_ptr].0;
-        total_coins += consume;
-
-        upbit_remaining -= consume;
-        bybit_remaining -= consume;
-
-        // 수익성 검증
-        let upbit_vwap_usd = (upbit_cost_krw / total_coins) / usd_krw;
-        let bybit_vwap = bybit_revenue_usdt / total_coins;
-        let effective_spread = (bybit_vwap - upbit_vwap_usd) / upbit_vwap_usd * 100.0;
-        let roundtrip_fee = (upbit_fee + bybit_fee) * 2.0 * 100.0;
-        let entry_slippage_pct = (upbit_vwap_usd - best_ask_usd) / best_ask_usd * 100.0
-            + (best_bid - bybit_vwap) / best_bid * 100.0;
-        let estimated_exit_slippage = entry_slippage_pct;
-        let profit = (effective_spread - mean_spread_pct) - roundtrip_fee - estimated_exit_slippage;
-
-        trace!(
-            total_coins = total_coins,
-            effective_spread = effective_spread,
-            profit = profit,
-            "two-pointer 진입 단계"
-        );
-
-        if profit > 0.0 {
-            last_valid = Some(SafeVolumeResult {
-                safe_volume_coins: total_coins,
-                safe_volume_usdt: total_coins * bybit_vwap,
-                upbit_vwap: upbit_cost_krw / total_coins,
-                bybit_vwap,
-                entry_slippage_pct,
-            });
-        } else {
-            // profit <= 0 → 직전 결과 반환
-            return last_valid;
-        }
-
-        // 잔여 처리: 0인 쪽 다음 호가로 이동
-        if upbit_remaining <= 0.0 {
-            upbit_ptr += 1;
-            if upbit_ptr >= upbit_asks.len() {
-                break;
-            }
-            upbit_remaining = upbit_asks[upbit_ptr].1;
-        }
-        if bybit_remaining <= 0.0 {
-            bybit_ptr += 1;
-            if bybit_ptr >= bybit_bids.len() {
-                break;
-            }
-            bybit_remaining = bybit_bids[bybit_ptr].1;
-        }
-    }
-
-    last_valid
+    evaluate_entry_safe_volume(
+        upbit_asks,
+        bybit_bids,
+        mean_spread_pct,
+        upbit_fee,
+        bybit_fee,
+        usd_krw,
+    )
+    .safe_volume
 }
 
 /// 청산 시 안전 볼륨 계산 (Upbit 매도 + Bybit 롱 커버).
