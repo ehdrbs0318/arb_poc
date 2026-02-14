@@ -4,3 +4,4 @@ config.toml
 config.local.toml
 .env
 /output/
+.DS_Store
