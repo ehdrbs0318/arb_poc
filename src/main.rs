@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let strategy_config_path =
         std::env::var("STRATEGY_CONFIG").unwrap_or_else(|_| "strategy.toml".into());
-    let strategy_config = if Path::new(&strategy_config_path).exists() {
+    let mut strategy_config = if Path::new(&strategy_config_path).exists() {
         info!(path = %strategy_config_path, "전략 설정 파일 로드");
         let cfg = ZScoreConfig::from_file(&strategy_config_path)?;
         cfg.validate()?;
@@ -87,6 +87,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         return Err("strategy.toml 파일이 필요합니다. 라이브 모드에서는 기본값 사용 불가.".into());
     };
+
+    // 라이브 모드에서는 DB-only 출력을 강제합니다.
+    if strategy_config.output.enabled {
+        info!("라이브 모드 DB-only 정책 적용: 파일 출력 비활성화");
+        strategy_config.output.enabled = false;
+    }
 
     info!(
         coins = ?strategy_config.coins,
@@ -620,6 +626,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(Err(e)) => warn!(error = %e, "BalanceRecorderTask 종료 에러"),
         Err(_) => warn!("BalanceRecorderTask 종료 타임아웃 (60초), task 포기"),
     }
+    drop(snapshot_sender);
 
     // funding_schedules task 종료 대기
     match tokio::time::timeout(Duration::from_secs(10), funding_task).await {
@@ -666,6 +673,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // AlertService consumer 종료 대기
     info!("AlertService consumer 종료 대기...");
     alert_consumer.shutdown().await;
+
+    info!("DB writer flush/shutdown 대기...");
+    match db_writer
+        .shutdown_with_timeouts(Duration::from_secs(10), Duration::from_secs(30))
+        .await
+    {
+        Ok(()) => info!("DB writer graceful shutdown 완료"),
+        Err(e) => warn!(error = e.as_str(), "DB writer graceful shutdown 실패"),
+    }
 
     info!(
         session_id = session_id,

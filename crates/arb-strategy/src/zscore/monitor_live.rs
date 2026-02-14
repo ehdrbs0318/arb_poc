@@ -30,6 +30,7 @@
 //! 5. BalanceTracker.on_exit() — 잔고 복원
 //! 6. RiskManager.record_trade(pnl)
 
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, OnceLock};
 
@@ -73,6 +74,13 @@ struct LivePolicyShared {
     session_writer: Arc<tokio::sync::Mutex<Option<SessionWriter>>>,
 }
 
+/// 코인별 Upbit IOC 거부 누적 상태.
+#[derive(Debug, Clone)]
+struct UpbitIocRejectState {
+    consecutive_rejects: u32,
+    cooldown_until: Option<chrono::DateTime<Utc>>,
+}
+
 // ---------------------------------------------------------------------------
 // LivePolicy
 // ---------------------------------------------------------------------------
@@ -113,6 +121,8 @@ where
     shared: OnceLock<LivePolicyShared>,
     /// 잔고 스냅샷 전송 핸들 (None이면 비활성화).
     balance_sender: Option<BalanceSnapshotSender>,
+    /// 코인별 Upbit IOC 거부 누적 상태.
+    upbit_ioc_reject_states: parking_lot::Mutex<HashMap<String, UpbitIocRejectState>>,
     /// 제네릭 마커.
     _marker: PhantomData<(U, B)>,
 }
@@ -165,6 +175,7 @@ where
             alert_service,
             shared: OnceLock::new(),
             balance_sender,
+            upbit_ioc_reject_states: parking_lot::Mutex::new(HashMap::new()),
             _marker: PhantomData,
         }
     }
@@ -263,6 +274,70 @@ where
             return None;
         }
         Decimal::try_from(value).ok()
+    }
+
+    /// Upbit IOC 주문 거부 메시지 여부를 판별합니다.
+    fn is_upbit_ioc_rejection_message(message: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        lower.contains("time_in_force")
+            || lower.contains("ioc")
+            || lower.contains("not supported")
+            || lower.contains("validation")
+            || lower.contains("ord_type")
+    }
+
+    /// 코인별 Upbit IOC 거부 상태를 성공 기준으로 초기화합니다.
+    fn clear_upbit_ioc_reject_state(&self, coin: &str) {
+        let mut states = self.upbit_ioc_reject_states.lock();
+        states.remove(coin);
+    }
+
+    /// 코인이 IOC 거부 cooldown 상태인지 확인합니다.
+    fn upbit_ioc_cooldown_until(&self, coin: &str) -> Option<chrono::DateTime<Utc>> {
+        let now = Utc::now();
+        let mut states = self.upbit_ioc_reject_states.lock();
+        if let Some(state) = states.get_mut(coin)
+            && let Some(until) = state.cooldown_until
+        {
+            if until > now {
+                return Some(until);
+            }
+            // cooldown 만료 시 상태 초기화
+            state.cooldown_until = None;
+            state.consecutive_rejects = 0;
+        }
+        None
+    }
+
+    /// Upbit IOC 거부를 기록하고 필요 시 cooldown 차단을 설정합니다.
+    ///
+    /// # 반환값
+    /// cooldown이 새로 설정되었으면 Some(until), 아니면 None
+    fn record_upbit_ioc_reject(&self, coin: &str) -> Option<chrono::DateTime<Utc>> {
+        let (block_count, cooldown_minutes) = if let Some(shared) = self.shared.get() {
+            (
+                shared.config.upbit_ioc_reject_block_count,
+                shared.config.upbit_ioc_reject_cooldown_minutes,
+            )
+        } else {
+            (3, 30)
+        };
+
+        let mut states = self.upbit_ioc_reject_states.lock();
+        let state = states
+            .entry(coin.to_string())
+            .or_insert_with(|| UpbitIocRejectState {
+                consecutive_rejects: 0,
+                cooldown_until: None,
+            });
+
+        state.consecutive_rejects = state.consecutive_rejects.saturating_add(1);
+        if state.consecutive_rejects >= block_count {
+            let until = Utc::now() + chrono::Duration::minutes(cooldown_minutes as i64);
+            state.cooldown_until = Some(until);
+            return Some(until);
+        }
+        None
     }
 
     /// 분봉 1건을 DB writer로 전송합니다.
@@ -376,6 +451,16 @@ where
         // ① Kill switch 체크 (AtomicBool, lock 불필요)
         if self.risk_manager.is_killed() {
             debug!(coin = coin.as_str(), "진입 거부: kill switch 발동됨");
+            return Ok(());
+        }
+
+        if let Some(until) = self.upbit_ioc_cooldown_until(coin) {
+            info!(
+                coin = coin.as_str(),
+                cooldown_until = %until,
+                "진입 거부: Upbit IOC 거부 cooldown 적용 중"
+            );
+            shared.counters.lock().entry_rejected_order_constraint_count += 1;
             return Ok(());
         }
 
@@ -606,6 +691,7 @@ where
                     effective_qty = %executed.effective_qty,
                     "진입 완료 (메모리 + DB)"
                 );
+                self.clear_upbit_ioc_reject_state(coin);
 
                 // 잔고 스냅샷 — 진입 직후
                 if let Some(sender) = &self.balance_sender
@@ -648,7 +734,21 @@ where
                     OrderExecutionError::SingleLegFilled {
                         leg,
                         emergency_closed,
+                        failed_leg_error,
                     } => {
+                        if *leg == crate::zscore::live_executor::Leg::Bybit
+                            && let Some(err) = failed_leg_error
+                            && Self::is_upbit_ioc_rejection_message(err)
+                        {
+                            let blocked_until = self.record_upbit_ioc_reject(coin);
+                            warn!(
+                                coin = coin.as_str(),
+                                error = err.as_str(),
+                                blocked_until = ?blocked_until,
+                                "Upbit IOC 주문 거부 감지"
+                            );
+                        }
+
                         self.emit_alert(AlertEvent::LegFailure {
                             coin: coin.clone(),
                             succeeded_leg: leg.to_string(),
@@ -783,6 +883,44 @@ where
                             "emergency close failed: {} order_id={}",
                             leg, order_id
                         ));
+                    }
+                    OrderExecutionError::BothUnfilledWithErrors {
+                        upbit_error,
+                        bybit_error: _,
+                    } => {
+                        if let Some(err) = upbit_error
+                            && Self::is_upbit_ioc_rejection_message(err)
+                        {
+                            let blocked_until = self.record_upbit_ioc_reject(coin);
+                            warn!(
+                                coin = coin.as_str(),
+                                error = err.as_str(),
+                                blocked_until = ?blocked_until,
+                                "Upbit IOC 주문 거부 감지 (양쪽 미체결)"
+                            );
+                        }
+
+                        {
+                            let mut pm = shared.position_mgr.lock().await;
+                            if let Some(ps) = pm.open_positions.get_mut(coin.as_str()) {
+                                ps.retain(|p| p.id != pos_id);
+                                if ps.is_empty() {
+                                    pm.open_positions.remove(coin.as_str());
+                                }
+                            }
+                        }
+
+                        if db_id >= 0
+                            && let Err(e) = self.position_store.remove(db_id).await
+                        {
+                            warn!(db_id = db_id, error = %e, "DB 포지션 삭제 실패");
+                        }
+
+                        self.balance_tracker.release(&mut reservation);
+                        warn!(
+                            coin = coin.as_str(),
+                            "거래소 에러 동반 양쪽 미체결, 포지션 제거 + 예약 해제"
+                        );
                     }
                 }
             }
@@ -2210,5 +2348,24 @@ mod tests {
             session_writer: sw,
         });
         // 두 번째 호출은 무시됨 (패닉하지 않음)
+    }
+
+    #[test]
+    fn test_is_upbit_ioc_rejection_message() {
+        assert!(
+            LivePolicy::<MockUpbit, MockBybit, MockPositionStore>::is_upbit_ioc_rejection_message(
+                "Invalid time_in_force: IOC is not supported"
+            )
+        );
+        assert!(
+            LivePolicy::<MockUpbit, MockBybit, MockPositionStore>::is_upbit_ioc_rejection_message(
+                "validation error: ord_type"
+            )
+        );
+        assert!(
+            !LivePolicy::<MockUpbit, MockBybit, MockPositionStore>::is_upbit_ioc_rejection_message(
+                "network timeout"
+            )
+        );
     }
 }

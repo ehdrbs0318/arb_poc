@@ -89,6 +89,10 @@ pub struct ZScoreConfig {
     pub max_retry_count: u32,
     /// 주문 타입: "limit_ioc", "limit_gtc_cancel", "market".
     pub order_type: String,
+    /// Upbit IOC 주문 거부 연속 N회 시 코인 진입 차단.
+    pub upbit_ioc_reject_block_count: u32,
+    /// Upbit IOC 주문 거부 차단 유지 시간 (분).
+    pub upbit_ioc_reject_cooldown_minutes: u64,
     /// IOC/GTC 지정가 시 최대 슬리피지 (%).
     pub max_slippage_pct: f64,
     /// Post-execution PnL gate: 수수료의 N% 이상이면 보유 (0.5 = 50%).
@@ -211,6 +215,8 @@ impl Default for ZScoreConfig {
             order_timeout_sec: 5,
             max_retry_count: 2,
             order_type: "limit_ioc".to_string(),
+            upbit_ioc_reject_block_count: 3,
+            upbit_ioc_reject_cooldown_minutes: 30,
             max_slippage_pct: 0.1,
             post_exec_pnl_gate_ratio: 0.5,
             emergency_wide_ioc_slippage_pct: vec![2.0, 3.0, 5.0],
@@ -332,6 +338,16 @@ impl ZScoreConfig {
                 "order_type must be one of {:?}, got: {}",
                 valid_order_types, self.order_type
             )));
+        }
+        if self.upbit_ioc_reject_block_count == 0 {
+            return Err(StrategyError::Config(
+                "upbit_ioc_reject_block_count must be greater than 0".to_string(),
+            ));
+        }
+        if self.upbit_ioc_reject_cooldown_minutes == 0 {
+            return Err(StrategyError::Config(
+                "upbit_ioc_reject_cooldown_minutes must be greater than 0".to_string(),
+            ));
         }
         if self.max_slippage_pct < 0.0 {
             return Err(StrategyError::Config(
@@ -516,6 +532,12 @@ fn default_max_retry_count() -> u32 {
 fn default_order_type() -> String {
     "limit_ioc".to_string()
 }
+fn default_upbit_ioc_reject_block_count() -> u32 {
+    3
+}
+fn default_upbit_ioc_reject_cooldown_minutes() -> u64 {
+    30
+}
 fn default_max_slippage_pct() -> f64 {
     0.1
 }
@@ -665,6 +687,10 @@ struct RawZScoreConfig {
     max_retry_count: u32,
     #[serde(default = "default_order_type")]
     order_type: String,
+    #[serde(default = "default_upbit_ioc_reject_block_count")]
+    upbit_ioc_reject_block_count: u32,
+    #[serde(default = "default_upbit_ioc_reject_cooldown_minutes")]
+    upbit_ioc_reject_cooldown_minutes: u64,
     #[serde(default = "default_max_slippage_pct")]
     max_slippage_pct: f64,
     #[serde(default = "default_post_exec_pnl_gate_ratio")]
@@ -766,6 +792,8 @@ impl Default for RawZScoreConfig {
             order_timeout_sec: default_order_timeout_sec(),
             max_retry_count: default_max_retry_count(),
             order_type: default_order_type(),
+            upbit_ioc_reject_block_count: default_upbit_ioc_reject_block_count(),
+            upbit_ioc_reject_cooldown_minutes: default_upbit_ioc_reject_cooldown_minutes(),
             max_slippage_pct: default_max_slippage_pct(),
             post_exec_pnl_gate_ratio: default_post_exec_pnl_gate_ratio(),
             emergency_wide_ioc_slippage_pct: default_emergency_wide_ioc_slippage_pct(),
@@ -851,6 +879,8 @@ impl From<RawZScoreConfig> for ZScoreConfig {
             order_timeout_sec: raw.order_timeout_sec,
             max_retry_count: raw.max_retry_count,
             order_type: raw.order_type,
+            upbit_ioc_reject_block_count: raw.upbit_ioc_reject_block_count,
+            upbit_ioc_reject_cooldown_minutes: raw.upbit_ioc_reject_cooldown_minutes,
             max_slippage_pct: raw.max_slippage_pct,
             post_exec_pnl_gate_ratio: raw.post_exec_pnl_gate_ratio,
             emergency_wide_ioc_slippage_pct: raw.emergency_wide_ioc_slippage_pct,
@@ -1385,6 +1415,32 @@ coins = ["BTC"]
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("order_type"));
+    }
+
+    #[test]
+    fn test_validate_invalid_upbit_ioc_reject_block_count() {
+        let config = ZScoreConfig {
+            upbit_ioc_reject_block_count: 0,
+            ..ZScoreConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("upbit_ioc_reject_block_count must be greater than 0")
+        );
+    }
+
+    #[test]
+    fn test_validate_invalid_upbit_ioc_reject_cooldown_minutes() {
+        let config = ZScoreConfig {
+            upbit_ioc_reject_cooldown_minutes: 0,
+            ..ZScoreConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("upbit_ioc_reject_cooldown_minutes must be greater than 0")
+        );
     }
 
     #[test]

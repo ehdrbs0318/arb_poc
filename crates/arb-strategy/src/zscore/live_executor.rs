@@ -129,6 +129,15 @@ pub enum OrderExecutionError {
         leg: Leg,
         /// 비상 청산 성공 여부.
         emergency_closed: bool,
+        /// 미체결 레그 에러 메시지 (있으면 전달).
+        failed_leg_error: Option<String>,
+    },
+    /// 양쪽 미체결 + 거래소 에러 상세.
+    BothUnfilledWithErrors {
+        /// Upbit 레그 에러.
+        upbit_error: Option<String>,
+        /// Bybit 레그 에러.
+        bybit_error: Option<String>,
     },
     /// 비상 청산 실패 (naked exposure).
     EmergencyCloseFailed {
@@ -153,10 +162,20 @@ impl std::fmt::Display for OrderExecutionError {
             Self::SingleLegFilled {
                 leg,
                 emergency_closed,
+                failed_leg_error,
             } => {
                 write!(
                     f,
-                    "single leg filled: {leg}, emergency_closed={emergency_closed}"
+                    "single leg filled: {leg}, emergency_closed={emergency_closed}, failed_leg_error={failed_leg_error:?}"
+                )
+            }
+            Self::BothUnfilledWithErrors {
+                upbit_error,
+                bybit_error,
+            } => {
+                write!(
+                    f,
+                    "both legs unfilled with errors: upbit={upbit_error:?}, bybit={bybit_error:?}"
                 )
             }
             Self::EmergencyCloseFailed { leg, order_id } => {
@@ -274,6 +293,8 @@ where
         );
 
         let order_timeout = Duration::from_secs(self.config.order_timeout_sec);
+        let mut upbit_error: Option<String> = None;
+        let mut bybit_error: Option<String> = None;
 
         // 양 레그 동시 발주 (IOC 지정가)
         let (upbit_result, bybit_result) = tokio::join!(
@@ -310,6 +331,7 @@ where
             }
             Ok(Err(e)) => {
                 warn!(error = %e, "Upbit 매수 실패");
+                upbit_error = Some(e.to_string());
                 None
             }
             Err(_) => {
@@ -330,6 +352,7 @@ where
             }
             Ok(Err(e)) => {
                 warn!(error = %e, "Bybit short 실패");
+                bybit_error = Some(e.to_string());
                 None
             }
             Err(_) => {
@@ -354,6 +377,7 @@ where
                 Err(OrderExecutionError::SingleLegFilled {
                     leg: Leg::Upbit,
                     emergency_closed,
+                    failed_leg_error: bybit_error,
                 })
             }
             (None, Some(bybit)) => {
@@ -368,12 +392,25 @@ where
                 Err(OrderExecutionError::SingleLegFilled {
                     leg: Leg::Bybit,
                     emergency_closed,
+                    failed_leg_error: upbit_error,
                 })
             }
             // 양쪽 미체결
             (None, None) => {
-                info!("양쪽 미체결, 진입 포기");
-                Err(OrderExecutionError::BothUnfilled)
+                if upbit_error.is_some() || bybit_error.is_some() {
+                    warn!(
+                        upbit_error = ?upbit_error,
+                        bybit_error = ?bybit_error,
+                        "양쪽 미체결(거래소 에러 동반)"
+                    );
+                    Err(OrderExecutionError::BothUnfilledWithErrors {
+                        upbit_error,
+                        bybit_error,
+                    })
+                } else {
+                    info!("양쪽 미체결, 진입 포기");
+                    Err(OrderExecutionError::BothUnfilled)
+                }
             }
         }
     }
@@ -530,6 +567,7 @@ where
                 Err(OrderExecutionError::SingleLegFilled {
                     leg: Leg::Upbit,
                     emergency_closed: false,
+                    failed_leg_error: None,
                 })
             }
             (None, Some(_bybit)) => {
@@ -537,6 +575,7 @@ where
                 Err(OrderExecutionError::SingleLegFilled {
                     leg: Leg::Bybit,
                     emergency_closed: false,
+                    failed_leg_error: None,
                 })
             }
             (None, None) => {
@@ -1245,6 +1284,7 @@ mod tests {
             OrderExecutionError::SingleLegFilled {
                 leg,
                 emergency_closed: _,
+                failed_leg_error: _,
             } => {
                 assert_eq!(leg, Leg::Upbit);
             }
@@ -1275,6 +1315,7 @@ mod tests {
             OrderExecutionError::SingleLegFilled {
                 leg,
                 emergency_closed: _,
+                failed_leg_error: _,
             } => {
                 assert_eq!(leg, Leg::Bybit);
             }
@@ -1298,8 +1339,11 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            OrderExecutionError::BothUnfilled => {} // 정상
-            other => panic!("expected BothUnfilled, got: {other}"),
+            OrderExecutionError::BothUnfilledWithErrors {
+                upbit_error: _,
+                bybit_error: _,
+            } => {}
+            other => panic!("expected BothUnfilledWithErrors, got: {other}"),
         }
     }
 
@@ -1514,6 +1558,7 @@ mod tests {
             OrderExecutionError::SingleLegFilled {
                 leg,
                 emergency_closed,
+                failed_leg_error: _,
             } => {
                 assert_eq!(leg, Leg::Bybit);
                 assert!(!emergency_closed);
@@ -1545,6 +1590,7 @@ mod tests {
             OrderExecutionError::SingleLegFilled {
                 leg,
                 emergency_closed,
+                failed_leg_error: _,
             } => {
                 assert_eq!(leg, Leg::Upbit);
                 assert!(!emergency_closed);
@@ -1640,6 +1686,7 @@ mod tests {
         let err = OrderExecutionError::SingleLegFilled {
             leg: Leg::Upbit,
             emergency_closed: true,
+            failed_leg_error: Some("upbit reject".to_string()),
         };
         assert!(err.to_string().contains("upbit"));
         assert!(err.to_string().contains("true"));

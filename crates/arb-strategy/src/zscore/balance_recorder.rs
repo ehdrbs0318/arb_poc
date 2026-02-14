@@ -740,6 +740,7 @@ mod tests {
         tickers: Mutex<ExchangeResult<Vec<Ticker>>>,
     }
 
+    #[allow(dead_code)]
     impl MockAdapter {
         fn new_upbit(balances: Vec<Balance>, tickers: Vec<Ticker>) -> Self {
             Self {

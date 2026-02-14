@@ -12,8 +12,11 @@ use crate::positions::{DbPositionStore, PositionRecord, PositionStore, UpdateFie
 use crate::sessions::SessionRepository;
 use crate::trades::{TradeRecord, TradeRepository};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tracing::{debug, error, warn};
 
 /// DB 쓰기 요청 타입.
@@ -42,6 +45,11 @@ pub enum DbWriteRequest {
     UpdateSession { id: i64, status: String },
     /// 세션 heartbeat UPDATE.
     Heartbeat { session_id: i64 },
+    /// Consumer 종료 요청.
+    Shutdown {
+        /// 종료 완료 ack 채널.
+        ack: oneshot::Sender<()>,
+    },
 }
 
 /// Background DB Writer 통계.
@@ -73,6 +81,7 @@ impl Default for DbWriterStats {
 pub struct DbWriter {
     tx: mpsc::Sender<DbWriteRequest>,
     stats: Arc<DbWriterStats>,
+    consumer_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl DbWriter {
@@ -101,7 +110,7 @@ impl DbWriter {
         let stats = Arc::new(DbWriterStats::default());
 
         let consumer_stats = Arc::clone(&stats);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             run_consumer(
                 rx,
                 session_repo,
@@ -115,8 +124,13 @@ impl DbWriter {
             )
             .await;
         });
+        let consumer_handle = Arc::new(Mutex::new(Some(handle)));
 
-        Self { tx, stats }
+        Self {
+            tx,
+            stats,
+            consumer_handle,
+        }
     }
 
     /// DB 쓰기 요청 전송.
@@ -180,6 +194,74 @@ impl DbWriter {
     pub fn final_failure_count(&self) -> u64 {
         self.stats.final_failure_count.load(Ordering::Relaxed)
     }
+
+    /// Background consumer를 graceful shutdown 합니다.
+    ///
+    /// 1. Shutdown 요청 enqueue
+    /// 2. ack 대기 (soft timeout)
+    /// 3. JoinHandle 완료 대기 (hard timeout)
+    pub async fn shutdown_with_timeouts(
+        &self,
+        soft_timeout: std::time::Duration,
+        hard_timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        if hard_timeout < soft_timeout {
+            return Err("hard_timeout must be >= soft_timeout".to_string());
+        }
+        let shutdown_deadline = std::time::Instant::now() + hard_timeout;
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.tx
+            .send(DbWriteRequest::Shutdown { ack: ack_tx })
+            .await
+            .map_err(|_| "db writer channel closed before shutdown request".to_string())?;
+
+        let mut ack_rx = ack_rx;
+        match tokio::time::timeout(soft_timeout, &mut ack_rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err("db writer shutdown ack channel closed".to_string()),
+            Err(_) => {
+                warn!(
+                    soft_timeout_secs = soft_timeout.as_secs(),
+                    "DB writer shutdown soft timeout"
+                );
+
+                let remaining =
+                    shutdown_deadline.saturating_duration_since(std::time::Instant::now());
+                tokio::time::timeout(remaining, &mut ack_rx)
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "db writer shutdown hard timeout before ack ({}s)",
+                            hard_timeout.as_secs()
+                        )
+                    })?
+                    .map_err(|_| "db writer shutdown ack channel closed".to_string())?;
+            }
+        }
+
+        let handle_opt = {
+            let mut handle_guard = self
+                .consumer_handle
+                .lock()
+                .map_err(|_| "db writer consumer handle poisoned".to_string())?;
+            handle_guard.take()
+        };
+        if let Some(handle) = handle_opt {
+            let remaining = shutdown_deadline.saturating_duration_since(std::time::Instant::now());
+            tokio::time::timeout(remaining, handle)
+                .await
+                .map_err(|_| {
+                    format!(
+                        "db writer shutdown hard timeout ({}s)",
+                        hard_timeout.as_secs()
+                    )
+                })?
+                .map_err(|e| format!("db writer task join error: {e}"))?;
+        }
+
+        Ok(())
+    }
 }
 
 /// 요청 타입 문자열 반환 (로깅용).
@@ -194,6 +276,7 @@ fn describe_request(req: &DbWriteRequest) -> &'static str {
         DbWriteRequest::InsertBalanceSnapshot(_) => "InsertBalanceSnapshot",
         DbWriteRequest::UpdateSession { .. } => "UpdateSession",
         DbWriteRequest::Heartbeat { .. } => "Heartbeat",
+        DbWriteRequest::Shutdown { .. } => "Shutdown",
     }
 }
 
@@ -233,6 +316,12 @@ async fn run_consumer(
     debug!("DB writer consumer task 시작");
 
     while let Some(request) = rx.recv().await {
+        if let DbWriteRequest::Shutdown { ack } = request {
+            let _ = ack.send(());
+            debug!("DB writer shutdown 요청 수신");
+            break;
+        }
+
         let request_type = describe_request(&request);
         let mut last_err: Option<DbError> = None;
 
@@ -331,6 +420,9 @@ async fn execute_request(
         DbWriteRequest::Heartbeat { session_id } => {
             session_repo.update_heartbeat(*session_id).await?;
         }
+        DbWriteRequest::Shutdown { .. } => {
+            // run_consumer 루프에서 선처리됨.
+        }
     }
     Ok(())
 }
@@ -376,6 +468,13 @@ mod tests {
         };
         let req = DbWriteRequest::InsertBalanceSnapshot(row);
         assert_eq!(describe_request(&req), "InsertBalanceSnapshot");
+    }
+
+    #[test]
+    fn test_describe_request_shutdown() {
+        let (ack_tx, _ack_rx) = oneshot::channel();
+        let req = DbWriteRequest::Shutdown { ack: ack_tx };
+        assert_eq!(describe_request(&req), "Shutdown");
     }
 
     #[test]
