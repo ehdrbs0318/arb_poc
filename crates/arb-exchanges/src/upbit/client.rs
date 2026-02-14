@@ -17,7 +17,6 @@ use crate::upbit::types::{
 };
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use reqwest::Client;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -235,24 +234,24 @@ impl UpbitClient {
         let url = format!("{BASE_URL}{endpoint}");
         debug!(endpoint, "Upbit private POST 요청");
 
-        // 해시를 위해 body를 쿼리 스트링 형식으로 직렬화
-        let body_map: HashMap<String, serde_json::Value> =
-            serde_json::from_str(&serde_json::to_string(body).map_err(ExchangeError::JsonError)?)
-                .map_err(ExchangeError::JsonError)?;
-
-        let query_parts: Vec<(String, String)> = body_map
+        // Upbit query_hash는 "요청에 사용한 바디 파라미터" 기준이므로,
+        // 해시 계산용/실전송용 JSON을 동일 값으로 고정합니다.
+        let body_value = serde_json::to_value(body).map_err(ExchangeError::JsonError)?;
+        let body_obj = body_value.as_object().ok_or_else(|| {
+            ExchangeError::InvalidParameter("POST body must be JSON object".into())
+        })?;
+        let query_parts: Vec<(&str, String)> = body_obj
             .iter()
             .filter(|(_, v)| !v.is_null())
             .map(|(k, v)| {
                 let value = match v {
                     serde_json::Value::String(s) => s.clone(),
-                    _ => v.to_string().trim_matches('"').to_string(),
+                    _ => v.to_string(),
                 };
-                (k.clone(), value)
+                (k.as_str(), value)
             })
             .collect();
-
-        let query_string = build_query_string(query_parts);
+        let query_string = build_query_string(query_parts.iter().map(|(k, v)| (*k, v.as_str())));
         let auth_header = creds.authorization_header_with_query(&query_string)?;
 
         let response = self
@@ -260,7 +259,7 @@ impl UpbitClient {
             .post(&url)
             .header("Authorization", auth_header)
             .header("Content-Type", "application/json")
-            .json(body)
+            .json(&body_value)
             .send()
             .await
             .map_err(ExchangeError::HttpError)?;

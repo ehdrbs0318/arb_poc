@@ -163,3 +163,7 @@ path = "examples/zscore_sim.rs"
 [[example]]
 name = "migrate"
 path = "examples/migrate.rs"
+
+[[example]]
+name = "upbit_moodeng_min_roundtrip"
+path = "examples/upbit_moodeng_min_roundtrip.rs"

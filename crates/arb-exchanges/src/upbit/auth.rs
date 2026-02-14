@@ -3,7 +3,7 @@
 //! 이 모듈은 Upbit API 인증을 위한 JWT 토큰 생성을 처리합니다.
 
 use arb_exchange::ExchangeError;
-use jsonwebtoken::{EncodingKey, Header, encode};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
 use sha2::{Digest, Sha512};
 use uuid::Uuid;
@@ -74,7 +74,7 @@ impl UpbitCredentials {
     ///
     /// # 인자
     ///
-    /// * `query_string` - URL 인코딩된 쿼리 문자열 (예: "market=KRW-BTC&side=bid")
+    /// * `query_string` - URL 인코딩 전 원문 쿼리 문자열 (예: "market=KRW-BTC&side=bid")
     pub fn generate_token_with_query(&self, query_string: &str) -> Result<String, ExchangeError> {
         let query_hash = self.hash_query(query_string);
 
@@ -98,7 +98,8 @@ impl UpbitCredentials {
 
     /// JWT 페이로드를 인코딩합니다.
     fn encode_token(&self, payload: &JwtPayload) -> Result<String, ExchangeError> {
-        let header = Header::default(); // 기본값으로 HS256 사용
+        // Upbit 인증 가이드 기준 HS512를 사용합니다.
+        let header = Header::new(Algorithm::HS512);
         let key = EncodingKey::from_secret(self.secret_key.as_bytes());
 
         encode(&header, payload, &key).map_err(|e| ExchangeError::AuthError(e.to_string()))
@@ -128,7 +129,7 @@ impl UpbitCredentials {
 ///
 /// # 반환값
 ///
-/// URL 인코딩된 쿼리 문자열
+/// URL 인코딩 전 원문 쿼리 문자열
 pub fn build_query_string<I, K, V>(params: I) -> String
 where
     I: IntoIterator<Item = (K, V)>,
@@ -137,13 +138,7 @@ where
 {
     let pairs: Vec<String> = params
         .into_iter()
-        .map(|(k, v)| {
-            format!(
-                "{}={}",
-                url::form_urlencoded::byte_serialize(k.as_ref().as_bytes()).collect::<String>(),
-                url::form_urlencoded::byte_serialize(v.as_ref().as_bytes()).collect::<String>()
-            )
-        })
+        .map(|(k, v)| format!("{}={}", k.as_ref(), v.as_ref()))
         .collect();
     pairs.join("&")
 }
@@ -197,8 +192,8 @@ mod tests {
     fn test_build_query_string_with_special_chars() {
         let params = vec![("key", "value with spaces")];
         let query = build_query_string(params);
-        // URL 인코딩은 form-urlencoded 형식에서 공백을 +로 변환함
-        assert_eq!(query, "key=value+with+spaces");
+        // query_hash는 URL 인코딩 전 원문 문자열을 기준으로 생성
+        assert_eq!(query, "key=value with spaces");
     }
 
     #[test]
