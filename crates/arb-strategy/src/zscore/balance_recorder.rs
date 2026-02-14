@@ -25,6 +25,7 @@ use arb_exchange::types::Balance;
 use arb_forex::{ForexCache, UsdtKrwCache};
 use chrono::Utc;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -385,21 +386,7 @@ impl BalanceRecorderTask {
             0.0
         });
 
-        let usdt_krw = self
-            .usdt_cache
-            .get_usdt_krw()
-            .or_else(|| {
-                // TTL 만료 시 stale 값 사용
-                let stale = self.usdt_cache.get_usdt_krw_with_stale();
-                if stale.is_some() {
-                    warn!("USDT/KRW 캐시 TTL 만료, stale 값 사용");
-                }
-                stale
-            })
-            .unwrap_or_else(|| {
-                warn!("USDT/KRW 캐시 비어있음, 0.0 사용");
-                0.0
-            });
+        let usdt_krw = self.resolve_usdt_krw().await;
 
         // 5. Upbit 처리
         match upbit_result {
@@ -624,6 +611,48 @@ impl BalanceRecorderTask {
             total_usd,
             total_usdt,
         })
+    }
+
+    /// USDT/KRW 환율을 반환합니다.
+    ///
+    /// 우선순위:
+    /// 1) fresh cache
+    /// 2) Upbit KRW-USDT on-demand 조회 (3초 timeout)
+    /// 3) stale cache
+    /// 4) 0.0
+    async fn resolve_usdt_krw(&self) -> f64 {
+        if let Some(rate) = self.usdt_cache.get_usdt_krw() {
+            return rate;
+        }
+
+        let fetch =
+            tokio::time::timeout(Duration::from_secs(3), self.upbit.get_ticker(&["KRW-USDT"]))
+                .await;
+        match fetch {
+            Ok(Ok(tickers)) => {
+                if let Some(ticker) = tickers.first()
+                    && let Some(rate) = ticker.trade_price.to_f64()
+                {
+                    self.usdt_cache.update(rate);
+                    return rate;
+                }
+                warn!("USDT/KRW on-demand 조회 응답 비정상 (빈 응답 또는 변환 실패)");
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "USDT/KRW on-demand 조회 실패");
+            }
+            Err(_) => {
+                warn!("USDT/KRW on-demand 조회 타임아웃 (3초)");
+            }
+        }
+
+        if let Some(stale) = self.usdt_cache.get_usdt_krw_with_stale() {
+            warn!("USDT/KRW 캐시 TTL 만료, stale 값 사용");
+            stale
+        } else {
+            warn!("USDT/KRW 캐시 비어있음, 0.0 사용");
+            0.0
+        }
     }
 }
 

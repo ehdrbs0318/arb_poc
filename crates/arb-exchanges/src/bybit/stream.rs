@@ -194,6 +194,34 @@ impl MarketStream for BybitClient {
     }
 }
 
+/// 신규 구독 대상 토픽만 추출하고 현재 목록에 반영합니다.
+fn build_subscribe_topics(symbols: &[String], current_topics: &mut Vec<String>) -> Vec<String> {
+    let mut subscribe_topics = Vec::new();
+    for symbol in symbols {
+        let topic = format!("tickers.{symbol}");
+        if !current_topics.contains(&topic) {
+            current_topics.push(topic.clone());
+            subscribe_topics.push(topic);
+        }
+    }
+    subscribe_topics
+}
+
+/// 현재 구독 중인 토픽만 해제 대상으로 추출하고 현재 목록에서 제거합니다.
+fn build_unsubscribe_topics(symbols: &[String], current_topics: &mut Vec<String>) -> Vec<String> {
+    let remove_topics: Vec<String> = symbols
+        .iter()
+        .map(|s| format!("tickers.{s}"))
+        .filter(|topic| current_topics.contains(topic))
+        .collect();
+
+    if !remove_topics.is_empty() {
+        current_topics.retain(|topic| !remove_topics.contains(topic));
+    }
+
+    remove_topics
+}
+
 /// Bybit WebSocket 이벤트 루프 (재연결 + heartbeat + 동적 구독 포함).
 async fn bybit_ws_loop(
     initial_topics: Vec<String>,
@@ -233,25 +261,25 @@ async fn bybit_ws_loop(
                         cmd = command_rx.recv() => {
                             match cmd {
                                 Some(StreamCommand::Subscribe(symbols)) => {
-                                    // tickers.{symbol} 형식으로 토픽 변환
-                                    let new_topics: Vec<String> = symbols
-                                        .iter()
-                                        .map(|s| format!("tickers.{s}"))
-                                        .collect();
-                                    // 현재 목록에 추가 (중복 제거)
-                                    for t in &new_topics {
-                                        if !current_topics.contains(t) {
-                                            current_topics.push(t.clone());
-                                        }
+                                    let subscribe_topics =
+                                        build_subscribe_topics(&symbols, &mut current_topics);
+
+                                    if subscribe_topics.is_empty() {
+                                        debug!(
+                                            symbols = ?symbols,
+                                            "Bybit 동적 구독 추가 스킵: 이미 구독 중"
+                                        );
+                                        continue;
                                     }
+
                                     info!(
-                                        topics = ?new_topics,
+                                        topics = ?subscribe_topics,
                                         "Bybit 동적 구독 추가"
                                     );
                                     // Bybit은 개별 subscribe op 지원
                                     let msg = serde_json::json!({
                                         "op": "subscribe",
-                                        "args": new_topics
+                                        "args": subscribe_topics
                                     });
                                     if let Err(e) = write.send(
                                         Message::Text(msg.to_string().into())
@@ -261,12 +289,17 @@ async fn bybit_ws_loop(
                                     }
                                 }
                                 Some(StreamCommand::Unsubscribe(symbols)) => {
-                                    let remove_topics: Vec<String> = symbols
-                                        .iter()
-                                        .map(|s| format!("tickers.{s}"))
-                                        .collect();
-                                    // 현재 목록에서 제거
-                                    current_topics.retain(|t| !remove_topics.contains(t));
+                                    let remove_topics =
+                                        build_unsubscribe_topics(&symbols, &mut current_topics);
+
+                                    if remove_topics.is_empty() {
+                                        debug!(
+                                            symbols = ?symbols,
+                                            "Bybit 동적 구독 해제 스킵: 현재 미구독"
+                                        );
+                                        continue;
+                                    }
+
                                     info!(
                                         topics = ?remove_topics,
                                         "Bybit 동적 구독 해제"
@@ -548,5 +581,32 @@ mod tests {
 
         // bid/ask 없으면 None
         assert!(parse_bybit_ticker(json).is_none());
+    }
+
+    #[test]
+    fn test_build_subscribe_topics_dedup() {
+        let mut current_topics = vec!["tickers.BTCUSDT".to_string(), "tickers.ETHUSDT".to_string()];
+        let symbols = vec!["ETHUSDT".to_string(), "XRPUSDT".to_string()];
+
+        let subscribe_topics = build_subscribe_topics(&symbols, &mut current_topics);
+        assert_eq!(subscribe_topics, vec!["tickers.XRPUSDT".to_string()]);
+        assert_eq!(
+            current_topics,
+            vec![
+                "tickers.BTCUSDT".to_string(),
+                "tickers.ETHUSDT".to_string(),
+                "tickers.XRPUSDT".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_unsubscribe_topics_only_existing() {
+        let mut current_topics = vec!["tickers.BTCUSDT".to_string(), "tickers.ETHUSDT".to_string()];
+        let symbols = vec!["BTCUSDT".to_string(), "XRPUSDT".to_string()];
+
+        let remove_topics = build_unsubscribe_topics(&symbols, &mut current_topics);
+        assert_eq!(remove_topics, vec!["tickers.BTCUSDT".to_string()]);
+        assert_eq!(current_topics, vec!["tickers.ETHUSDT".to_string()]);
     }
 }

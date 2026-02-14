@@ -181,6 +181,7 @@ dependencies = [
  "mockito",
  "rust_decimal",
  "serde_json",
+ "sqlx",
  "tokio",
  "tokio-test",
  "tokio-util",

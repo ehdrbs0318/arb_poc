@@ -46,6 +46,9 @@ chrono = { workspace = true }
 # Cancellation token for graceful shutdown
 tokio-util = { version = "0.7", features = ["rt"] }
 
+# Database probe example
+sqlx = { workspace = true }
+
 [dev-dependencies]
 # Testing
 tokio-test = "0.4"

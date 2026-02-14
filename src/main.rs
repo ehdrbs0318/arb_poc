@@ -460,6 +460,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---------------------------------------------------------------
     let config_for_monitor = (*strategy_config_arc).clone();
     let bybit_for_funding = bybit.clone();
+    let upbit_for_usdt_krw = upbit.clone();
 
     let monitor = ZScoreMonitor::new(upbit, bybit, config_for_monitor, forex_cache, policy);
 
@@ -489,6 +490,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cancel_term.cancel();
         });
     }
+
+    // ---------------------------------------------------------------
+    // 10-0. USDT/KRW 캐시 주기 갱신 task
+    // ---------------------------------------------------------------
+    let cancel_usdt_krw = cancel_token.clone();
+    let usdt_cache_for_task = Arc::clone(&usdt_krw_cache);
+    let usdt_krw_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                _ = cancel_usdt_krw.cancelled() => break,
+                _ = interval.tick() => {
+                    match upbit_for_usdt_krw.get_ticker(&["KRW-USDT"]).await {
+                        Ok(tickers) => {
+                            if let Some(ticker) = tickers.first()
+                                && let Some(price_f64) = ticker.trade_price.to_f64()
+                            {
+                                usdt_cache_for_task.update(price_f64);
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "USDT/KRW 주기 갱신 실패");
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     // ---------------------------------------------------------------
     // 10-1. funding_schedules 갱신 task
@@ -633,6 +662,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(Ok(())) => info!("funding_schedules task 정상 종료"),
         Ok(Err(e)) => warn!(error = %e, "funding_schedules task 종료 에러"),
         Err(_) => warn!("funding_schedules task 종료 타임아웃 (10초)"),
+    }
+
+    // USDT/KRW 주기 갱신 task 종료 대기
+    match tokio::time::timeout(Duration::from_secs(10), usdt_krw_task).await {
+        Ok(Ok(())) => info!("usdt_krw refresh task 정상 종료"),
+        Ok(Err(e)) => warn!(error = %e, "usdt_krw refresh task 종료 에러"),
+        Err(_) => warn!("usdt_krw refresh task 종료 타임아웃 (10초)"),
     }
 
     // ---------------------------------------------------------------
