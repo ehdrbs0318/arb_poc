@@ -677,6 +677,7 @@ where
                         &trades,
                         &instrument_cache,
                         &counters,
+                        &self.policy,
                     ).await;
                     // check_tick_signal을 tokio::spawn으로 분리
                     Self::maybe_spawn_tick_signal(
@@ -711,6 +712,7 @@ where
                         &trades,
                         &instrument_cache,
                         &counters,
+                        &self.policy,
                     ).await;
                     // check_tick_signal을 tokio::spawn으로 분리
                     Self::maybe_spawn_tick_signal(
@@ -745,6 +747,7 @@ where
                             &mut minute_records,
                             &instrument_cache,
                             &counters,
+                            &self.policy,
                         ).await {
                             Ok(Some(regime)) => {
                                 let in_cooldown = regime_cooldown_until
@@ -1259,6 +1262,7 @@ where
         trades: &Arc<tokio::sync::Mutex<Vec<ClosedPosition>>>,
         instrument_cache: &Arc<parking_lot::RwLock<InstrumentCache>>,
         counters: &Arc<parking_lot::Mutex<MonitoringCounters>>,
+        policy: &Arc<P>,
     ) {
         let event_ts = match event {
             MarketEvent::Trade { timestamp, .. } => *timestamp,
@@ -1287,6 +1291,7 @@ where
                     minute_records,
                     instrument_cache,
                     counters,
+                    policy,
                 )
                 .await
                 {
@@ -1945,6 +1950,7 @@ where
         minute_records: &mut Vec<MinuteRecord>,
         instrument_cache: &Arc<parking_lot::RwLock<InstrumentCache>>,
         counters: &parking_lot::Mutex<MonitoringCounters>,
+        policy: &Arc<P>,
     ) -> Result<Option<RegimeChangeResult>, StrategyError> {
         let ts = candle_builder
             .current_minute
@@ -2022,6 +2028,12 @@ where
                     let spread_pct_val = spread_pct_snapshot;
 
                     for pid in liquidated_ids {
+                        let db_id = pm
+                            .open_positions
+                            .get(coin.as_str())
+                            .and_then(|positions| positions.iter().find(|p| p.id == pid))
+                            .and_then(|p| p.db_id);
+
                         warn!(
                             coin = coin.as_str(),
                             position_id = pid,
@@ -2054,6 +2066,7 @@ where
                                         "강제 청산 거래 CSV 기록 실패"
                                     );
                                 }
+                                policy.on_trade_closed(&closed, db_id).await;
                             }
                             Err(e) => {
                                 warn!(
@@ -2131,6 +2144,7 @@ where
                         "분봉 통계 CSV 기록 실패"
                     );
                 }
+                policy.on_minute_closed(&record).await;
             }
         }
 

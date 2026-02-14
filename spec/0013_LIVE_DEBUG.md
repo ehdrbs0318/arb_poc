@@ -26,8 +26,8 @@
 
 | ID | 제목 | 상태 | 우선순위 | 관련 스펙 |
 |---|---|---|---|---|
-| LD-0001 | Bybit USDT `available/locked` 오인식 | Open | P0 | `0011`, `0012` |
-| LD-0002 | DB INSERT 경로 미연결 (`minutes`, `funding_schedules`, `trades`, `alerts`) | Open | P0 | `0011`, `0012` |
+| LD-0001 | Bybit USDT `available/locked` 오인식 | Done | P0 | `0011`, `0012` |
+| LD-0002 | DB INSERT 경로 미연결 (`minutes`, `funding_schedules`, `trades`, `alerts`) | Done | P0 | `0011`, `0012` |
 
 ---
 
@@ -155,31 +155,31 @@ fn convert_balance(b: crate::bybit::types::BybitCoinBalance) -> Balance {
 
 ### A. 원인 확인
 
-- [ ] 원본 Bybit 잔고 필드 로그 캡처 (`walletBalance`, `availableToWithdraw`, `locked`, `equity`, `unrealisedPnl`)
-- [ ] `locked = wallet - availableToWithdraw`가 실제 오인식 원인임을 로그로 확인
+- [x] 원본 Bybit 잔고 필드 로그 캡처 (`walletBalance`, `availableToWithdraw`, `locked`, `equity`, `unrealisedPnl`)
+- [x] `locked = wallet - availableToWithdraw`가 실제 오인식 원인임을 로그로 확인
 
 ### B. 코드 수정
 
-- [ ] `crates/arb-exchanges/src/bybit/client.rs`: 파생 `locked` 계산 제거
-- [ ] `crates/arb-exchanges/src/bybit/client.rs`: `locked`를 API 필드 기반으로 매핑
-- [ ] `crates/arb-exchange/src/types.rs`: `Balance` 필드 의미 주석 점검/수정
+- [x] `crates/arb-exchanges/src/bybit/client.rs`: 파생 `locked` 계산 제거
+- [x] `crates/arb-exchanges/src/bybit/client.rs`: `locked`를 API 필드 기반으로 매핑
+- [x] `crates/arb-exchange/src/types.rs`: `Balance` 필드 의미 주석 점검/수정
 
 ### C. 스냅샷 경로 검증
 
-- [ ] `crates/arb-strategy/src/zscore/balance_recorder.rs`: 수정된 매핑 반영 확인
-- [ ] PERIODIC 스냅샷에서 Bybit `available/locked`가 현실적인 값인지 확인
+- [x] `crates/arb-strategy/src/zscore/balance_recorder.rs`: 수정된 매핑 반영 확인
+- [x] PERIODIC 스냅샷에서 Bybit `available/locked`가 현실적인 값인지 확인
 
 ### D. 테스트
 
-- [ ] `arb-exchanges` 단위 테스트 추가/수정
-- [ ] `arb-strategy` 스냅샷 조립 테스트 추가/수정
-- [ ] `cargo test -p arb-exchanges`
-- [ ] `cargo test -p arb-strategy`
+- [x] `arb-exchanges` 단위 테스트 추가/수정
+- [x] `arb-strategy` 스냅샷 조립 테스트 추가/수정
+- [x] `cargo test -p arb-exchanges`
+- [x] `cargo test -p arb-strategy`
 
 ### E. 문서
 
-- [ ] `spec/0012_BALANCE_SNAPSHOT.md` 동기화
-- [ ] 본 문서(`0013_LIVE_DEBUG`) 상태 갱신 (Open -> In Progress -> Done)
+- [x] `spec/0012_BALANCE_SNAPSHOT.md` 동기화
+- [x] 본 문서(`0013_LIVE_DEBUG`) 상태 갱신 (Open -> In Progress -> Done)
 
 ---
 
@@ -349,50 +349,50 @@ fn convert_balance(b: crate::bybit::types::BybitCoinBalance) -> Balance {
 
 ### A. wiring
 
-- [ ] `LivePolicy`에 `DbWriter` 주입
-- [ ] policy 훅(분봉/거래/펀딩) 추가 및 Live 구현
-- [ ] SimPolicy 기본 no-op 유지
-- [ ] `AlertService` 핸들을 main 수명 주기에 보관 (`_alert_service` drop 제거)
+- [x] `LivePolicy`에 `DbWriter` 주입
+- [x] policy 훅(분봉/거래/펀딩) 추가 및 Live 구현
+- [x] SimPolicy 기본 no-op 유지
+- [x] `AlertService` 핸들을 main 수명 주기에 보관 (`_alert_service` drop 제거)
 
 ### B. minutes
 
-- [ ] 분 완결 시 `DbWriteRequest::InsertMinute` 전송
-- [ ] `minutes` 적재 확인 (코인 수 × 분 수 근사치)
-- [ ] `(session_id, coin, ts)` 중복 방지(UNIQUE/UPSERT) 적용
+- [x] 분 완결 시 `DbWriteRequest::InsertMinute` 전송
+- [x] `minutes` 적재 확인 (코인 수 × 분 수 근사치)
+- [x] `(session_id, coin, ts)` 중복 방지(UNIQUE/UPSERT) 적용
 
 ### C. trades
 
-- [ ] 청산 성공 시 `DbWriteRequest::InsertTrade` 전송
-- [ ] 일반/TTL/강제/비상 청산 경로 모두 누락 없이 적재 확인
-- [ ] `position_id = db_id` 매핑 검증 (`ClosedPosition.id` 미사용)
-- [ ] `db_id` 없는 케이스 skip + 경고/카운터 검증
+- [x] 청산 성공 시 `DbWriteRequest::InsertTrade` 전송
+- [x] 일반/TTL/강제/비상 청산 경로 모두 누락 없이 적재 확인
+- [x] `position_id = db_id` 매핑 검증 (`ClosedPosition.id` 미사용)
+- [x] `db_id` 없는 케이스 skip + 경고/카운터 검증
 
 ### D. funding_schedules
 
-- [ ] 주기 갱신 task에서 `DbWriteRequest::UpsertFunding` 전송
-- [ ] `funding_schedules`의 코인별 upsert 동작 확인
-- [ ] `next_funding_time` parse 실패/0 skip 규칙 검증
+- [x] 주기 갱신 task에서 `DbWriteRequest::UpsertFunding` 전송
+- [x] `funding_schedules`의 코인별 upsert 동작 확인
+- [x] `next_funding_time` parse 실패/0 skip 규칙 검증
 
 ### E. alerts
 
-- [ ] 주요 이벤트에 `AlertService.send` 연결
-- [ ] 텔레그램 성공/실패와 무관하게 `alerts` DB 적재 확인
-- [ ] 텔레그램 실패 시 추가 오류 알림/로그 확인
+- [x] 주요 이벤트에 `AlertService.send` 연결
+- [x] 텔레그램 성공/실패와 무관하게 `alerts` DB 적재 확인
+- [x] 텔레그램 실패 시 추가 오류 알림/로그 확인
 
 ### F. 테스트/검증
 
-- [ ] `cargo test -p arb-strategy`
-- [ ] `cargo test -p arb-db`
-- [ ] `cargo clippy`
-- [ ] 30분 실행 후 적재 검증:
-- [ ] `SELECT COUNT(*) FROM minutes WHERE session_id = ?`
-- [ ] `SELECT COUNT(*) FROM trades WHERE session_id = ?`
-- [ ] `SELECT COUNT(*) FROM funding_schedules`
-- [ ] `SELECT COUNT(*) FROM alerts WHERE session_id = ?`
-- [ ] 정량 기준 검증:
-- [ ] `minutes` >= `active_coin_count * 25` (30분 기준, 시작 워밍업 제외 허용 오차 반영)
-- [ ] `trades` row 수 == 해당 세션 `ClosedPosition` 수 (또는 skip 사유 카운터와 합 일치)
-- [ ] `funding_schedules` row 수 >= 활성 코인 수 (최소 1회 upsert 기준)
+- [x] `cargo test -p arb-strategy`
+- [x] `cargo test -p arb-db`
+- [x] `cargo clippy`
+- [x] 30분 실행 후 적재 검증:
+- [x] `SELECT COUNT(*) FROM minutes WHERE session_id = ?`
+- [x] `SELECT COUNT(*) FROM trades WHERE session_id = ?`
+- [x] `SELECT COUNT(*) FROM funding_schedules`
+- [x] `SELECT COUNT(*) FROM alerts WHERE session_id = ?`
+- [x] 정량 기준 검증:
+- [x] `minutes` >= `active_coin_count * 25` (30분 기준, 시작 워밍업 제외 허용 오차 반영)
+- [x] `trades` row 수 == 해당 세션 `ClosedPosition` 수 (또는 skip 사유 카운터와 합 일치)
+- [x] `funding_schedules` row 수 >= 활성 코인 수 (최소 1회 upsert 기준)
 
 ---
 

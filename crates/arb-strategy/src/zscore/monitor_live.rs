@@ -39,11 +39,15 @@ use rust_decimal::prelude::ToPrimitive as _;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use arb_db::minutes::MinuteRecord as DbMinuteRecord;
+use arb_db::trades::TradeRecord;
+use arb_db::writer::{DbWriteRequest, DbWriter};
 use arb_exchange::{InstrumentDataProvider, LinearOrderManagement, MarketData, OrderManagement};
 
 use crate::error::StrategyError;
 use crate::output::summary::MonitoringCounters;
-use crate::output::writer::SessionWriter;
+use crate::output::writer::{MinuteRecord, SessionWriter};
+use crate::zscore::alert::{AlertEvent, AlertService};
 use crate::zscore::balance::BalanceTracker;
 use crate::zscore::balance_recorder::BalanceSnapshotSender;
 use crate::zscore::config::ZScoreConfig;
@@ -101,6 +105,10 @@ where
     position_store: Arc<S>,
     /// DB 세션 ID (crash recovery용).
     session_id: i64,
+    /// 비동기 DB writer (None이면 DB producer 비활성화).
+    db_writer: Option<DbWriter>,
+    /// 운영 알림 서비스 (None이면 비활성화).
+    alert_service: Option<AlertService>,
     /// SharedResources 지연 바인딩.
     shared: OnceLock<LivePolicyShared>,
     /// 잔고 스냅샷 전송 핸들 (None이면 비활성화).
@@ -132,13 +140,18 @@ where
     /// * `risk_manager` - 리스크 관리자
     /// * `position_store` - 포지션 영속화 (DB)
     /// * `session_id` - DB 세션 ID
+    /// * `db_writer` - DB writer (minutes/trades producer)
+    /// * `alert_service` - 운영 알림 서비스
     /// * `balance_sender` - 잔고 스냅샷 전송 핸들 (None이면 비활성화)
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         executor: Arc<LiveExecutor<U, B>>,
         balance_tracker: Arc<BalanceTracker>,
         risk_manager: Arc<RiskManager>,
         position_store: Arc<S>,
         session_id: i64,
+        db_writer: Option<DbWriter>,
+        alert_service: Option<AlertService>,
         balance_sender: Option<BalanceSnapshotSender>,
     ) -> Self {
         info!(session_id = session_id, "LivePolicy 초기화");
@@ -148,6 +161,8 @@ where
             risk_manager,
             position_store,
             session_id,
+            db_writer,
+            alert_service,
             shared: OnceLock::new(),
             balance_sender,
             _marker: PhantomData,
@@ -234,6 +249,112 @@ where
             warn!(error = %e, "CSV 기록 실패");
         }
     }
+
+    /// 운영 알림 전송 (서비스 비활성화 시 no-op).
+    fn emit_alert(&self, event: AlertEvent) {
+        if let Some(service) = &self.alert_service {
+            service.send(event);
+        }
+    }
+
+    /// f64를 DB 저장용 Decimal로 변환합니다.
+    fn decimal_from_f64(value: f64) -> Option<Decimal> {
+        if !value.is_finite() {
+            return None;
+        }
+        Decimal::try_from(value).ok()
+    }
+
+    /// 분봉 1건을 DB writer로 전송합니다.
+    async fn enqueue_minute_record(&self, record: &MinuteRecord) {
+        let Some(db_writer) = &self.db_writer else {
+            return;
+        };
+
+        let ts = match chrono::DateTime::parse_from_rfc3339(&record.timestamp) {
+            Ok(ts) => ts.with_timezone(&Utc),
+            Err(e) => {
+                warn!(
+                    timestamp = record.timestamp.as_str(),
+                    error = %e,
+                    "분봉 timestamp 파싱 실패, DB INSERT 스킵"
+                );
+                self.emit_alert(AlertEvent::Error {
+                    message: format!("minute timestamp parse failed: {}", e),
+                });
+                return;
+            }
+        };
+
+        let minute = DbMinuteRecord {
+            id: None,
+            session_id: self.session_id,
+            coin: record.coin.clone(),
+            ts,
+            upbit_close: Self::decimal_from_f64(record.upbit_close),
+            bybit_close: Self::decimal_from_f64(record.bybit_close),
+            spread_pct: record.spread_pct.is_finite().then_some(record.spread_pct),
+            z_score: record.z_score.is_finite().then_some(record.z_score),
+            mean: record.mean.is_finite().then_some(record.mean),
+            stddev: record.stddev.is_finite().then_some(record.stddev),
+        };
+
+        db_writer.send(DbWriteRequest::InsertMinute(minute));
+    }
+
+    /// 청산 거래 1건을 DB writer로 전송합니다.
+    async fn enqueue_trade_record(&self, closed: &ClosedPosition, position_db_id: Option<i64>) {
+        let Some(db_writer) = &self.db_writer else {
+            return;
+        };
+        let Some(position_id) = position_db_id else {
+            warn!(
+                coin = closed.coin.as_str(),
+                local_position_id = closed.id,
+                "position db_id 없음, trades INSERT 스킵"
+            );
+            self.emit_alert(AlertEvent::Error {
+                message: format!(
+                    "trade insert skipped: coin={} local_pos_id={} has_no_db_id",
+                    closed.coin, closed.id
+                ),
+            });
+            return;
+        };
+
+        let upbit_price_krw =
+            Self::decimal_from_f64(closed.exit_usd_krw).map(|rate| closed.upbit_exit_price * rate);
+
+        let trade = TradeRecord {
+            id: None,
+            session_id: self.session_id,
+            position_id,
+            coin: closed.coin.clone(),
+            side: "exit".to_string(),
+            qty: closed.qty,
+            upbit_price_krw,
+            bybit_price_usdt: Some(closed.bybit_exit_price),
+            upbit_fee: closed.actual_upbit_fee.or(Some(closed.upbit_fees)),
+            bybit_fee: closed.actual_bybit_fee.or(Some(closed.bybit_fees)),
+            spread_pct: closed
+                .exit_spread_pct
+                .is_finite()
+                .then_some(closed.exit_spread_pct),
+            z_score: closed
+                .exit_z_score
+                .is_finite()
+                .then_some(closed.exit_z_score),
+            realized_pnl: Some(closed.net_pnl),
+            adjustment_cost: closed.adjustment_cost,
+            exit_usd_krw: closed
+                .exit_usd_krw
+                .is_finite()
+                .then_some(closed.exit_usd_krw),
+            executed_at: closed.exit_time,
+        };
+
+        db_writer.send(DbWriteRequest::InsertTrade(trade));
+    }
 }
 
 impl<U, B, S> ExecutionPolicy for LivePolicy<U, B, S>
@@ -285,12 +406,18 @@ where
             .balance_tracker
             .reserve(upbit_krw_needed, bybit_usdt_needed)
         else {
+            let (_upbit_available, bybit_available) = self.balance_tracker.available();
             info!(
                 coin = coin.as_str(),
                 upbit_krw = %upbit_krw_needed,
                 bybit_usdt = %bybit_usdt_needed,
                 "진입 거부: 잔고 부족"
             );
+            self.emit_alert(AlertEvent::BalanceInsufficient {
+                exchange: "bybit".to_string(),
+                required: bybit_usdt_needed,
+                available: bybit_available,
+            });
             shared.counters.lock().entry_rejected_order_constraint_count += 1;
             return Ok(());
         };
@@ -522,6 +649,20 @@ where
                         leg,
                         emergency_closed,
                     } => {
+                        self.emit_alert(AlertEvent::LegFailure {
+                            coin: coin.clone(),
+                            succeeded_leg: leg.to_string(),
+                            failed_leg: match leg {
+                                crate::zscore::live_executor::Leg::Upbit => "bybit".to_string(),
+                                crate::zscore::live_executor::Leg::Bybit => "upbit".to_string(),
+                            },
+                            action_taken: if *emergency_closed {
+                                "emergency_close_succeeded".to_string()
+                            } else {
+                                "kill_switch_triggered".to_string()
+                            },
+                        });
+
                         // 한쪽만 체결 → 비상 청산 결과에 따라 처리
                         if *emergency_closed {
                             // 비상 청산 성공 → 포지션 제거 + 예약 해제
@@ -590,6 +731,11 @@ where
                             );
 
                             // kill switch 발동
+                            self.emit_alert(AlertEvent::EmergencyCloseFailure {
+                                coin: coin.clone(),
+                                retry_count: 1,
+                                naked_exposure: bybit_usdt_needed,
+                            });
                             self.risk_manager.trigger_kill_switch(&format!(
                                 "emergency close failed: {} leg={}",
                                 coin, leg
@@ -628,6 +774,11 @@ where
                             order_id = order_id.as_str(),
                             "EmergencyCloseFailed — kill switch 발동"
                         );
+                        self.emit_alert(AlertEvent::EmergencyCloseFailure {
+                            coin: coin.clone(),
+                            retry_count: 1,
+                            naked_exposure: bybit_usdt_needed,
+                        });
                         self.risk_manager.trigger_kill_switch(&format!(
                             "emergency close failed: {} order_id={}",
                             leg, order_id
@@ -813,10 +964,15 @@ where
                                 pnl = %closed.net_pnl,
                                 "청산 후 kill switch 발동"
                             );
+                            self.emit_alert(AlertEvent::KillSwitchTriggered {
+                                reason: reason.to_string(),
+                                daily_pnl: closed.net_pnl,
+                            });
                         }
 
                         // trades + CSV 기록
                         self.record_trade(&closed).await;
+                        self.on_trade_closed(&closed, *db_id).await;
 
                         // 잔고 스냅샷 — 청산 직후
                         if let Some(sender) = &self.balance_sender
@@ -1010,10 +1166,15 @@ where
                                 pnl = %closed.net_pnl,
                                 "TTL 청산 후 kill switch 발동"
                             );
+                            self.emit_alert(AlertEvent::KillSwitchTriggered {
+                                reason: reason.to_string(),
+                                daily_pnl: closed.net_pnl,
+                            });
                         }
 
                         // trades + CSV 기록
                         self.record_trade(&closed).await;
+                        self.on_trade_closed(&closed, db_id).await;
 
                         // 잔고 스냅샷 — TTL 청산 직후
                         if let Some(sender) = &self.balance_sender
@@ -1076,6 +1237,11 @@ where
                             pos_id = ttl_pos.id,
                             "강제 청산 실패 — kill switch 발동"
                         );
+                        self.emit_alert(AlertEvent::EmergencyCloseFailure {
+                            coin: coin.clone(),
+                            retry_count: 1,
+                            naked_exposure: ttl_pos.size_usdt,
+                        });
                         self.risk_manager.trigger_kill_switch(&format!(
                             "TTL force close failed: {} pos_id={}",
                             coin, ttl_pos.id
@@ -1091,6 +1257,19 @@ where
     fn is_entry_allowed(&self) -> bool {
         // RiskManager에 위임 (AtomicBool + Mutex 내부 확인)
         self.risk_manager.is_entry_allowed()
+    }
+
+    async fn on_minute_closed(&self, record: &MinuteRecord) {
+        self.enqueue_minute_record(record).await;
+    }
+
+    async fn on_trade_closed(&self, closed: &ClosedPosition, position_db_id: Option<i64>) {
+        self.enqueue_trade_record(closed, position_db_id).await;
+        self.emit_alert(AlertEvent::ExitExecuted {
+            coin: closed.coin.clone(),
+            qty: closed.qty,
+            realized_pnl: closed.net_pnl,
+        });
     }
 
     fn bind_shared_resources(&self, resources: SharedResources) {
@@ -1523,7 +1702,9 @@ mod tests {
             Arc::clone(&risk_manager),
             Arc::clone(&position_store),
             1, // session_id
-            None,
+            None::<DbWriter>,
+            None::<AlertService>,
+            None::<BalanceSnapshotSender>,
         );
 
         let pm = Arc::new(tokio::sync::Mutex::new(PositionManager::new()));
@@ -1685,7 +1866,9 @@ mod tests {
             Arc::clone(&risk_manager),
             Arc::clone(&position_store),
             1,
-            None,
+            None::<DbWriter>,
+            None::<AlertService>,
+            None::<BalanceSnapshotSender>,
         );
 
         let pm = Arc::new(tokio::sync::Mutex::new(PositionManager::new()));

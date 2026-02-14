@@ -1,8 +1,8 @@
 //! 텔레그램 알림 서비스.
 //!
 //! AlertService는 라이브 트레이딩에서 중요한 이벤트를 텔레그램으로 전송합니다.
-//! 일반 알림은 mpsc 비동기 채널로, 치명적 알림은 동기적으로 처리합니다.
-//! 텔레그램 실패 시 DB alerts 테이블에 fallback 기록합니다.
+//! 일반 알림은 mpsc 비동기 채널로 처리하며, DB alerts 테이블에는 항상 감사로그를 기록합니다.
+//! 텔레그램 전송은 best-effort 채널입니다.
 
 use rust_decimal::Decimal;
 use std::fmt;
@@ -258,10 +258,11 @@ pub type DbAlertFn = Box<
         + Sync,
 >;
 
-/// AlertService: 텔레그램 알림 + DB fallback.
+/// AlertService: 텔레그램 알림 + DB 감사로그.
 ///
 /// 일반 알림은 mpsc 비동기 채널(64 bounded)로 전송하여 이벤트 루프를 블로킹하지 않습니다.
 /// 치명적 알림(kill switch, 비상 청산 실패)은 청산 완료 후 동기적으로 전송합니다.
+#[derive(Clone)]
 pub struct AlertService {
     /// 비동기 알림 채널 sender.
     tx: tokio::sync::mpsc::Sender<AlertEvent>,
@@ -287,7 +288,7 @@ impl AlertService {
     /// # 인자
     /// - `session_id`: 현재 트레이딩 세션 ID
     /// - `telegram_send_fn`: 텔레그램 전송 함수 (테스트에서 mock 가능)
-    /// - `db_alert_fn`: DB alerts 테이블에 fallback 기록하는 함수
+    /// - `db_alert_fn`: DB alerts 테이블 기록 함수 (항상 호출)
     ///
     /// # 반환값
     /// `(AlertService, AlertConsumer)` 튜플. Consumer는 shutdown 대기용.
@@ -317,33 +318,47 @@ impl AlertService {
                 let event_type = event.event_type().to_string();
                 let payload = format!("{:?}", event);
 
-                // 텔레그램 전송 시도
+                let mut db_ok = false;
+                let mut tg_ok = false;
+
+                // DB 감사로그는 항상 기록
+                match (db_alert_fn)(session_id, &level, &event_type, &message, Some(payload)).await
+                {
+                    Ok(()) => {
+                        db_ok = true;
+                    }
+                    Err(db_err) => {
+                        tracing::error!(
+                            error = db_err.as_str(),
+                            event_type = event_type.as_str(),
+                            "alerts DB 기록 실패"
+                        );
+                    }
+                }
+
+                // 텔레그램은 best-effort 전송
                 match (telegram_send_fn)(message.clone()).await {
                     Ok(()) => {
+                        tg_ok = true;
                         tracing::debug!(
                             event_type = event_type.as_str(),
                             "텔레그램 알림 전송 완료"
                         );
                     }
-                    Err(e) => {
+                    Err(tg_err) => {
                         tracing::warn!(
-                            error = e.as_str(),
+                            error = tg_err.as_str(),
                             event_type = event_type.as_str(),
-                            "텔레그램 전송 실패, DB fallback 시도"
+                            "텔레그램 전송 실패"
                         );
-                        // DB fallback
-                        if let Err(db_err) =
-                            (db_alert_fn)(session_id, &level, &event_type, &message, Some(payload))
-                                .await
-                        {
-                            tracing::error!(
-                                telegram_error = e.as_str(),
-                                db_error = db_err.as_str(),
-                                event_type = event_type.as_str(),
-                                "텔레그램 + DB 모두 실패 (triple failure)"
-                            );
-                        }
                     }
+                }
+
+                if !db_ok && !tg_ok {
+                    tracing::error!(
+                        event_type = event_type.as_str(),
+                        "알림 DB + 텔레그램 모두 실패"
+                    );
                 }
             }
             tracing::info!("AlertService consumer 종료");
@@ -795,6 +810,36 @@ mod tests {
         consumer.shutdown().await;
 
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_alert_service_db_always_written() {
+        let db_counter = Arc::new(AtomicU32::new(0));
+        let db_counter_clone = db_counter.clone();
+
+        let db_fn = move |_sid: i64,
+                          _level: &str,
+                          _evt: &str,
+                          _msg: &str,
+                          _payload: Option<String>|
+              -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
+            let c = db_counter_clone.clone();
+            Box::pin(async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        };
+
+        let (service, consumer) = AlertService::new(1, noop_telegram(), db_fn);
+
+        service.send(AlertEvent::Error {
+            message: "test".into(),
+        });
+
+        drop(service);
+        consumer.shutdown().await;
+
+        assert_eq!(db_counter.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

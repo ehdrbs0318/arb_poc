@@ -396,8 +396,10 @@ pub struct Balance {
     /// 통화 코드 (예: "BTC", "KRW").
     pub currency: String,
     /// 가용 잔고.
+    /// Bybit의 경우 `availableToWithdraw`(출금 가능 잔고)를 매핑합니다.
     pub balance: Decimal,
     /// 잠긴 잔고 (주문에 사용 중).
+    /// Bybit의 경우 API `locked` 필드를 원본 그대로 매핑합니다.
     pub locked: Decimal,
     /// 평균 매수 가격.
     pub avg_buy_price: Decimal,

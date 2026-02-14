@@ -68,7 +68,7 @@ impl Default for DbWriterStats {
 /// Background DB Writer.
 ///
 /// mpsc::channel(256) bounded 채널로 요청 수신.
-/// try_send 실패 시 newest 드랍 + warn 로그.
+/// 채널 full 시 요청 중요도에 따라 drop 또는 재대기 전송.
 #[derive(Debug, Clone)]
 pub struct DbWriter {
     tx: mpsc::Sender<DbWriteRequest>,
@@ -121,15 +121,46 @@ impl DbWriter {
 
     /// DB 쓰기 요청 전송.
     ///
-    /// 채널이 가득 차면 요청을 드랍하고 warn 로그 기록.
+    /// 채널이 가득 찬 경우:
+    /// - 중요 요청(trades/alerts/positions/session): async send로 재대기
+    /// - 비중요 요청(minutes/funding/snapshot/heartbeat): newest drop
     pub fn send(&self, request: DbWriteRequest) {
-        if let Err(mpsc::error::TrySendError::Full(dropped)) = self.tx.try_send(request) {
-            self.stats.overflow_count.fetch_add(1, Ordering::Relaxed);
-            warn!(
-                overflow_count = self.stats.overflow_count.load(Ordering::Relaxed),
-                request_type = describe_request(&dropped),
-                "DB writer channel full, dropping newest request"
-            );
+        match self.tx.try_send(request) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(req)) => {
+                self.stats.overflow_count.fetch_add(1, Ordering::Relaxed);
+
+                if is_critical_request(&req) {
+                    warn!(
+                        overflow_count = self.stats.overflow_count.load(Ordering::Relaxed),
+                        request_type = describe_request(&req),
+                        "DB writer channel full, queueing critical request with async send"
+                    );
+                    let tx = self.tx.clone();
+                    let stats = Arc::clone(&self.stats);
+                    tokio::spawn(async move {
+                        if tx.send(req).await.is_err() {
+                            stats.final_failure_count.fetch_add(1, Ordering::Relaxed);
+                            error!("DB writer channel closed while sending critical request");
+                        }
+                    });
+                } else {
+                    warn!(
+                        overflow_count = self.stats.overflow_count.load(Ordering::Relaxed),
+                        request_type = describe_request(&req),
+                        "DB writer channel full, dropping newest request"
+                    );
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(req)) => {
+                self.stats
+                    .final_failure_count
+                    .fetch_add(1, Ordering::Relaxed);
+                error!(
+                    request_type = describe_request(&req),
+                    "DB writer channel closed, request dropped"
+                );
+            }
         }
     }
 
@@ -162,6 +193,18 @@ fn describe_request(req: &DbWriteRequest) -> &'static str {
         DbWriteRequest::UpdateSession { .. } => "UpdateSession",
         DbWriteRequest::Heartbeat { .. } => "Heartbeat",
     }
+}
+
+/// 채널 full 시 재대기해야 하는 중요 요청 여부.
+fn is_critical_request(req: &DbWriteRequest) -> bool {
+    matches!(
+        req,
+        DbWriteRequest::InsertPosition(_)
+            | DbWriteRequest::UpdatePositionState { .. }
+            | DbWriteRequest::InsertTrade(_)
+            | DbWriteRequest::InsertAlert(_)
+            | DbWriteRequest::UpdateSession { .. }
+    )
 }
 
 /// 최대 재시도 횟수.
@@ -334,5 +377,17 @@ mod tests {
         assert_eq!(stats.overflow_count.load(Ordering::Relaxed), 0);
         assert_eq!(stats.processed_count.load(Ordering::Relaxed), 0);
         assert_eq!(stats.final_failure_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_is_critical_request() {
+        let critical = DbWriteRequest::UpdateSession {
+            id: 1,
+            status: "Completed".to_string(),
+        };
+        assert!(is_critical_request(&critical));
+
+        let non_critical = DbWriteRequest::Heartbeat { session_id: 1 };
+        assert!(!is_critical_request(&non_critical));
     }
 }

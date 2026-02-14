@@ -13,7 +13,7 @@ use rust_decimal::Decimal;
 
 use crate::error::StrategyError;
 use crate::output::summary::MonitoringCounters;
-use crate::output::writer::SessionWriter;
+use crate::output::writer::{MinuteRecord, SessionWriter};
 use crate::zscore::config::ZScoreConfig;
 use crate::zscore::instrument::InstrumentInfo;
 use crate::zscore::pnl::ClosedPosition;
@@ -187,6 +187,25 @@ pub trait ExecutionPolicy: Send + Sync + 'static {
     /// 시뮬: 항상 true.
     /// 라이브: RiskManager.is_entry_allowed() + reconciliation 상태 등.
     fn is_entry_allowed(&self) -> bool;
+
+    /// 분봉 완결 레코드를 후처리합니다.
+    ///
+    /// 기본 구현은 no-op이며, LivePolicy에서 DB INSERT producer를 연결합니다.
+    fn on_minute_closed(&self, _record: &MinuteRecord) -> impl Future<Output = ()> + Send {
+        async {}
+    }
+
+    /// 청산 완료 거래를 후처리합니다.
+    ///
+    /// 기본 구현은 no-op이며, LivePolicy에서 DB INSERT producer를 연결합니다.
+    /// `position_db_id`는 DB `positions.id`이며, 없으면 `None`입니다.
+    fn on_trade_closed(
+        &self,
+        _closed: &ClosedPosition,
+        _position_db_id: Option<i64>,
+    ) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 
     /// 공유 리소스를 바인딩합니다.
     ///

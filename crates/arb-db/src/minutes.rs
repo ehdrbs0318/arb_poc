@@ -52,6 +52,14 @@ impl MinuteRepository {
                 upbit_close, bybit_close,
                 spread_pct, z_score, mean, stddev
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON DUPLICATE KEY UPDATE
+                id = LAST_INSERT_ID(id),
+                upbit_close = VALUES(upbit_close),
+                bybit_close = VALUES(bybit_close),
+                spread_pct = VALUES(spread_pct),
+                z_score = VALUES(z_score),
+                mean = VALUES(mean),
+                stddev = VALUES(stddev)
             "#,
         )
         .bind(minute.session_id)

@@ -32,22 +32,24 @@ use std::time::Duration;
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use arb_poc::adapter::DbPositionStoreAdapter;
 use arb_poc::config::Config;
 use arb_poc::db::alerts::AlertRepository;
 use arb_poc::db::balance_snapshots::BalanceSnapshotRepository;
 use arb_poc::db::funding::FundingRepository;
+use arb_poc::db::funding::FundingScheduleRecord;
 use arb_poc::db::minutes::MinuteRepository;
 use arb_poc::db::pool::{DbPool, DbPoolConfig};
 use arb_poc::db::positions::DbPositionStore;
 use arb_poc::db::sessions::SessionRepository;
 use arb_poc::db::trades::TradeRepository;
-use arb_poc::db::writer::DbWriter;
+use arb_poc::db::writer::{DbWriteRequest, DbWriter};
 use arb_poc::exchange::{ExchangeAdapter, MarketData, OrderManagement};
 use arb_poc::exchanges::{BybitAdapter, BybitClient, UpbitAdapter, UpbitClient};
 use arb_poc::forex::{ForexCache, UsdtKrwCache};
+use arb_poc::strategy::zscore::alert::{AlertConsumer, AlertService, DbAlertFn, TelegramSendFn};
 use arb_poc::strategy::zscore::balance::BalanceTracker;
 use arb_poc::strategy::zscore::balance_recorder::BalanceRecorderTask;
 use arb_poc::strategy::zscore::config::ZScoreConfig;
@@ -183,8 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     coins = ?open_positions.iter().map(|p| p.coin.as_str()).collect::<Vec<_>>(),
                     "이전 세션에 미결 포지션 발견 — 수동 확인 필요"
                 );
-                // TODO: LivePolicy 초기화 시 자동 복구/청산 로직 추가
-                // 현재는 경고만 출력하고 새 세션으로 진행
+                // 현재는 경고를 남기고 새 세션으로 계속 진행합니다.
             }
             Ok(_) => {
                 info!(prev_session_id = prev_id, "이전 세션 미결 포지션 없음");
@@ -308,73 +309,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let risk_manager = Arc::new(RiskManager::new(risk_config));
     info!("RiskManager 초기화 완료");
 
-    // ---------------------------------------------------------------
-    // 6-1. AlertService 생성
-    // ---------------------------------------------------------------
-    let alert_consumer = if config.telegram.is_configured() {
-        info!("텔레그램 알림 활성화");
-        let telegram_client = Arc::new(
-            arb_poc::telegram::TelegramClient::new(&config.telegram)
-                .map_err(|e| format!("Telegram 클라이언트 생성 실패: {e}"))?,
-        );
-
-        let alert_repo = arb_poc::db::alerts::AlertRepository::new(db_pool.inner().clone());
-
-        // 텔레그램 전송 클로저
-        let tg = Arc::clone(&telegram_client);
-        let telegram_send_fn = move |msg: String| -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
-        > {
-            let tg = Arc::clone(&tg);
-            Box::pin(async move {
-                tg.send_message(&msg).await.map_err(|e| e.to_string())?;
-                Ok(())
-            })
-        };
-
-        // DB fallback 클로저
-        let db_alert_fn = move |sid: i64,
-                                level: &str,
-                                event_type: &str,
-                                message: &str,
-                                payload: Option<String>|
-              -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
-        > {
-            let repo = alert_repo.clone();
-            let record = arb_poc::db::alerts::AlertRecord {
-                id: None,
-                session_id: sid,
-                level: level.to_string(),
-                event_type: event_type.to_string(),
-                message: message.to_string(),
-                payload_json: payload,
-                created_at: chrono::Utc::now(),
-            };
-            Box::pin(async move {
-                repo.insert_alert(&record)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                Ok(())
-            })
-        };
-
-        let (_alert_service, consumer) = arb_poc::strategy::zscore::alert::AlertService::new(
-            session_id,
-            telegram_send_fn,
-            db_alert_fn,
-        );
-        info!("AlertService 생성 완료 (텔레그램 + DB fallback)");
-        Some(consumer)
-    } else {
-        info!("텔레그램 미설정 — AlertService 비활성화");
-        None
-    };
+    let strategy_config_arc = Arc::new(strategy_config);
 
     // ---------------------------------------------------------------
     // 7. DbWriter + BalanceRecorderTask 생성
     // ---------------------------------------------------------------
-    let strategy_config_arc = Arc::new(strategy_config);
 
     // DbWriter 생성 (background DB write 파이프라인)
     let db_writer_session_repo = SessionRepository::new(db_pool.inner().clone());
@@ -395,6 +334,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db_writer_balance_repo,
     );
     info!("DbWriter 생성 완료");
+
+    // ---------------------------------------------------------------
+    // 7-1. AlertService 생성 (DB always-write + Telegram best-effort)
+    // ---------------------------------------------------------------
+    let telegram_send_fn: TelegramSendFn = if config.telegram.is_configured() {
+        info!("텔레그램 알림 활성화");
+        let telegram_client = Arc::new(
+            arb_poc::telegram::TelegramClient::new(&config.telegram)
+                .map_err(|e| format!("Telegram 클라이언트 생성 실패: {e}"))?,
+        );
+        let tg = Arc::clone(&telegram_client);
+        Box::new(move |msg: String| {
+            let tg = Arc::clone(&tg);
+            Box::pin(async move {
+                tg.send_message(&msg).await.map_err(|e| e.to_string())?;
+                Ok(())
+            })
+        })
+    } else {
+        info!("텔레그램 미설정 — DB 전용 알림 모드");
+        Box::new(|_msg: String| Box::pin(async { Ok(()) }))
+    };
+
+    let alert_db_writer = db_writer.clone();
+    let db_alert_fn: DbAlertFn = Box::new(
+        move |sid: i64, level: &str, event_type: &str, message: &str, payload: Option<String>| {
+            let writer = alert_db_writer.clone();
+            let record = arb_poc::db::alerts::AlertRecord {
+                id: None,
+                session_id: sid,
+                level: level.to_string(),
+                event_type: event_type.to_string(),
+                message: message.to_string(),
+                payload_json: payload,
+                created_at: chrono::Utc::now(),
+            };
+            Box::pin(async move {
+                writer.send(DbWriteRequest::InsertAlert(record));
+                Ok(())
+            })
+        },
+    );
+
+    let (alert_service, alert_consumer): (AlertService, AlertConsumer) =
+        AlertService::new(session_id, telegram_send_fn, db_alert_fn);
+    info!("AlertService 생성 완료 (DB always-write + Telegram best-effort)");
 
     // ForexCache 생성 (USD/KRW 공시 환율)
     let forex_cache = Arc::new(ForexCache::new(Duration::from_secs(600)));
@@ -457,6 +442,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&risk_manager),
         Arc::clone(&position_store_arc),
         session_id,
+        Some(db_writer.clone()),
+        Some(alert_service.clone()),
         Some(snapshot_sender.clone()),
     );
 
@@ -466,6 +453,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 9. ZScoreMonitor 생성
     // ---------------------------------------------------------------
     let config_for_monitor = (*strategy_config_arc).clone();
+    let bybit_for_funding = bybit.clone();
 
     let monitor = ZScoreMonitor::new(upbit, bybit, config_for_monitor, forex_cache, policy);
 
@@ -497,6 +485,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ---------------------------------------------------------------
+    // 10-1. funding_schedules 갱신 task
+    // ---------------------------------------------------------------
+    let cancel_funding = cancel_token.clone();
+    let funding_writer = db_writer.clone();
+    let funding_coins = strategy_config_arc.coins.clone();
+    let funding_auto_select = strategy_config_arc.auto_select;
+    let funding_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                _ = cancel_funding.cancelled() => break,
+                _ = interval.tick() => {
+                    match bybit_for_funding.get_tickers_linear(None).await {
+                        Ok(tickers) => {
+                            for ticker in tickers {
+                                let Some(coin) = ticker.symbol.strip_suffix("USDT") else {
+                                    continue;
+                                };
+                                if !funding_auto_select && !funding_coins.iter().any(|c| c == coin) {
+                                    continue;
+                                }
+
+                                if ticker.next_funding_time <= 0 {
+                                    warn!(
+                                        symbol = ticker.symbol.as_str(),
+                                        next_funding_time = ticker.next_funding_time,
+                                        "next_funding_time 비정상, funding upsert 스킵"
+                                    );
+                                    continue;
+                                }
+
+                                let Some(next_funding_time) =
+                                    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                                        ticker.next_funding_time,
+                                    )
+                                else {
+                                    warn!(
+                                        symbol = ticker.symbol.as_str(),
+                                        next_funding_time = ticker.next_funding_time,
+                                        "next_funding_time 파싱 실패, funding upsert 스킵"
+                                    );
+                                    continue;
+                                };
+
+                                if ticker.funding_rate == 0.0 {
+                                    debug!(
+                                        symbol = ticker.symbol.as_str(),
+                                        "funding_rate=0.0 (누락 fallback 가능)"
+                                    );
+                                }
+
+                                funding_writer.send(DbWriteRequest::UpsertFunding(
+                                    FundingScheduleRecord {
+                                        id: None,
+                                        coin: coin.to_string(),
+                                        interval_hours: 8,
+                                        next_funding_time,
+                                        current_rate: ticker.funding_rate,
+                                    },
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Bybit funding ticker 조회 실패");
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // ---------------------------------------------------------------
     // 11. 세션 heartbeat task
     // ---------------------------------------------------------------
     let session_repo_hb = SessionRepository::new(db_pool.inner().clone());
@@ -521,16 +581,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---------------------------------------------------------------
     info!("=== 실시간 모니터링 시작 (라이브 모드) ===");
 
-    let trades: Vec<ClosedPosition> = match monitor.run(cancel_token).await {
+    let trades: Vec<ClosedPosition> = match monitor.run(cancel_token.clone()).await {
         Ok(t) => t,
         Err(e) => {
             error!(error = %e, "모니터링 실행 실패");
+            cancel_token.cancel();
             // 세션 상태 Errored로 업데이트
             let _ = session_repo.end_session(session_id, "Errored").await;
             let err: Box<dyn std::error::Error> = Box::new(e);
             return Err(err);
         }
     };
+    cancel_token.cancel();
 
     // ---------------------------------------------------------------
     // 13. BalanceRecorderTask 종료
@@ -541,6 +603,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(Ok(())) => info!("BalanceRecorderTask 정상 종료"),
         Ok(Err(e)) => warn!(error = %e, "BalanceRecorderTask 종료 에러"),
         Err(_) => warn!("BalanceRecorderTask 종료 타임아웃 (60초), task 포기"),
+    }
+
+    // funding_schedules task 종료 대기
+    match tokio::time::timeout(Duration::from_secs(10), funding_task).await {
+        Ok(Ok(())) => info!("funding_schedules task 정상 종료"),
+        Ok(Err(e)) => warn!(error = %e, "funding_schedules task 종료 에러"),
+        Err(_) => warn!("funding_schedules task 종료 타임아웃 (10초)"),
     }
 
     // ---------------------------------------------------------------
@@ -573,10 +642,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // AlertService consumer 종료 대기
-    if let Some(consumer) = alert_consumer {
-        info!("AlertService consumer 종료 대기...");
-        consumer.shutdown().await;
-    }
+    info!("AlertService consumer 종료 대기...");
+    alert_consumer.shutdown().await;
 
     info!(
         session_id = session_id,
