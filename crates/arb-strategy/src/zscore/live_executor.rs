@@ -16,7 +16,9 @@ use arb_exchange::{
 };
 
 use crate::zscore::config::ZScoreConfig;
-use crate::zscore::instrument::InstrumentInfo;
+use crate::zscore::instrument::{
+    InstrumentInfo, ceil_to_step, round_price_conservative, upbit_tick_size,
+};
 
 // ---------------------------------------------------------------------------
 // 요청/응답 타입
@@ -270,15 +272,22 @@ where
         let coin = &request.coin;
         let qty = request.qty;
 
-        // Upbit KRW 가격 (슬리피지 마진 적용: 매수이므로 상향)
+        // Upbit KRW 가격 (슬리피지 마진 적용 후, 호가 단위로 올림 정규화)
         let slippage_mul = Decimal::ONE
             + Decimal::try_from(self.config.max_slippage_pct / 100.0).unwrap_or(Decimal::ZERO);
-        let upbit_limit_price_krw = request.upbit_krw_price * slippage_mul;
+        let upbit_limit_price_raw = request.upbit_krw_price * slippage_mul;
+        let upbit_limit_tick = upbit_tick_size(upbit_limit_price_raw);
+        let upbit_limit_price_krw = ceil_to_step(upbit_limit_price_raw, upbit_limit_tick);
 
-        // Bybit USDT 가격 (슬리피지 마진 적용: 매도(short)이므로 하향)
-        let bybit_limit_price = request.bybit_usdt_price
+        // Bybit USDT 가격 (슬리피지 마진 적용 후, 선물 tick_size로 내림 정규화)
+        let bybit_limit_price_raw = request.bybit_usdt_price
             * (Decimal::ONE
                 - Decimal::try_from(self.config.max_slippage_pct / 100.0).unwrap_or(Decimal::ZERO));
+        let bybit_limit_price = round_price_conservative(
+            bybit_limit_price_raw,
+            request.instrument_info.tick_size,
+            false, // short(sell) 진입은 체결 우선으로 내림
+        );
 
         let upbit_market = format!("KRW-{}", coin);
         let bybit_symbol = format!("{}USDT", coin);
@@ -290,6 +299,14 @@ where
             bybit_limit_usdt = %bybit_limit_price,
             client_order_id = request.client_order_id.as_str(),
             "진입 주문 발주 시작"
+        );
+        debug!(
+            coin = coin.as_str(),
+            upbit_raw = %upbit_limit_price_raw,
+            upbit_tick = %upbit_limit_tick,
+            bybit_raw = %bybit_limit_price_raw,
+            bybit_tick = %request.instrument_info.tick_size,
+            "진입 가격 정규화 완료"
         );
 
         let order_timeout = Duration::from_secs(self.config.order_timeout_sec);
@@ -1501,6 +1518,64 @@ mod tests {
         let bybit_orders = bybit.order_history.lock().await;
         let bybit_price = bybit_orders[0].price.unwrap();
         assert!(bybit_price < Decimal::new(42000, 0));
+    }
+
+    #[tokio::test]
+    async fn test_execute_entry_slippage_price_is_tick_normalized() {
+        let upbit = Arc::new(MockUpbit::new(MockOrderResponse {
+            id: "u-tick".to_string(),
+            executed_volume: Decimal::new(1, 2),
+            avg_price: Some(Decimal::new(1620, 1)), // 162.0
+            paid_fee: Decimal::ZERO,
+            ..Default::default()
+        }));
+        let bybit = Arc::new(MockBybit::new(MockOrderResponse {
+            id: "b-tick".to_string(),
+            executed_volume: Decimal::new(1, 2),
+            avg_price: Some(Decimal::new(11069919, 8)),
+            paid_fee: Decimal::ZERO,
+            ..Default::default()
+        }));
+
+        let executor = LiveExecutor::new(upbit.clone(), bybit.clone(), make_config());
+
+        let req = EntryRequest {
+            coin: "DOGE".to_string(),
+            qty: Decimal::new(2256, 0),
+            upbit_krw_price: Decimal::new(162, 0),
+            bybit_usdt_price: Decimal::new(11069919, 8), // 0.11069919
+            usd_krw: 1440.64,
+            instrument_info: InstrumentInfo {
+                tick_size: Decimal::new(1, 5), // 0.00001
+                qty_step: Decimal::new(1, 3),
+                min_order_qty: Decimal::new(1, 3),
+                min_notional: Decimal::new(5, 0),
+                max_order_qty: Decimal::new(10_000_000, 0),
+            },
+            client_order_id: "test-uuid-tick-001".to_string(),
+        };
+
+        let _result = executor.execute_entry(&req).await;
+
+        let upbit_orders = upbit.order_history.lock().await;
+        assert_eq!(upbit_orders.len(), 1);
+        let upbit_sent_price = upbit_orders[0].price.expect("upbit limit price");
+        let upbit_raw = req.upbit_krw_price * Decimal::new(1001, 3); // +0.1%
+        assert_ne!(upbit_sent_price, upbit_raw);
+        assert_eq!(
+            upbit_sent_price % upbit_tick_size(upbit_sent_price),
+            Decimal::ZERO
+        );
+
+        let bybit_orders = bybit.order_history.lock().await;
+        assert_eq!(bybit_orders.len(), 1);
+        let bybit_sent_price = bybit_orders[0].price.expect("bybit limit price");
+        let bybit_raw = req.bybit_usdt_price * Decimal::new(999, 3); // -0.1%
+        assert_ne!(bybit_sent_price, bybit_raw);
+        assert_eq!(
+            bybit_sent_price % req.instrument_info.tick_size,
+            Decimal::ZERO
+        );
     }
 
     // =======================================================================
