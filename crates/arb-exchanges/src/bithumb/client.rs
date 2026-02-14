@@ -360,7 +360,7 @@ impl MarketData for BithumbClient {
         _count: u32,
         _before: DateTime<Utc>,
     ) -> ExchangeResult<Vec<Candle>> {
-        warn!("Bithumb get_candles_before 미구현: API 미지원");
+        warn!("Bithumb get_candles_before: API 미지원");
         Err(ExchangeError::InternalError(
             "get_candles_before not implemented for Bithumb".to_string(),
         ))
