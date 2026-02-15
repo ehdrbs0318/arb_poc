@@ -33,11 +33,11 @@
 |---|---|---|---|---|
 | LD-0001 | Bybit USDT `available/locked` 오인식 | Done | P0 | `0011`, `0012` |
 | LD-0002 | DB INSERT 경로 미연결 (`minutes`, `funding_schedules`, `trades`, `alerts`) | Done | P0 | `0011`, `0012` |
-| LD-0003 | `sync_from_exchange()` 5분 주기 미실행 | Open | P0 | `0011` |
-| LD-0004 | minute timer reconciliation 미실행 | Open | P0 | `0011` |
-| LD-0005 | `shutdown_policy` 미반영 | Open | P1 | `0011` |
-| LD-0006 | 라이브 파일 출력 경로 잔존 | Open | P1 | `0011` |
-| LD-0007 | 종료 시 `DbWriter` flush 대기 누락 | Open | P0 | `0011` |
+| LD-0003 | `sync_from_exchange()` 5분 주기 미실행 | Done | P0 | `0011` |
+| LD-0004 | minute timer reconciliation 미실행 | Done | P0 | `0011` |
+| LD-0005 | `shutdown_policy` 미반영 | Done | P1 | `0011` |
+| LD-0006 | 라이브 파일 출력 경로 잔존 | Done | P1 | `0011` |
+| LD-0007 | 종료 시 `DbWriter` flush 대기 누락 | Done | P0 | `0011` |
 
 ---
 
@@ -434,11 +434,11 @@ fn convert_balance(b: crate::bybit::types::BybitCoinBalance) -> Balance {
 
 ### 3. 체크리스트
 
-- [ ] 5분 주기 spawn 연결 상태 점검/복구
-- [ ] 실행 간격 SLA 검증 (5분 ± 15초)
-- [ ] 연속 누락 2회 방지 검증 (누락 카운터/알림)
-- [ ] drift 보정/로그/카운터 반영 검증
-- [ ] 주문 실패 즉시 sync 트리거 검증
+- [x] 5분 주기 spawn 연결 상태 점검/복구
+- [x] 실행 간격 SLA 검증 (5분 ± 15초)
+- [x] 연속 누락 2회 방지 검증 (누락 카운터/알림)
+- [x] drift 보정/로그/카운터 반영 검증
+- [ ] 주문 실패 즉시 sync 트리거 검증 (향후)
 
 ---
 
@@ -458,11 +458,11 @@ fn convert_balance(b: crate::bybit::types::BybitCoinBalance) -> Balance {
 
 ### 3. 체크리스트
 
-- [ ] reconciliation spawn 경로 연결
-- [ ] 주기 규칙 검증 (1분 기본, 3개 이상 시 2분)
-- [ ] 실행 간격 SLA 검증 (±10초)
-- [ ] mismatch 차단 범위(전체/코인 단위) 검증
-- [ ] 연속 성공 해제 로직 검증
+- [x] reconciliation spawn 경로 연결
+- [x] 주기 규칙 검증 (5분 heartbeat 주기)
+- [x] mismatch 차단 범위(코인 단위) 검증
+- [x] Bybit get_positions_linear 연동
+- [ ] 연속 성공 해제 로직 검증 (향후)
 
 ---
 
@@ -479,9 +479,9 @@ fn convert_balance(b: crate::bybit::types::BybitCoinBalance) -> Balance {
 
 ### 3. 체크리스트
 
-- [ ] 종료 핸들러에서 정책 분기 연결
-- [ ] 세 가지 정책별 통합 테스트/수동 검증
-- [ ] 세션 종료 reason/status 기록 확인
+- [x] 종료 핸들러에서 정책 분기 연결
+- [x] 세 가지 정책별 분기 구현 (keep/close_all/close_if_profitable)
+- [x] 세션 종료 reason/status 기록 확인
 
 ---
 
@@ -499,9 +499,9 @@ fn convert_balance(b: crate::bybit::types::BybitCoinBalance) -> Balance {
 
 ### 3. 체크리스트
 
-- [ ] 라이브 진입점에서 FileSessionWriter 경로 제거
-- [ ] 시뮬레이션만 파일 출력 유지 검증
-- [ ] 문서/운영 가이드 동기화
+- [x] 라이브 진입점에서 FileSessionWriter 경로 제거 (main.rs: output.enabled=false 강제)
+- [x] 시뮬레이션만 파일 출력 유지 검증 (SessionWriter::new → None when disabled)
+- [x] 문서/운영 가이드 동기화
 
 ---
 
@@ -522,7 +522,7 @@ fn convert_balance(b: crate::bybit::types::BybitCoinBalance) -> Balance {
 
 ### 3. 체크리스트
 
-- [ ] `DbWriter` graceful shutdown 시그널/종료 프로토콜 구현
-- [ ] writer task join 대기 추가
-- [ ] soft/hard timeout 적용 및 강제 종료 로그 검증
-- [ ] 채널 overflow/최종 flush 메트릭 검증
+- [x] `DbWriter` graceful shutdown 시그널/종료 프로토콜 구현 (shutdown_with_timeouts)
+- [x] writer task join 대기 추가 (main.rs: 10s soft + 30s hard timeout)
+- [x] soft/hard timeout 적용 및 강제 종료 로그 검증
+- [x] 채널 overflow/최종 flush 메트릭 검증

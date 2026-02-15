@@ -213,6 +213,34 @@ pub trait ExecutionPolicy: Send + Sync + 'static {
     /// SimPolicy: OnceLock으로 내부 상태 설정.
     /// LivePolicy: 자체 인프라를 사용하므로 기본 구현 (no-op).
     fn bind_shared_resources(&self, _resources: SharedResources) {}
+
+    /// 5분 주기 잔고 동기화 (LD-0003).
+    ///
+    /// 거래소 실잔고를 조회하여 BalanceTracker의 기대값과 비교합니다.
+    /// drift 임계치(5%) 초과 시 warn + 보정.
+    /// in_flight 예약이 있으면 스킵합니다.
+    fn on_balance_sync(&self) -> impl Future<Output = ()> + Send {
+        async {}
+    }
+
+    /// 분 주기 포지션 reconciliation (LD-0004).
+    ///
+    /// 메모리 포지션과 거래소 실포지션을 비교합니다.
+    /// 불일치 시 진입 차단 + 알림.
+    /// `open_count`가 0이면 스킵합니다.
+    fn on_reconciliation(&self) -> impl Future<Output = ()> + Send {
+        async {}
+    }
+
+    /// Graceful shutdown 정책 실행 (LD-0005).
+    ///
+    /// SIGINT/SIGTERM 수신 후 `shutdown_policy` config에 따라 동작합니다.
+    /// - "keep": 포지션 유지 (no-op)
+    /// - "close_all": 전체 포지션 청산
+    /// - "close_if_profitable": 수익 포지션만 청산
+    fn on_shutdown(&self) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 #[cfg(test)]

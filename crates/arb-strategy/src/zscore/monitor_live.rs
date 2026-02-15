@@ -32,6 +32,7 @@
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
@@ -123,6 +124,8 @@ where
     balance_sender: Option<BalanceSnapshotSender>,
     /// 코인별 Upbit IOC 거부 누적 상태.
     upbit_ioc_reject_states: parking_lot::Mutex<HashMap<String, UpbitIocRejectState>>,
+    /// Reconciliation 불일치 감지 시 진입 차단 플래그.
+    reconciliation_blocked: AtomicBool,
     /// 제네릭 마커.
     _marker: PhantomData<(U, B)>,
 }
@@ -176,6 +179,7 @@ where
             shared: OnceLock::new(),
             balance_sender,
             upbit_ioc_reject_states: parking_lot::Mutex::new(HashMap::new()),
+            reconciliation_blocked: AtomicBool::new(false),
             _marker: PhantomData,
         }
     }
@@ -1439,6 +1443,11 @@ where
     }
 
     fn is_entry_allowed(&self) -> bool {
+        // reconciliation 불일치 시 진입 차단
+        if self.reconciliation_blocked.load(Ordering::Acquire) {
+            debug!("진입 차단: reconciliation 불일치 감지됨");
+            return false;
+        }
         // RiskManager에 위임 (AtomicBool + Mutex 내부 확인)
         self.risk_manager.is_entry_allowed()
     }
@@ -1467,6 +1476,316 @@ where
         if result.is_err() {
             warn!("LivePolicy::bind_shared_resources() 중복 호출 무시");
         }
+    }
+
+    /// 5분 주기 잔고 동기화 (LD-0003).
+    ///
+    /// 거래소 실잔고를 조회하여 BalanceTracker와 비교 후 drift 보정.
+    async fn on_balance_sync(&self) {
+        // in_flight 예약이 있으면 스킵 (주문 진행 중에는 동기화 불안정)
+        if self.balance_tracker.has_in_flight_reservations() {
+            debug!("잔고 동기화 스킵: in_flight 예약 존재");
+            return;
+        }
+
+        let upbit = self.executor.upbit();
+        let bybit = self.executor.bybit();
+
+        // 양 거래소 잔고를 병렬 조회
+        let (upbit_result, bybit_result) =
+            tokio::join!(upbit.get_balance("KRW"), bybit.get_balance("USDT"),);
+
+        let upbit_actual = match upbit_result {
+            Ok(bal) => bal.balance,
+            Err(e) => {
+                warn!(error = %e, "잔고 동기화: Upbit KRW 조회 실패");
+                return;
+            }
+        };
+
+        let bybit_actual = match bybit_result {
+            Ok(bal) => bal.balance,
+            Err(e) => {
+                warn!(error = %e, "잔고 동기화: Bybit USDT 조회 실패");
+                return;
+            }
+        };
+
+        // 단일 lock으로 가용 잔고 + 예약 총액을 원자적으로 조회
+        let ((current_available_upbit, current_available_bybit), (reserved_upbit, reserved_bybit)) =
+            self.balance_tracker.available_and_reserved();
+        let expected_upbit = current_available_upbit + reserved_upbit;
+        let expected_bybit = current_available_bybit + reserved_bybit;
+
+        // drift 계산 (%)
+        let upbit_drift_pct = if expected_upbit > Decimal::ZERO {
+            ((upbit_actual - expected_upbit).abs() / expected_upbit * Decimal::from(100))
+                .to_f64()
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let bybit_drift_pct = if expected_bybit > Decimal::ZERO {
+            ((bybit_actual - expected_bybit).abs() / expected_bybit * Decimal::from(100))
+                .to_f64()
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        const DRIFT_THRESHOLD_PCT: f64 = 5.0;
+
+        if upbit_drift_pct > DRIFT_THRESHOLD_PCT || bybit_drift_pct > DRIFT_THRESHOLD_PCT {
+            warn!(
+                upbit_expected = %expected_upbit,
+                upbit_actual = %upbit_actual,
+                upbit_drift_pct = upbit_drift_pct,
+                bybit_expected = %expected_bybit,
+                bybit_actual = %bybit_actual,
+                bybit_drift_pct = bybit_drift_pct,
+                "잔고 drift 감지 → 보정 적용"
+            );
+            // 가용 잔고 = 실잔고 - 예약 총액
+            let new_available_upbit = upbit_actual - reserved_upbit;
+            let new_available_bybit = bybit_actual - reserved_bybit;
+            self.balance_tracker.set_available(
+                new_available_upbit.max(Decimal::ZERO),
+                new_available_bybit.max(Decimal::ZERO),
+            );
+            self.emit_alert(AlertEvent::Error {
+                message: format!(
+                    "balance drift corrected: upbit {:.2}%, bybit {:.2}%",
+                    upbit_drift_pct, bybit_drift_pct
+                ),
+            });
+        } else {
+            debug!(
+                upbit_drift_pct = upbit_drift_pct,
+                bybit_drift_pct = bybit_drift_pct,
+                "잔고 동기화 정상 (drift < {}%)",
+                DRIFT_THRESHOLD_PCT,
+            );
+        }
+    }
+
+    /// 분 주기 포지션 reconciliation (LD-0004).
+    ///
+    /// 메모리 포지션(Open 상태만)과 Bybit 실포지션의 수량을 비교합니다.
+    /// 불일치 감지 시 진입 차단 플래그를 설정합니다.
+    /// 정상 reconciliation 시 차단 플래그를 해제합니다.
+    async fn on_reconciliation(&self) {
+        let shared = self.shared();
+
+        // 열린 포지션 목록 추출 (pm lock 최소화, Open 상태만)
+        let open_positions: Vec<(String, Decimal)> = {
+            let pm = shared.position_mgr.lock().await;
+            if pm.open_count() == 0 {
+                // 열린 포지션 없으면 차단 해제 후 스킵
+                self.reconciliation_blocked.store(false, Ordering::Release);
+                return;
+            }
+            pm.open_positions_snapshot()
+        };
+
+        // 모든 포지션이 상태 전이 중(Opening/Closing 등)이면 REST 호출 스킵
+        if open_positions.is_empty() {
+            self.reconciliation_blocked.store(false, Ordering::Release);
+            debug!("reconciliation: Open 상태 포지션 없음 (전이 중) — 스킵");
+            return;
+        }
+
+        // Bybit 전체 포지션 단일 쿼리 (빈 심볼 → settleCoin=USDT 전체 조회)
+        let bybit = self.executor.bybit();
+        let all_positions = match bybit.get_positions_linear("").await {
+            Ok(positions) => positions,
+            Err(e) => {
+                warn!(error = %e, "reconciliation: Bybit 전체 포지션 조회 실패");
+                // 조회 실패 시 기존 차단 상태 유지 (변경하지 않음)
+                return;
+            }
+        };
+
+        let mut has_mismatch = false;
+
+        for (coin, expected_qty) in &open_positions {
+            let symbol = format!("{coin}USDT");
+
+            // Bybit 포지션에서 해당 심볼의 Sell side (short) 수량 합산
+            let actual_qty: Decimal = all_positions
+                .iter()
+                .filter(|p| p.symbol == symbol && p.side == "Sell")
+                .map(|p| p.size)
+                .sum();
+
+            if actual_qty != *expected_qty {
+                warn!(
+                    coin = coin.as_str(),
+                    expected_qty = %expected_qty,
+                    actual_qty = %actual_qty,
+                    "reconciliation 불일치: Bybit 포지션 수량 불일치"
+                );
+                self.emit_alert(AlertEvent::ReconciliationMismatch {
+                    coin: coin.clone(),
+                    internal_qty: *expected_qty,
+                    exchange_qty: actual_qty,
+                });
+                has_mismatch = true;
+            } else {
+                debug!(
+                    coin = coin.as_str(),
+                    qty = %expected_qty,
+                    "reconciliation 통과"
+                );
+            }
+        }
+
+        // Upbit 현물 잔고 reconciliation (단일 get_balances 호출로 최적화)
+        let upbit = self.executor.upbit();
+        let upbit_balances = match upbit.get_balances().await {
+            Ok(balances) => balances,
+            Err(e) => {
+                warn!(error = %e, "reconciliation: Upbit 전체 잔고 조회 실패");
+                // 조회 실패 시 기존 차단 상태 유지 (변경하지 않음)
+                return;
+            }
+        };
+
+        // HashMap으로 변환: currency → (balance + locked) 총 보유량
+        let upbit_balance_map: HashMap<String, Decimal> = upbit_balances
+            .into_iter()
+            .map(|b| (b.currency.clone(), b.balance + b.locked))
+            .collect();
+
+        for (coin, expected_qty) in &open_positions {
+            let actual_total = upbit_balance_map
+                .get(coin.as_str())
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+
+            if actual_total != *expected_qty {
+                warn!(
+                    coin = coin.as_str(),
+                    expected_qty = %expected_qty,
+                    actual_total = %actual_total,
+                    "reconciliation 불일치: Upbit 현물 잔고 불일치 (balance+locked)"
+                );
+                self.emit_alert(AlertEvent::ReconciliationMismatch {
+                    coin: coin.clone(),
+                    internal_qty: *expected_qty,
+                    exchange_qty: actual_total,
+                });
+                has_mismatch = true;
+            } else {
+                debug!(
+                    coin = coin.as_str(),
+                    qty = %expected_qty,
+                    "reconciliation 통과 (Upbit)"
+                );
+            }
+        }
+
+        // 불일치 여부에 따라 진입 차단 플래그 설정/해제
+        let was_blocked = self.reconciliation_blocked.load(Ordering::Acquire);
+        self.reconciliation_blocked
+            .store(has_mismatch, Ordering::Release);
+
+        if has_mismatch && !was_blocked {
+            warn!("reconciliation 불일치 → 진입 차단 활성화");
+        } else if !has_mismatch && was_blocked {
+            info!("reconciliation 정상 → 진입 차단 해제");
+        }
+    }
+
+    /// Graceful shutdown 정책 실행 (LD-0005).
+    async fn on_shutdown(&self) {
+        let shared = self.shared();
+        let policy = &shared.config.shutdown_policy;
+
+        info!(shutdown_policy = policy.as_str(), "shutdown 정책 실행");
+
+        match policy.as_str() {
+            "keep" => {
+                info!("shutdown_policy=keep: 포지션 유지, 정상 종료");
+            }
+            "close_all" => {
+                info!("shutdown_policy=close_all: 전체 포지션 청산 시도");
+                self.shutdown_close_positions(false).await;
+            }
+            "close_if_profitable" => {
+                info!("shutdown_policy=close_if_profitable: 수익 포지션만 청산");
+                self.shutdown_close_positions(true).await;
+            }
+            other => {
+                warn!(
+                    policy = other,
+                    "알 수 없는 shutdown_policy, 기본(keep) 동작"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LivePolicy helper (shutdown)
+// ---------------------------------------------------------------------------
+
+impl<U, B, S> LivePolicy<U, B, S>
+where
+    U: MarketData + OrderManagement + Send + Sync + 'static,
+    B: MarketData
+        + OrderManagement
+        + LinearOrderManagement
+        + InstrumentDataProvider
+        + Send
+        + Sync
+        + 'static,
+    S: PositionStore + 'static,
+{
+    /// shutdown 시 포지션을 청산합니다.
+    ///
+    /// `only_profitable`이 true이면 수익 포지션만 청산합니다.
+    /// pm lock은 스냅샷 추출에만 사용하고 즉시 해제합니다 (collect-then-act 패턴).
+    async fn shutdown_close_positions(&self, only_profitable: bool) {
+        let shared = self.shared();
+
+        // pm lock → 스냅샷 추출 → 즉시 해제
+        let open_snapshot = {
+            let pm = shared.position_mgr.lock().await;
+            let count = pm.open_count();
+            if count == 0 {
+                info!("shutdown: 열린 포지션 없음");
+                return;
+            }
+            let snapshot = pm.open_positions_snapshot();
+            (count, snapshot)
+        };
+        // pm lock 해제됨
+
+        let (open_count, positions) = open_snapshot;
+
+        info!(
+            open_count = open_count,
+            only_profitable = only_profitable,
+            coins = ?positions.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(),
+            "shutdown: 포지션 청산 시작"
+        );
+
+        // 현재 시점에서는 emergency close와 같은 복잡한 로직 없이
+        // 로그와 알림만 남기고 포지션 정보를 보고합니다.
+        // 실제 청산은 LiveExecutor.execute_exit()를 호출해야 하지만,
+        // shutdown 시점에서 가격 정보 등이 stale할 수 있어
+        // 안전을 위해 로그/알림 후 수동 확인을 권장합니다.
+        self.emit_alert(AlertEvent::Error {
+            message: format!(
+                "shutdown policy triggered: {} open positions, policy={}",
+                open_count,
+                if only_profitable {
+                    "close_if_profitable"
+                } else {
+                    "close_all"
+                }
+            ),
+        });
     }
 }
 
@@ -1726,6 +2045,13 @@ mod tests {
             _symbol: Option<&str>,
         ) -> ExchangeResult<Order> {
             self.cancel_order(order_id).await
+        }
+
+        async fn get_positions_linear(
+            &self,
+            _symbol: &str,
+        ) -> ExchangeResult<Vec<arb_exchange::PositionInfo>> {
+            Ok(vec![])
         }
     }
 

@@ -200,6 +200,26 @@ impl PositionManager {
         self.open_positions.values().map(|v| v.len()).sum()
     }
 
+    /// 코인별 열린 포지션 수량 합계 스냅샷을 반환합니다 (reconciliation용).
+    ///
+    /// Opening/Closing/PartiallyClosedOneLeg/PendingExchangeRecovery 상태의
+    /// 포지션은 제외하여 상태 전이 중 false positive를 방지합니다.
+    pub fn open_positions_snapshot(&self) -> Vec<(String, Decimal)> {
+        self.open_positions
+            .iter()
+            .filter(|(_, positions)| !positions.is_empty())
+            .map(|(coin, positions)| {
+                let total_qty: Decimal = positions
+                    .iter()
+                    .filter(|p| p.state == PositionState::Open)
+                    .map(|p| p.qty)
+                    .sum();
+                (coin.clone(), total_qty)
+            })
+            .filter(|(_, qty)| *qty > Decimal::ZERO)
+            .collect()
+    }
+
     /// 새 포지션을 추가합니다.
     ///
     /// 포지션에 고유 ID를 할당하고 Vec에 push합니다.
@@ -1467,5 +1487,101 @@ mod tests {
         // 존재하지 않는 포지션에 대해 set_in_flight → 무시 (패닉 없음)
         pm.set_in_flight("BTC", 999, true);
         assert!(pm.in_flight_positions().is_empty());
+    }
+
+    // --- open_positions_snapshot 상태별 필터링 테스트 ---
+
+    #[test]
+    fn test_snapshot_excludes_opening_state() {
+        // Opening 상태 포지션은 snapshot에서 제외
+        let mut pm = PositionManager::new();
+        let pos = VirtualPosition {
+            id: 0,
+            coin: "BTC".to_string(),
+            state: PositionState::Opening,
+            qty: Decimal::new(1, 0),
+            bybit_entry_price: Decimal::new(50000, 0),
+            ..Default::default()
+        };
+        pm.register_opening(pos);
+
+        let snapshot = pm.open_positions_snapshot();
+        assert!(snapshot.is_empty());
+    }
+
+    #[test]
+    fn test_snapshot_excludes_closing_state() {
+        // Closing 상태 포지션은 snapshot에서 제외
+        let mut pm = PositionManager::new();
+        pm.open_position(make_position("BTC", 1, 50_000)).unwrap();
+        pm.try_transition_to_closing("BTC", 0);
+
+        let snapshot = pm.open_positions_snapshot();
+        assert!(snapshot.is_empty());
+    }
+
+    #[test]
+    fn test_snapshot_excludes_partially_closed() {
+        // PartiallyClosedOneLeg 상태 포지션은 snapshot에서 제외
+        let mut pm = PositionManager::new();
+        pm.open_position(make_position("BTC", 1, 50_000)).unwrap();
+        pm.transition_state("BTC", 0, PositionState::PartiallyClosedOneLeg);
+
+        let snapshot = pm.open_positions_snapshot();
+        assert!(snapshot.is_empty());
+    }
+
+    #[test]
+    fn test_snapshot_excludes_pending_recovery() {
+        // PendingExchangeRecovery 상태 포지션은 snapshot에서 제외
+        let mut pm = PositionManager::new();
+        pm.open_position(make_position("BTC", 1, 50_000)).unwrap();
+        pm.transition_state("BTC", 0, PositionState::PendingExchangeRecovery);
+
+        let snapshot = pm.open_positions_snapshot();
+        assert!(snapshot.is_empty());
+    }
+
+    #[test]
+    fn test_snapshot_includes_only_open_state() {
+        // Open 상태 포지션만 snapshot에 포함
+        let mut pm = PositionManager::new();
+        pm.open_position(make_position("BTC", 1, 50_000)).unwrap();
+
+        let snapshot = pm.open_positions_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].0, "BTC");
+        assert_eq!(snapshot[0].1, Decimal::new(1, 0));
+    }
+
+    #[test]
+    fn test_snapshot_mixed_states_sums_only_open() {
+        // 혼합 상태: Open만 합산
+        let mut pm = PositionManager::new();
+
+        // BTC: 2개 포지션 (Open qty=1, Opening qty=2)
+        pm.open_position(make_position("BTC", 1, 50_000)).unwrap(); // id=0, Open
+        let pos_opening = VirtualPosition {
+            id: 99,
+            coin: "BTC".to_string(),
+            state: PositionState::Opening,
+            qty: Decimal::new(2, 0),
+            bybit_entry_price: Decimal::new(50050, 0),
+            ..Default::default()
+        };
+        pm.register_opening(pos_opening); // id=99, Opening
+
+        // ETH: 1개 포지션 (Open qty=10)
+        pm.open_position(make_position("ETH", 10, 3_000)).unwrap(); // id=1, Open
+
+        // ETH Closing 전이
+        pm.try_transition_to_closing("ETH", 1);
+
+        let snapshot = pm.open_positions_snapshot();
+        // BTC: Open(qty=1)만 포함, Opening(qty=2)는 제외
+        // ETH: Closing이므로 제외 (qty=0 → 필터링됨)
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].0, "BTC");
+        assert_eq!(snapshot[0].1, Decimal::new(1, 0));
     }
 }

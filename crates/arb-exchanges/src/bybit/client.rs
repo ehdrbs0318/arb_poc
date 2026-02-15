@@ -749,6 +749,10 @@ impl arb_exchange::LinearOrderManagement for BybitClient {
     ) -> ExchangeResult<Order> {
         self.cancel_order_linear_impl(order_id, symbol).await
     }
+
+    async fn get_positions_linear(&self, symbol: &str) -> ExchangeResult<Vec<PositionInfo>> {
+        self.get_positions(symbol).await
+    }
 }
 
 /// Bybit 선물(linear) 전용 API 메서드.
@@ -983,9 +987,15 @@ impl BybitClient {
     ///
     /// # 인자
     ///
-    /// * `symbol` - 심볼 (예: "BTCUSDT")
+    /// * `symbol` - 심볼 (예: "BTCUSDT"). 빈 문자열이면 USDT 결제 전체 포지션을 조회합니다.
     pub async fn get_positions(&self, symbol: &str) -> ExchangeResult<Vec<PositionInfo>> {
-        let params = [("category", "linear"), ("symbol", symbol)];
+        // 빈 심볼이면 symbol 파라미터를 생략하고 settleCoin으로 전체 조회
+        let mut params: Vec<(&str, &str)> = vec![("category", "linear")];
+        if !symbol.is_empty() {
+            params.push(("symbol", symbol));
+        } else {
+            params.push(("settleCoin", "USDT"));
+        }
 
         debug!(symbol, "Bybit 포지션 조회 요청");
 

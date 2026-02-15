@@ -251,6 +251,16 @@ where
         + Sync
         + 'static,
 {
+    /// Upbit 클라이언트 참조를 반환합니다 (잔고 조회 등).
+    pub fn upbit(&self) -> &Arc<U> {
+        &self.upbit
+    }
+
+    /// Bybit 클라이언트 참조를 반환합니다 (잔고/포지션 조회 등).
+    pub fn bybit(&self) -> &Arc<B> {
+        &self.bybit
+    }
+
     /// 새 LiveExecutor를 생성합니다.
     pub fn new(upbit: Arc<U>, bybit: Arc<B>, config: Arc<ZScoreConfig>) -> Self {
         Self {
@@ -1191,6 +1201,13 @@ mod tests {
             _symbol: Option<&str>,
         ) -> ExchangeResult<Order> {
             self.cancel_order(order_id).await
+        }
+
+        async fn get_positions_linear(
+            &self,
+            _symbol: &str,
+        ) -> ExchangeResult<Vec<arb_exchange::PositionInfo>> {
+            Ok(vec![])
         }
     }
 

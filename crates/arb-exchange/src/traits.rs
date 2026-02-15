@@ -4,7 +4,8 @@
 
 use crate::error::ExchangeResult;
 use crate::types::{
-    Balance, Candle, CandleInterval, InstrumentInfoResponse, Order, OrderBook, OrderRequest, Ticker,
+    Balance, Candle, CandleInterval, InstrumentInfoResponse, Order, OrderBook, OrderRequest,
+    PositionInfo, Ticker,
 };
 use chrono::{DateTime, Utc};
 use std::future::Future;
@@ -193,6 +194,16 @@ pub trait LinearOrderManagement: Send + Sync {
         order_id: &str,
         symbol: Option<&str>,
     ) -> impl Future<Output = ExchangeResult<Order>> + Send;
+
+    /// 선물 포지션을 조회합니다.
+    ///
+    /// # 인자
+    ///
+    /// * `symbol` - 심볼 (예: "BTCUSDT")
+    fn get_positions_linear(
+        &self,
+        symbol: &str,
+    ) -> impl Future<Output = ExchangeResult<Vec<PositionInfo>>> + Send;
 }
 
 /// 거래 규격(instrument info) 조회 trait.

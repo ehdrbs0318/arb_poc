@@ -408,6 +408,21 @@ impl BalanceTracker {
     /// 현재 예약 총액을 반환합니다.
     pub fn reserved_total(&self) -> (Decimal, Decimal) {
         let state = self.inner.lock();
+        Self::calc_reserved(&state)
+    }
+
+    /// 가용 잔고 + 예약 총액을 단일 lock으로 원자적으로 반환합니다.
+    ///
+    /// `on_balance_sync`에서 사용: 두 값의 일관성이 보장됩니다.
+    pub fn available_and_reserved(&self) -> ((Decimal, Decimal), (Decimal, Decimal)) {
+        let state = self.inner.lock();
+        let available = (state.upbit_available_krw, state.bybit_available_usdt);
+        let reserved = Self::calc_reserved(&state);
+        (available, reserved)
+    }
+
+    /// 예약 총액 계산 (내부 헬퍼, lock 없음).
+    fn calc_reserved(state: &BalanceState) -> (Decimal, Decimal) {
         let upbit_reserved: Decimal = state
             .reservations
             .iter()
@@ -690,5 +705,38 @@ mod tests {
 
         bt.commit(&mut t2, Decimal::from(100_000), Decimal::from(50));
         assert_eq!(bt.active_reservation_count(), 1);
+    }
+
+    #[test]
+    fn test_available_and_reserved_single_lock_consistency() {
+        // available_and_reserved()가 단일 lock으로 일관된 스냅샷을 반환하는지 확인
+        let bt = BalanceTracker::new(Decimal::from(1_000_000), Decimal::from(500));
+
+        // 예약 전: 가용=초기값, 예약=0
+        let ((avail_upbit, avail_bybit), (reserved_upbit, reserved_bybit)) =
+            bt.available_and_reserved();
+        assert_eq!(avail_upbit, Decimal::from(1_000_000));
+        assert_eq!(avail_bybit, Decimal::from(500));
+        assert_eq!(reserved_upbit, Decimal::ZERO);
+        assert_eq!(reserved_bybit, Decimal::ZERO);
+
+        // 예약 후: 가용+예약 = 초기값
+        let _t1 = bt
+            .reserve(Decimal::from(300_000), Decimal::from(150))
+            .unwrap();
+        let _t2 = bt
+            .reserve(Decimal::from(200_000), Decimal::from(100))
+            .unwrap();
+
+        let ((avail_upbit, avail_bybit), (reserved_upbit, reserved_bybit)) =
+            bt.available_and_reserved();
+        // 가용 + 예약 = 초기값 (일관성 검증)
+        assert_eq!(avail_upbit + reserved_upbit, Decimal::from(1_000_000));
+        assert_eq!(avail_bybit + reserved_bybit, Decimal::from(500));
+        // 개별 값도 정확한지 확인
+        assert_eq!(avail_upbit, Decimal::from(500_000));
+        assert_eq!(avail_bybit, Decimal::from(250));
+        assert_eq!(reserved_upbit, Decimal::from(500_000));
+        assert_eq!(reserved_bybit, Decimal::from(250));
     }
 }

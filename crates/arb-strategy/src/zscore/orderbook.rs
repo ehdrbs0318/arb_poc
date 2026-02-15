@@ -372,8 +372,10 @@ pub fn evaluate_entry_safe_volume(
         let roundtrip_fee = (upbit_fee + bybit_fee) * 2.0 * 100.0;
         let entry_slippage_pct = (upbit_vwap_usd - best_ask_usd) / best_ask_usd * 100.0
             + (best_bid - bybit_vwap) / best_bid * 100.0;
+        // estimated_exit_slippage는 진단 전용. effective_spread가 이미 VWAP 기반이므로
+        // 진입 슬리피지를 내포하여 profit에서 이중 차감하지 않는다.
         let estimated_exit_slippage = entry_slippage_pct;
-        let profit = (effective_spread - mean_spread_pct) - roundtrip_fee - estimated_exit_slippage;
+        let profit = (effective_spread - mean_spread_pct) - roundtrip_fee;
 
         let step = EntryProfitBreakdown {
             total_coins,
@@ -534,9 +536,11 @@ pub fn calculate_exit_safe_volume(
         // 청산 시 스프레드: Upbit 매도 수익 - Bybit 매수 비용
         let effective_spread = (upbit_vwap_usd - bybit_vwap) / bybit_vwap * 100.0;
         let roundtrip_fee = (upbit_fee + bybit_fee) * 2.0 * 100.0;
+        // exit_slippage_pct는 진단 전용. effective_spread가 VWAP 기반이므로
+        // 슬리피지를 이미 내포하여 profit에서 이중 차감하지 않는다.
         let exit_slippage_pct = (best_bid_usd - upbit_vwap_usd) / best_bid_usd * 100.0
             + (bybit_vwap - best_ask) / best_ask * 100.0;
-        let profit = (effective_spread - mean_spread_pct) - roundtrip_fee - exit_slippage_pct;
+        let profit = (effective_spread - mean_spread_pct) - roundtrip_fee;
 
         trace!(
             total_coins = total_coins,

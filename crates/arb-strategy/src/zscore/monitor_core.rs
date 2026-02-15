@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -636,6 +636,8 @@ where
 
         // heartbeat 관련 상태
         let mut heartbeat_timer = tokio::time::interval(Duration::from_secs(300));
+        // heartbeat sync 중복 실행 방지 guard (CAS 패턴)
+        let heartbeat_sync_running = Arc::new(AtomicBool::new(false));
 
         // 재선택 타이머 (auto_select=true일 때만 사용)
         let reselect_interval = Duration::from_secs(self.config.reselect_interval_min * 60);
@@ -903,9 +905,30 @@ where
                         usd_krw = self.forex_cache.get_cached_rate().unwrap_or(0.0),
                         "[heartbeat] 실시간 모니터 상태"
                     );
+
+                    // 5분 주기 잔고 동기화 + reconciliation
+                    // REST 호출을 tokio::spawn으로 분리하여 select! 루프 블로킹 방지 (spec/0007)
+                    // CAS guard로 이전 heartbeat sync 미완료 시 중복 실행 방지
+                    if heartbeat_sync_running
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        let policy = Arc::clone(&self.policy);
+                        let guard = Arc::clone(&heartbeat_sync_running);
+                        tokio::spawn(async move {
+                            policy.on_balance_sync().await;
+                            policy.on_reconciliation().await;
+                            guard.store(false, Ordering::Release);
+                        });
+                    } else {
+                        warn!("heartbeat sync 이전 작업 진행 중 — 스킵");
+                    }
                 }
             }
         }
+
+        // shutdown 정책 실행 (LD-0005: 포지션 정리 등)
+        self.policy.on_shutdown().await;
 
         // 정리: WebSocket 구독 해제
         self.upbit.unsubscribe().await.ok();
